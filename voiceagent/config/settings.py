@@ -26,6 +26,7 @@ their own names (`ENVIRONMENT`, `DEBUG`, `DATABASE_URL`, ...).
 from __future__ import annotations
 
 import os
+import uuid
 from dataclasses import dataclass, field
 from functools import lru_cache
 
@@ -37,6 +38,7 @@ __all__ = [
     "ConfigurationError",
     "FreeSwitchSettings",
     "ObjectStorageSettings",
+    "RuntimeSettings",
     "Settings",
     "get_settings",
 ]
@@ -100,9 +102,61 @@ class AiProviderSettings:
     names which `ConversationEngine` implementation a tenant gets when it has
     expressed no preference; it is a selector, not a vendor coupling, and the
     only value the Phase 1 foundation understands is `"fake"`.
+
+    `eligible_providers`/`allowed_data_classifications`/`allowed_purposes` are
+    a **deployment-wide default** `control_plane.data_authorization` policy
+    (Phase 2.2 brief section 20; `voiceagent.runtime.privacy`). No per-tenant
+    AI data policy table exists yet (Phase 2.0 report section 11.2 defers
+    `provider_credentials`/tenant policy storage entirely) -- this default is
+    what lets Phase 2.2 prove the *ordering* invariant ("no audio reaches an
+    engine before authorization succeeds") against fakes; it is not real
+    per-tenant policy enforcement and is documented as a known limitation in
+    `docs/PHASE-2.2-STATUS.md`.
     """
 
     default_engine: str = "fake"
+    eligible_providers: tuple[str, ...] = ("fake",)
+    allowed_data_classifications: tuple[str, ...] = ("tenant_data",)
+    allowed_purposes: tuple[str, ...] = ("conversation",)
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeSettings:
+    """`call-runtime` process tunables (ADR-0008 point 15: "each needs a
+    benchmark against real load before a default is chosen"). Every default
+    below is a conservative placeholder for Phase 2.2's own tests and local
+    development, not a benchmarked production value -- OQ-1 (Phase 2.0
+    report section 20) remains open.
+    """
+
+    #: Least-loaded assignment refuses a runtime at or above this many
+    #: concurrent calls (ADR-0008 points 5, 6, 14).
+    max_concurrent_calls: int = 50
+    #: Size of the bounded thread pool every database/SaaS-OS call from the
+    #: call-runtime process crosses (ADR-0008 point 2; section 16 of this
+    #: phase's brief). Never the asyncio default executor, so the boundary
+    #: is an explicit, sized resource rather than an implicit shared one.
+    to_thread_pool_size: int = 8
+    #: How often a runtime process refreshes its own Redis heartbeat key.
+    heartbeat_interval_seconds: float = 5.0
+    #: The heartbeat key's TTL. Must exceed `heartbeat_interval_seconds` by a
+    #: comfortable margin, or ordinary scheduling jitter reads as a crash.
+    heartbeat_ttl_seconds: float = 15.0
+    #: How often the reconciliation loop scans for stale ownership.
+    reconciliation_interval_seconds: float = 30.0
+    #: The `core.users.id` the runtime attributes `authorize_data_access()`
+    #: calls to (`voiceagent.runtime.privacy`). That SaaS-OS function's own
+    #: `actor_user_id` parameter carries a real foreign key to `core.users`
+    #: (verified at the pinned SHA), while the call runtime's own acting
+    #: principal is a `core.identity.ServiceAccount` with no human user in a
+    #: call's context (Phase 0 report section 14.4) -- a genuine mismatch
+    #: this phase documents rather than works around by modifying SaaS-OS
+    #: (forbidden, ADR-0001). An operator provisions this user once (e.g.
+    #: via `scripts/bootstrap_rbac.py`) and configures its id here; `None`
+    #: is a valid, deliberately fail-closed default (`voiceagent.runtime.privacy`
+    #: refuses to call `authorize_data_access()` without it, rather than
+    #: guessing a UUID that would fail its own foreign key at write time).
+    system_actor_user_id: uuid.UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +173,7 @@ class Settings:
     object_storage: ObjectStorageSettings = field(default_factory=ObjectStorageSettings)
     freeswitch: FreeSwitchSettings = field(default_factory=FreeSwitchSettings)
     ai_providers: AiProviderSettings = field(default_factory=AiProviderSettings)
+    runtime: RuntimeSettings = field(default_factory=RuntimeSettings)
 
     @property
     def environment(self) -> str:
@@ -172,11 +227,41 @@ def _parse_port(name: str, raw: str) -> int:
     return port
 
 
+def _parse_csv(raw: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
+    if raw is None:
+        return default
+    return tuple(item.strip() for item in raw.split(",") if item.strip())
+
+
+def _parse_float(name: str, raw: str) -> float:
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ConfigurationError(f"{name} must be a number, got: {raw!r}") from exc
+
+
+def _parse_int(name: str, raw: str) -> int:
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ConfigurationError(f"{name} must be an integer, got: {raw!r}") from exc
+
+
+def _parse_uuid(name: str, raw: str | None) -> uuid.UUID | None:
+    if raw is None:
+        return None
+    try:
+        return uuid.UUID(raw)
+    except ValueError as exc:
+        raise ConfigurationError(f"{name} must be a UUID, got: {raw!r}") from exc
+
+
 def settings_from_env(platform: PlatformSettings | None = None) -> Settings:
     """Build `Settings` from the environment. Pure apart from `os.environ`:
     no database, no network, no secret store. Tests call it directly with
     `monkeypatch.setenv(...)` instead of clearing a cache."""
     esl_port_raw = os.environ.get("VOICEAGENT_FREESWITCH_ESL_PORT")
+    defaults = RuntimeSettings()
 
     return Settings(
         platform=platform if platform is not None else get_platform_settings(),
@@ -201,6 +286,51 @@ def settings_from_env(platform: PlatformSettings | None = None) -> Settings:
         ),
         ai_providers=AiProviderSettings(
             default_engine=os.environ.get("VOICEAGENT_DEFAULT_ENGINE", "fake"),
+            eligible_providers=_parse_csv(
+                os.environ.get("VOICEAGENT_AI_ELIGIBLE_PROVIDERS"),
+                AiProviderSettings().eligible_providers,
+            ),
+            allowed_data_classifications=_parse_csv(
+                os.environ.get("VOICEAGENT_AI_ALLOWED_DATA_CLASSIFICATIONS"),
+                AiProviderSettings().allowed_data_classifications,
+            ),
+            allowed_purposes=_parse_csv(
+                os.environ.get("VOICEAGENT_AI_ALLOWED_PURPOSES"),
+                AiProviderSettings().allowed_purposes,
+            ),
+        ),
+        runtime=RuntimeSettings(
+            max_concurrent_calls=(
+                _parse_int("VOICEAGENT_RUNTIME_MAX_CONCURRENT_CALLS", raw)
+                if (raw := os.environ.get("VOICEAGENT_RUNTIME_MAX_CONCURRENT_CALLS")) is not None
+                else defaults.max_concurrent_calls
+            ),
+            to_thread_pool_size=(
+                _parse_int("VOICEAGENT_RUNTIME_TO_THREAD_POOL_SIZE", raw)
+                if (raw := os.environ.get("VOICEAGENT_RUNTIME_TO_THREAD_POOL_SIZE")) is not None
+                else defaults.to_thread_pool_size
+            ),
+            heartbeat_interval_seconds=(
+                _parse_float("VOICEAGENT_RUNTIME_HEARTBEAT_INTERVAL_SECONDS", raw)
+                if (raw := os.environ.get("VOICEAGENT_RUNTIME_HEARTBEAT_INTERVAL_SECONDS"))
+                is not None
+                else defaults.heartbeat_interval_seconds
+            ),
+            heartbeat_ttl_seconds=(
+                _parse_float("VOICEAGENT_RUNTIME_HEARTBEAT_TTL_SECONDS", raw)
+                if (raw := os.environ.get("VOICEAGENT_RUNTIME_HEARTBEAT_TTL_SECONDS")) is not None
+                else defaults.heartbeat_ttl_seconds
+            ),
+            reconciliation_interval_seconds=(
+                _parse_float("VOICEAGENT_RUNTIME_RECONCILIATION_INTERVAL_SECONDS", raw)
+                if (raw := os.environ.get("VOICEAGENT_RUNTIME_RECONCILIATION_INTERVAL_SECONDS"))
+                is not None
+                else defaults.reconciliation_interval_seconds
+            ),
+            system_actor_user_id=_parse_uuid(
+                "VOICEAGENT_RUNTIME_SYSTEM_ACTOR_USER_ID",
+                os.environ.get("VOICEAGENT_RUNTIME_SYSTEM_ACTOR_USER_ID"),
+            ),
         ),
     )
 

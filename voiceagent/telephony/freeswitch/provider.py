@@ -1,0 +1,158 @@
+"""`FreeSwitchTelephonyProvider` -- the only `TelephonyProvider` implementation
+(ADR-0002 point 1), over an injected `EslConnection` (ADR-0002 amendment
+point 2). Every FreeSWITCH-specific concept -- ESL command syntax, event
+field names, hangup-cause strings -- is translated at this module's boundary
+and never crosses it: a caller sees only `voiceagent.telephony.contracts`
+types.
+
+The ESL command strings below (`uuid_answer`, `uuid_kill`, `uuid_bridge`,
+`uuid_hold`, `uuid_send_dtmf`, `uuid_record`, `originate`) and the
+`Event-Name`/`Hangup-Cause` values in the two maps are FreeSWITCH's
+documented `mod_commands`/event vocabulary, carried forward from Phase 0
+report §10.3-§10.5's own research pass -- **not independently re-verified
+against a live FreeSWITCH instance in this phase** (brief section 29: no live
+instance is required by the default CI suite). `docs/PHASE-2.2-STATUS.md`
+records this explicitly as unverified-against-a-real-server, the same
+posture Phase 0 report §10.4 already took for `mod_audio_stream`'s wire
+protocol before its own conformance test existed.
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+
+from voiceagent.telephony.contracts import (
+    CallDirection,
+    CallEvent,
+    CallEventType,
+    CallRef,
+    HangupCause,
+    OriginateRequest,
+    TransportError,
+)
+from voiceagent.telephony.freeswitch.esl import EslConnection, EslEvent
+
+__all__ = ["FreeSwitchTelephonyProvider"]
+
+#: FreeSWITCH's `Event-Name` values, mapped onto the normalized taxonomy
+#: `voiceagent.telephony.contracts.CallEventType` already defines. Any event
+#: name not in this map is dropped by `events()` rather than raised -- an
+#: unmapped event is not an error, it is simply not one this product's call
+#: lifecycle (Phase 0 report §10.5) reacts to.
+_EVENT_TYPE_MAP: dict[str, CallEventType] = {
+    "CHANNEL_PARK": CallEventType.OFFERED,
+    "CHANNEL_PROGRESS": CallEventType.RINGING,
+    "CHANNEL_ANSWER": CallEventType.ANSWERED,
+    "CHANNEL_BRIDGE": CallEventType.BRIDGED,
+    "CHANNEL_HOLD": CallEventType.HELD,
+    "CHANNEL_UNHOLD": CallEventType.RESUMED,
+    "DTMF": CallEventType.DTMF,
+    "RECORD_START": CallEventType.RECORDING_STARTED,
+    "RECORD_STOP": CallEventType.RECORDING_STOPPED,
+    "CHANNEL_HANGUP_COMPLETE": CallEventType.HUNGUP,
+}
+
+_HANGUP_CAUSE_MAP: dict[str, HangupCause] = {
+    "NORMAL_CLEARING": HangupCause.NORMAL,
+    "USER_BUSY": HangupCause.BUSY,
+    "NO_ANSWER": HangupCause.NO_ANSWER,
+    "CALL_REJECTED": HangupCause.REJECTED,
+    "ORIGINATOR_CANCEL": HangupCause.CANCELED,
+    "NETWORK_OUT_OF_ORDER": HangupCause.NETWORK_FAILURE,
+    "RECOVERY_ON_TIMER_EXPIRE": HangupCause.TIMEOUT,
+}
+
+
+def _normalize_hangup_cause(raw: str | None) -> HangupCause:
+    if raw is None:
+        return HangupCause.UNKNOWN
+    return _HANGUP_CAUSE_MAP.get(raw, HangupCause.UNKNOWN)
+
+
+def _denormalize_hangup_cause(cause: HangupCause) -> str:
+    for raw, normalized in _HANGUP_CAUSE_MAP.items():
+        if normalized is cause:
+            return raw
+    return "NORMAL_CLEARING"
+
+
+def _normalize_event(raw: EslEvent) -> CallEvent | None:
+    event_type = _EVENT_TYPE_MAP.get(raw.get("Event-Name", ""))
+    if event_type is None:
+        return None
+    call_ref: CallRef = raw.get("Unique-ID", "")
+    direction = (
+        CallDirection.OUTBOUND if raw.get("Call-Direction") == "outbound" else CallDirection.INBOUND
+    )
+    return CallEvent(
+        type=event_type,
+        call_ref=call_ref,
+        direction=direction,
+        from_number=raw.get("Caller-Caller-ID-Number"),
+        to_number=raw.get("Caller-Destination-Number"),
+        hangup_cause=(
+            _normalize_hangup_cause(raw.get("Hangup-Cause"))
+            if event_type is CallEventType.HUNGUP
+            else None
+        ),
+        digit=raw.get("DTMF-Digit") if event_type is CallEventType.DTMF else None,
+    )
+
+
+class FreeSwitchTelephonyProvider:
+    """Call control over `mod_event_socket`, inbound mode (ADR-0002 point 4).
+    Issues ESL command strings via the injected `EslConnection` and
+    normalizes its raw event stream into `CallEvent` -- the only
+    FreeSWITCH-specific code path any command or event in this product ever
+    passes through."""
+
+    def __init__(self, esl: EslConnection) -> None:
+        self._esl = esl
+
+    async def _command(self, command: str) -> str:
+        response = await self._esl.send(command)
+        if response.startswith("-ERR"):
+            raise TransportError(f"ESL command failed: {command!r} -> {response!r}")
+        return response
+
+    async def originate(self, request: OriginateRequest) -> CallRef:
+        response = await self._command(
+            f"bgapi originate "
+            f"{{origination_caller_id_number={request.from_number}}}"
+            f"sofia/gateway/default/{request.to_number}"
+        )
+        return response.strip()
+
+    async def answer(self, call_ref: CallRef) -> None:
+        await self._command(f"uuid_answer {call_ref}")
+
+    async def hangup(self, call_ref: CallRef, cause: HangupCause = HangupCause.NORMAL) -> None:
+        await self._command(f"uuid_kill {call_ref} {_denormalize_hangup_cause(cause)}")
+
+    async def bridge(self, call_ref: CallRef, other_call_ref: CallRef) -> None:
+        await self._command(f"uuid_bridge {call_ref} {other_call_ref}")
+
+    async def transfer(self, call_ref: CallRef, destination: str) -> CallRef:
+        response = await self._command(f"bgapi originate sofia/gateway/default/{destination}")
+        return response.strip()
+
+    async def hold(self, call_ref: CallRef) -> None:
+        await self._command(f"uuid_hold {call_ref}")
+
+    async def unhold(self, call_ref: CallRef) -> None:
+        await self._command(f"uuid_hold off {call_ref}")
+
+    async def send_dtmf(self, call_ref: CallRef, digits: str) -> None:
+        await self._command(f"uuid_send_dtmf {call_ref} {digits}")
+
+    async def start_recording(self, call_ref: CallRef) -> None:
+        await self._command(f"uuid_record {call_ref} start /dev/null")
+
+    async def stop_recording(self, call_ref: CallRef) -> None:
+        await self._command(f"uuid_record {call_ref} stop /dev/null")
+
+    async def events(self) -> AsyncIterator[CallEvent]:
+        async for raw in self._esl.events():
+            normalized = _normalize_event(raw)
+            if normalized is not None:
+                yield normalized

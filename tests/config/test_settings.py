@@ -8,6 +8,7 @@ anywhere to put a credential.
 from __future__ import annotations
 
 import dataclasses
+import uuid
 
 import pytest
 from core.config import Settings as PlatformSettings
@@ -17,6 +18,7 @@ from voiceagent.config import (
     ConfigurationError,
     FreeSwitchSettings,
     ObjectStorageSettings,
+    RuntimeSettings,
     Settings,
     settings_from_env,
 )
@@ -115,3 +117,57 @@ def test_settings_are_immutable(settings: Settings) -> None:
     """Configuration is a value, not mutable global state."""
     with pytest.raises(dataclasses.FrozenInstanceError):
         settings.app_display_name = "changed"  # type: ignore[misc]
+
+
+def test_runtime_defaults_are_conservative(settings: Settings) -> None:
+    """ADR-0008 point 15: real values are a benchmarking task, not
+    invented here -- but an unconfigured deployment must still get sane,
+    non-zero tunables and no system actor (fail-closed on privacy
+    authorization, `voiceagent.runtime.privacy`)."""
+    assert settings.runtime.max_concurrent_calls > 0
+    assert settings.runtime.to_thread_pool_size > 0
+    assert settings.runtime.heartbeat_ttl_seconds > settings.runtime.heartbeat_interval_seconds
+    assert settings.runtime.system_actor_user_id is None
+
+
+def test_runtime_settings_parse_from_env(monkeypatch) -> None:
+    system_actor = uuid.uuid4()
+    monkeypatch.setenv("VOICEAGENT_RUNTIME_MAX_CONCURRENT_CALLS", "25")
+    monkeypatch.setenv("VOICEAGENT_RUNTIME_TO_THREAD_POOL_SIZE", "4")
+    monkeypatch.setenv("VOICEAGENT_RUNTIME_HEARTBEAT_INTERVAL_SECONDS", "2.5")
+    monkeypatch.setenv("VOICEAGENT_RUNTIME_HEARTBEAT_TTL_SECONDS", "7.5")
+    monkeypatch.setenv("VOICEAGENT_RUNTIME_RECONCILIATION_INTERVAL_SECONDS", "60")
+    monkeypatch.setenv("VOICEAGENT_RUNTIME_SYSTEM_ACTOR_USER_ID", str(system_actor))
+
+    runtime = settings_from_env(_platform()).runtime
+    assert runtime == RuntimeSettings(
+        max_concurrent_calls=25,
+        to_thread_pool_size=4,
+        heartbeat_interval_seconds=2.5,
+        heartbeat_ttl_seconds=7.5,
+        reconciliation_interval_seconds=60.0,
+        system_actor_user_id=system_actor,
+    )
+
+
+def test_invalid_system_actor_user_id_is_rejected(monkeypatch) -> None:
+    monkeypatch.setenv("VOICEAGENT_RUNTIME_SYSTEM_ACTOR_USER_ID", "not-a-uuid")
+    with pytest.raises(ConfigurationError):
+        settings_from_env(_platform())
+
+
+def test_invalid_runtime_integer_is_rejected(monkeypatch) -> None:
+    monkeypatch.setenv("VOICEAGENT_RUNTIME_MAX_CONCURRENT_CALLS", "not-an-int")
+    with pytest.raises(ConfigurationError):
+        settings_from_env(_platform())
+
+
+def test_ai_provider_policy_lists_parse_from_env(monkeypatch) -> None:
+    monkeypatch.setenv("VOICEAGENT_AI_ELIGIBLE_PROVIDERS", "fake, deepgram-shaped")
+    monkeypatch.setenv("VOICEAGENT_AI_ALLOWED_DATA_CLASSIFICATIONS", "tenant_data, pii")
+    monkeypatch.setenv("VOICEAGENT_AI_ALLOWED_PURPOSES", "conversation")
+
+    ai_providers = settings_from_env(_platform()).ai_providers
+    assert ai_providers.eligible_providers == ("fake", "deepgram-shaped")
+    assert ai_providers.allowed_data_classifications == ("tenant_data", "pii")
+    assert ai_providers.allowed_purposes == ("conversation",)

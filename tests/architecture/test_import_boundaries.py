@@ -106,6 +106,15 @@ def test_freeswitch_internals_are_confined_to_their_adapter() -> None:
     assert _violations(forbidden, allowed_modules=("voiceagent.telephony.freeswitch",)) == []
 
 
+def test_no_commercial_ai_provider_sdk_is_imported_anywhere() -> None:
+    """Phase 2.2 brief section 24: no OpenAI/ElevenLabs/Deepgram SDK may be
+    imported by any product module -- ADR-0009 point 6 (none of the three
+    providers researched for the first vertical slice becomes a hard
+    architectural dependency), checked mechanically rather than by
+    convention, exactly like the Pipecat fence above."""
+    assert _violations(("openai", "elevenlabs", "deepgram")) == []
+
+
 def test_object_storage_sdk_is_not_imported_anywhere_yet() -> None:
     """Phase 0 report section 2.4 G-2 / section 17 of the Phase 1 brief:
     `boto3` reaches the product only inside a future storage adapter, never in

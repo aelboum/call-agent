@@ -78,6 +78,40 @@ def test_importing_contracts_initializes_no_provider() -> None:
     assert result.stdout.strip() == "ok"
 
 
+def test_importing_the_runtime_package_opens_no_connection() -> None:
+    """`voiceagent.runtime.heartbeat.RedisHeartbeatStore` builds its
+    `redis.asyncio` client lazily (`voiceagent.runtime.heartbeat`'s own
+    docstring); importing every runtime module, and constructing every class
+    in it that takes no real network argument, must not touch a socket."""
+    result = _run_in_subprocess(
+        "import voiceagent.runtime.heartbeat as h; "
+        "import voiceagent.runtime.supervisor as s; "
+        "import voiceagent.runtime.call_task as c; "
+        "import voiceagent.runtime.assignment as a; "
+        "import voiceagent.runtime.reconciliation as r; "
+        "import voiceagent.runtime.privacy as p; "
+        "import voiceagent.runtime.db as d; "
+        "store = h.RedisHeartbeatStore('redis://127.0.0.1:1/0'); "
+        "boundary = d.DatabaseBoundary(max_workers=1); "
+        "boundary.close(); "
+        "print('ok')"
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok"
+
+
+def test_importing_the_freeswitch_adapter_opens_no_connection() -> None:
+    result = _run_in_subprocess(
+        "import voiceagent.telephony.freeswitch.esl, "
+        "voiceagent.telephony.freeswitch.provider, "
+        "voiceagent.telephony.freeswitch.media, "
+        "voiceagent.telephony.freeswitch.fakes; "
+        "print('ok')"
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok"
+
+
 def test_building_the_app_opens_no_connection() -> None:
     """`build_app()` itself does no I/O. The database is touched by the
     platform lifespan -- which runs only when the application actually runs,

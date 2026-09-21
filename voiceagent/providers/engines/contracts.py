@@ -287,7 +287,7 @@ class LlmProvider(Protocol):
 class TtsProvider(Protocol):
     """Streaming synthesis. Cancellation must stop mid-frame."""
 
-    def synthesize(self, text: str, voice: VoiceRef) -> AsyncIterator[AudioOut]: ...
+    def synthesize(self, text: str, voice: VoiceRef | None) -> AsyncIterator[AudioOut]: ...
 
 
 @runtime_checkable
