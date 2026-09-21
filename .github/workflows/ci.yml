@@ -3,9 +3,17 @@ name: CI
 # CI runs the same scripts a developer runs locally (`scripts/check-*.sh`),
 # so there is no second definition of "passing" to keep in sync.
 #
-# It requires no secrets and touches no infrastructure: the whole suite is
-# hermetic. The one place a database is involved is the migrations job, which
-# renders SQL offline without connecting to anything.
+# It requires no secrets and touches no infrastructure of its own: the
+# `backend`/`security`/`frontend`/`migrations` jobs are hermetic, and
+# `migrations` renders SQL offline without connecting to anything.
+#
+# `migrations-integration` (Phase 2.1) is the one exception, and it is not a
+# new convention -- it mirrors the pinned SaaS-OS's own `migrations` CI job
+# exactly: a disposable `postgres:16-alpine` service container, torn down
+# with the runner, applying SaaS-OS's own migrations first (ADR-0016's fixed
+# ordering) and then this product's, connected as the restricted
+# NOSUPERUSER/NOBYPASSRLS application role so Row-Level Security is actually
+# exercised rather than bypassed. See `tests/integration/README.md`.
 
 on:
   push:
@@ -83,6 +91,66 @@ jobs:
           REDIS_URL: redis://127.0.0.1:1/0
           APP_DB_USER: saas_os_app
         run: pytest tests/test_migrations.py
+
+  migrations-integration:
+    name: migration security gate (Phase 2.1)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: saas_os
+          POSTGRES_PASSWORD: ci-only-placeholder # pragma: allowlist secret
+          POSTGRES_DB: voiceagent
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U saas_os -d voiceagent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Install the PostgreSQL client (psql)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client
+      # The restricted application role: NOSUPERUSER NOBYPASSRLS, so RLS is
+      # genuinely exercised (a superuser/BYPASSRLS role bypasses row
+      # security regardless of FORCE ROW LEVEL SECURITY).
+      - name: Create the restricted application role
+        env:
+          PGHOST: 127.0.0.1
+          PGPASSWORD: ci-only-placeholder # pragma: allowlist secret
+        run: |
+          psql -v ON_ERROR_STOP=1 -U saas_os -d voiceagent -c "
+            CREATE ROLE saas_os_app LOGIN PASSWORD 'app-ci-only-placeholder'
+                NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
+            GRANT CONNECT ON DATABASE voiceagent TO saas_os_app;
+          "
+      - name: Apply SaaS-OS's own migrations, then this product's
+        env:
+          DATABASE_URL: postgresql+psycopg://saas_os_app:app-ci-only-placeholder@127.0.0.1:5432/voiceagent
+          MIGRATIONS_DATABASE_URL: postgresql+psycopg://saas_os:ci-only-placeholder@127.0.0.1:5432/voiceagent
+          APP_DB_USER: saas_os_app
+        run: |
+          saas-os-migrate upgrade
+          alembic upgrade head
+      - name: Integration tests (RLS, composite FKs, immutability trigger)
+        env:
+          ENVIRONMENT: test
+          DATABASE_URL: postgresql+psycopg://saas_os_app:app-ci-only-placeholder@127.0.0.1:5432/voiceagent
+          MIGRATIONS_DATABASE_URL: postgresql+psycopg://saas_os:ci-only-placeholder@127.0.0.1:5432/voiceagent
+          REDIS_URL: redis://127.0.0.1:1/0
+          APP_DB_USER: saas_os_app
+        run: pytest -m integration
 
   frontend:
     runs-on: ubuntu-latest

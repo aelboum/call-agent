@@ -83,9 +83,30 @@ def test_version_table_is_distinct_from_the_platform_history(offline_sql: str) -
     assert "alembic_version_saas_os" not in offline_sql
 
 
-def test_no_tables_are_created_yet() -> None:
-    """Phase 1 has no domain. A table invented ahead of its domain is a
-    migration that will have to be rewritten."""
-    versions = (REPO_ROOT / "migrations" / "versions").glob("*.py")
-    for path in versions:
-        assert "create_table" not in path.read_text(encoding="utf-8"), path.name
+def test_deferred_domain_tables_are_never_created(offline_sql: str) -> None:
+    """Superseded 2026-09-21 (Phase 2.1): the Phase 1 version of this test
+    asserted no migration ever created a table, because Phase 1 had no
+    domain. Phase 2.1 IS the first domain slice (`app.agents`,
+    `app.agent_versions`, `app.phone_numbers`, `app.call_sessions`), so that
+    assertion is now correctly false rather than a regression -- it is
+    replaced by its own descendant: the Phase 2.0-deferred tables (Phase 2.0
+    report §11.2 / Phase 2.1 brief §3) must never appear, in this migration
+    or any other, ahead of the phase that actually needs them."""
+    deferred_tables = (
+        "conversations",
+        "conversation_turns",
+        "contacts",
+        "contact_phones",
+        "calendars",
+        "working_hours",
+        "appointments",
+        "tools",
+        "tool_bindings",
+        "workflows",
+        "workflow_versions",
+        "recordings",
+        "provider_credentials",
+        "runtime_assignments",
+    )
+    for table in deferred_tables:
+        assert f"CREATE TABLE app.{table} (" not in offline_sql

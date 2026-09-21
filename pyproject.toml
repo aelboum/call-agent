@@ -52,10 +52,13 @@ pipecat = []
 # packaging (its ADR-0015 implementation note).
 packages = [
     "voiceagent",
+    "voiceagent.agents",
     "voiceagent.api",
     "voiceagent.api.v1",
+    "voiceagent.calls",
     "voiceagent.config",
     "voiceagent.db",
+    "voiceagent.phone_numbers",
     "voiceagent.providers",
     "voiceagent.providers.engines",
     "voiceagent.runtime",
@@ -89,7 +92,17 @@ exclude = ["migrations", "frontend", ".venv", "**/__pycache__"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+# `integration` tests require a real PostgreSQL instance -- excluded by
+# default so the normal suite stays hermetic (no PostgreSQL, Redis, network,
+# provider or FreeSWITCH), exactly mirroring the pinned SaaS-OS's own
+# convention (its pyproject.toml: `addopts = "-ra -m \"not integration and
+# not packaging\""`, `tests/infra/test_db_integration.py`). Run explicitly
+# with `pytest -m integration` against a real database; see
+# tests/integration/README.md.
+addopts = "-q -m \"not integration\""
+markers = [
+    "integration: requires a real PostgreSQL instance with this product's migrations applied; excluded by default, see tests/integration/README.md",
+]
 
 # ---------------------------------------------------------------------------
 # Architecture boundaries (Phase 0.1: ADR-0006, ADR-0007, ADR-0002 amendment).
