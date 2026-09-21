@@ -1,0 +1,29 @@
+# Secrets and local configuration -- never committed.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.import_linter_cache/
+
+# Node / frontend
+node_modules/
+frontend/dist/
+frontend/node_modules/
+frontend/.env*
+!frontend/.env.example
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/

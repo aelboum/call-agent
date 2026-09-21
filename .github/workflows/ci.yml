@@ -1,0 +1,100 @@
+name: CI
+
+# CI runs the same scripts a developer runs locally (`scripts/check-*.sh`),
+# so there is no second definition of "passing" to keep in sync.
+#
+# It requires no secrets and touches no infrastructure: the whole suite is
+# hermetic. The one place a database is involved is the migrations job, which
+# renders SQL offline without connecting to anything.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      # Installs the exact pinned SaaS-OS commit from a clean environment --
+      # which is itself the test that ADR-0001's dependency declaration
+      # resolves (acceptance criteria 1 and 2).
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,security]"
+      - name: Verify the SaaS-OS pin resolved to the exact commit
+        run: |
+          python - <<'PY'
+          import json, pathlib, sys
+          expected = "ff550010e5eafecace7311038aadc99fcecfbe3d"
+          matches = list(pathlib.Path(sys.prefix).glob("**/saas_os-*.dist-info/direct_url.json"))
+          matches += list(pathlib.Path("/usr/lib/python3/dist-packages").glob("saas_os-*.dist-info/direct_url.json"))
+          assert matches, "saas-os dist-info not found"
+          info = json.loads(matches[0].read_text())
+          commit = info["vcs_info"]["commit_id"]
+          assert commit == expected, f"expected {expected}, resolved {commit}"
+          print("saas-os pinned at", commit)
+          PY
+      - name: Backend checks
+        run: bash scripts/check-backend.sh
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[security]"
+      - name: Security checks
+        run: bash scripts/check-security.sh
+
+  migrations:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      # Offline SQL rendering: proves the migration compiles, has a single
+      # head, targets the `app` schema and never touches a platform schema,
+      # without a database service container.
+      - name: Migration configuration sanity
+        env:
+          ENVIRONMENT: test
+          DATABASE_URL: postgresql+psycopg://unused:unused@127.0.0.1:1/unused
+          MIGRATIONS_DATABASE_URL: postgresql+psycopg://owner:unused@127.0.0.1:1/unused
+          REDIS_URL: redis://127.0.0.1:1/0
+          APP_DB_USER: saas_os_app
+        run: pytest tests/test_migrations.py
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install
+        working-directory: frontend
+        run: npm ci
+      - name: Frontend checks
+        run: bash scripts/check-frontend.sh

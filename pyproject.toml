@@ -1,0 +1,171 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voiceagent"
+version = "0.1.0"
+description = "Multi-tenant AI call-agent platform (Phase 1 foundation). Consumes SaaS-OS as an external pinned dependency."
+requires-python = ">=3.13"
+readme = "README.md"
+license = { text = "UNLICENSED" }
+
+# ADR-0001: SaaS-OS is consumed as an external, pinned Git/VCS dependency at
+# an exact commit SHA -- never a branch, never a tag, never an editable local
+# path, never vendored, never a submodule. Re-pinning is a deliberate,
+# human-reviewed act; automated upgrades are prohibited.
+#
+# The SHA below was verified against the remote on 2026-09-21
+# (`git ls-remote https://github.com/aelboum/saas-os HEAD`).
+#
+# This is the product's ONLY runtime dependency. Everything the foundation
+# needs -- FastAPI, SQLAlchemy (via infra.db only), Alembic, psycopg, Redis,
+# ARQ, OpenTelemetry, cryptography -- arrives transitively through saas-os,
+# which is the point of ADR-0001: the product does not re-declare, and
+# therefore cannot independently drift from, the platform's stack.
+dependencies = [
+    "saas-os @ git+https://github.com/aelboum/saas-os@ff550010e5eafecace7311038aadc99fcecfbe3d",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.6",
+    "pyright>=1.1.380",
+    "pytest>=8.0",
+    "import-linter>=2.0",
+]
+security = [
+    "detect-secrets>=1.5",
+]
+# ADR-0006: Pipecat is an OPTIONAL extra, never a base dependency, and is
+# importable only from `voiceagent.providers.engines.pipecat`. It is
+# deliberately NOT installed in Phase 1 -- the foundation does not need it,
+# and the exact version pin is a Phase 2 decision made alongside the first
+# real engine implementation. The extra is declared here (empty) so the
+# consumption shape is fixed by the foundation rather than improvised later.
+pipecat = []
+
+[tool.setuptools]
+# Explicit, fully-enumerated package list rather than automatic discovery:
+# auditable, and it cannot silently pick up `tests/`, `migrations/` or
+# `frontend/` the way a repo-root scan could. Same rationale as saas-os's own
+# packaging (its ADR-0015 implementation note).
+packages = [
+    "voiceagent",
+    "voiceagent.api",
+    "voiceagent.api.v1",
+    "voiceagent.config",
+    "voiceagent.db",
+    "voiceagent.providers",
+    "voiceagent.providers.engines",
+    "voiceagent.runtime",
+    "voiceagent.telephony",
+    "voiceagent.telephony.freeswitch",
+    "voiceagent.tenancy",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S"]
+# S101 (assert) is the idiom pytest is built on.
+per-file-ignores = { "tests/**" = ["S101"] }
+
+[tool.pyright]
+pythonVersion = "3.13"
+typeCheckingMode = "standard"
+include = ["voiceagent", "tests"]
+# Resolve the pinned `saas-os` (and its dependencies) from the project venv.
+# Without this, pyright type-checks against the interpreter it happens to find
+# and reports every platform import as unresolved -- a failure mode that looks
+# like a boundary violation but is only a configuration gap.
+venvPath = "."
+venv = ".venv"
+# Migrations are Alembic-generated scaffolding with its own conventions and
+# are type-checked by neither this project nor saas-os's own.
+exclude = ["migrations", "frontend", ".venv", "**/__pycache__"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+# ---------------------------------------------------------------------------
+# Architecture boundaries (Phase 0.1: ADR-0006, ADR-0007, ADR-0002 amendment).
+#
+# These import-linter contracts are one of two enforcement layers. The other
+# is `tests/architecture/test_import_boundaries.py`, an AST scan that runs
+# with no dependencies installed and therefore also covers the case where a
+# forbidden package (pipecat) is not installed at all. Both run in CI.
+# ---------------------------------------------------------------------------
+[tool.importlinter]
+root_packages = ["voiceagent"]
+include_external_packages = true
+
+# ADR-0007: application code may never import SQLAlchemy/psycopg. The
+# omissions in `infra.db`'s re-export surface (`sqlalchemy.text`,
+# `sqlalchemy.func`) are documented RLS-bypass defenses, not oversights --
+# reaching around `voiceagent.db` would restore that capability class inside
+# this product. `migrations/` is not part of the `voiceagent` package and so
+# is outside this contract by construction: migration code owns physical
+# PostgreSQL types and imports SQLAlchemy directly, exactly as saas-os's own
+# reference consumer does.
+#
+# No `ignore_imports` is needed: `root_packages` is this product alone, so
+# grimp builds the graph from `voiceagent`'s own modules and records an
+# external dependency only as the top-level edge `voiceagent.db -> infra`. It
+# never traces *inside* `infra`, so the sanctioned `infra.db -> sqlalchemy`
+# edge is not in the graph and cannot trip this contract -- while a direct
+# `voiceagent.<anything> -> sqlalchemy` edge is in the graph and does.
+[[tool.importlinter.contracts]]
+name = "Application code never imports SQLAlchemy or psycopg directly"
+type = "forbidden"
+source_modules = ["voiceagent"]
+forbidden_modules = ["sqlalchemy", "psycopg", "psycopg2"]
+
+# ADR-0002 (2026-09-21 amendment): FreeSWITCH/ESL/mod_audio_stream internals
+# live behind `voiceagent.telephony.freeswitch` and nothing else may depend on
+# them. Domain code sees `TelephonyProvider`/`MediaProvider`, never an ESL
+# command, a channel-UUID semantic, or a FreeSWITCH hangup cause.
+#
+# The source list is enumerated rather than expressed as "voiceagent except
+# that subpackage" (import-linter has no such exclusion), which also keeps the
+# rule from being overly broad: a future legitimate adapter added *inside*
+# `voiceagent.telephony.freeswitch` needs no contract change.
+[[tool.importlinter.contracts]]
+name = "FreeSWITCH internals stay behind voiceagent.telephony.freeswitch"
+type = "forbidden"
+source_modules = [
+    "voiceagent.api",
+    "voiceagent.config",
+    "voiceagent.db",
+    "voiceagent.providers",
+    "voiceagent.runtime",
+    "voiceagent.tenancy",
+    "voiceagent.telephony.contracts",
+    "voiceagent.telephony.fakes",
+]
+forbidden_modules = ["voiceagent.telephony.freeswitch"]
+
+# ADR-0006: the ConversationEngine contract is product-owned and Pipecat-free.
+# Pipecat is importable only from `voiceagent.providers.engines.pipecat`.
+#
+# Enforced now, while Pipecat is deliberately NOT installed: import-linter was
+# verified to accept a forbidden module it cannot resolve (an uninstalled
+# package simply never appears as an edge), so the fence exists before the
+# first import does -- which is the whole point of it.
+[[tool.importlinter.contracts]]
+name = "Pipecat stays behind voiceagent.providers.engines.pipecat"
+type = "forbidden"
+source_modules = [
+    "voiceagent.api",
+    "voiceagent.config",
+    "voiceagent.db",
+    "voiceagent.runtime",
+    "voiceagent.telephony",
+    "voiceagent.tenancy",
+    "voiceagent.providers.engines.contracts",
+    "voiceagent.providers.engines.fakes",
+]
+forbidden_modules = ["pipecat"]
