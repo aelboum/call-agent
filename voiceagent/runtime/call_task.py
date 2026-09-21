@@ -64,14 +64,18 @@ from voiceagent.calls.errors import InvalidCallSessionTransitionError
 from voiceagent.calls.service import get_call_session, transition_call_session
 from voiceagent.observability import bind_correlation_context
 from voiceagent.providers.engines.contracts import (
+    AssistantResponse,
     AudioOut,
     ConversationEngine,
     EngineSessionConfig,
+    FinalTranscript,
+    SystemPromptSet,
     ToolCallRequested,
     ToolResult,
     ToolSpec,
     VoiceRef,
 )
+from voiceagent.runtime.conversation_persistence import ConversationPersistence, PendingTurn
 from voiceagent.runtime.db import DatabaseBoundary
 from voiceagent.runtime.errors import DataAuthorizationDeniedError
 from voiceagent.runtime.privacy import AiDataPolicySource, authorize_call_data_access
@@ -80,7 +84,13 @@ from voiceagent.tenancy import TenantContext
 from voiceagent.tools.gateway import ToolGateway
 from voiceagent.tools.registry import TOOL_REGISTRY, ToolRegistry
 
-__all__ = ["CallTaskDependencies", "CancellationSignal", "ToolDispatch", "run_call_task"]
+__all__ = [
+    "CallTaskDependencies",
+    "CancellationSignal",
+    "ConversationPersist",
+    "ToolDispatch",
+    "run_call_task",
+]
 
 _logger = logging.getLogger(__name__)
 
@@ -90,6 +100,13 @@ _logger = logging.getLogger(__name__)
 #: result was produced. `run_call_task()` builds the real one as a closure
 #: over `deps.tool_gateway.execute(...)`.
 ToolDispatch = Callable[[ToolCallRequested], Awaitable[ToolResult]]
+
+#: `_run_pumps()`'s own view of conversation persistence (Phase 2.5):
+#: synchronous and non-blocking (`ConversationPersistence.enqueue()`'s own
+#: contract, module docstring), so calling it can never make the pump await
+#: a database write. `run_call_task()` builds the real one as a closure over
+#: `deps.conversation_persistence.enqueue(call_session_id, ...)`.
+ConversationPersist = Callable[[PendingTurn], None]
 
 
 @dataclass
@@ -115,6 +132,7 @@ class CallTaskDependencies:
     db: DatabaseBoundary
     policy_source: AiDataPolicySource
     tool_gateway: ToolGateway
+    conversation_persistence: ConversationPersistence
     system_actor_user_id: uuid.UUID | None
     #: `voiceagent.tools.gateway`'s per-tenant service-account resolution
     #: key -- a *name*, not a fixed id (`RuntimeSettings
@@ -192,6 +210,7 @@ async def _run_pumps(
     media_stream,
     engine_session,
     dispatch_tool_call: ToolDispatch,
+    persist_turn: ConversationPersist | None = None,
 ) -> None:
     """The two concurrent, audio-adjacent loops -- no database access, no
     tenant context, no SaaS-OS import anywhere in this function (or in
@@ -200,9 +219,23 @@ async def _run_pumps(
     or its helpers ever reach the Tool Gateway, and the gateway's own DB work
     happens on the far side of that one already-awaited coroutine, never
     referenced here by name -- `tests/architecture/test_runtime_db_boundary
-    .py::test_the_audio_pump_never_references_a_sync_db_touching_name`)."""
+    .py::test_the_audio_pump_never_references_a_sync_db_touching_name`).
+
+    **`persist_turn` (Phase 2.5) is the identical shape of seam**:
+    synchronous and non-blocking (`ConversationPersist`'s own contract), so
+    calling it here can never make this function await a database write --
+    the actual write happens on the far side of a bounded queue this
+    function never sees, in `voiceagent.runtime.conversation_persistence`.
+    `None` is accepted (and every call defaults to it) so a caller that has
+    no persistence configured -- every hermetic test in
+    `tests/runtime/test_call_task_tools.py` predating Phase 2.5 -- keeps
+    working unchanged."""
 
     tool_tasks: set[asyncio.Task[None]] = set()
+
+    def _persist(turn: PendingTurn) -> None:
+        if persist_turn is not None:
+            persist_turn(turn)
 
     async def pump_caller_audio() -> None:
         async for frame in media_stream.receive():
@@ -223,6 +256,17 @@ async def _run_pumps(
             result = ToolResult(
                 call_id=request.call_id, error_code="internal_error", retryable=False
             )
+        # The matching "tool_result" turn, persisted only once the result is
+        # actually known -- always after this same call_id's "tool_call"
+        # turn was already enqueued below, in pump_engine_events(), never
+        # before (brief section 5's ordering requirement).
+        _persist(
+            PendingTurn(
+                event_id=result.call_id,
+                role="tool_result",
+                tool_payload={"value": result.value, "error_code": result.error_code},
+            )
+        )
         with contextlib.suppress(Exception):
             # A closed/gone engine session's submit_tool_result() is
             # documented as a no-op (voiceagent.providers.engines.pipelined),
@@ -236,13 +280,28 @@ async def _run_pumps(
             if isinstance(event, AudioOut):
                 await media_stream.send(event.frame)
             elif isinstance(event, ToolCallRequested):
+                _persist(
+                    PendingTurn(
+                        event_id=event.call_id,
+                        role="tool_call",
+                        tool_payload={"name": event.name, "arguments": dict(event.arguments)},
+                    )
+                )
                 task = asyncio.create_task(_execute_and_submit_tool_call(event))
                 tool_tasks.add(task)
                 task.add_done_callback(tool_tasks.discard)
-            # PartialTranscript/FinalTranscript/SpeechStarted/SpeechEnded/
-            # TurnEnded/UsageReported/EngineError: observability-only in
-            # Phase 2.2 -- no conversation-turn persistence exists yet
-            # (Phase 2.0 report §11.2 defers that table).
+            elif isinstance(event, SystemPromptSet):
+                _persist(
+                    PendingTurn(event_id=event.event_id, role="system", content=event.instructions)
+                )
+            elif isinstance(event, FinalTranscript):
+                _persist(PendingTurn(event_id=event.event_id, role="user", content=event.text))
+            elif isinstance(event, AssistantResponse):
+                _persist(PendingTurn(event_id=event.event_id, role="assistant", content=event.text))
+            # PartialTranscript/SpeechStarted/SpeechEnded/TurnEnded/
+            # UsageReported/EngineError: observability-only -- never
+            # persisted (brief section 4: "do not persist every transient
+            # STT partial").
 
     caller_task = asyncio.create_task(pump_caller_audio())
     events_task = asyncio.create_task(pump_engine_events())
@@ -320,6 +379,7 @@ async def run_call_task(
 
             media_stream = await deps.media.attach(call_ref)
             engine_session = await deps.engine.start(_engine_session_config(agent_version))
+            deps.conversation_persistence.start(context, call_session_id)
 
             async def _dispatch_tool_call(request: ToolCallRequested) -> ToolResult:
                 return await deps.tool_gateway.execute(
@@ -333,6 +393,9 @@ async def run_call_task(
                     request=request,
                 )
 
+            def _persist_turn(turn: PendingTurn) -> None:
+                deps.conversation_persistence.enqueue(call_session_id, turn)
+
             # initiated -> answered -> in_progress
             # (voiceagent.calls.lifecycle's own transition table has no
             # initiated -> in_progress edge; media attachment/engine start
@@ -345,9 +408,12 @@ async def run_call_task(
                 transition_call_session, context, call_session_id, to_status="in_progress"
             )
 
-            await _run_pumps(call_session_id, media_stream, engine_session, _dispatch_tool_call)
+            await _run_pumps(
+                call_session_id, media_stream, engine_session, _dispatch_tool_call, _persist_turn
+            )
         finally:
             deps.tool_gateway.forget_call(call_session_id)
+            await deps.conversation_persistence.finish(call_session_id)
             if engine_session is not None:
                 with contextlib.suppress(Exception):
                     await engine_session.close()

@@ -37,6 +37,7 @@ from voiceagent.agents.service import (
 )
 from voiceagent.calls.service import create_call_session
 from voiceagent.config.settings import AiProviderSettings
+from voiceagent.conversations.service import list_conversation_turns
 from voiceagent.phone_numbers.service import register_phone_number
 from voiceagent.providers.engines.component_fakes import (
     FakeLlmProvider,
@@ -47,6 +48,7 @@ from voiceagent.providers.engines.contracts import ToolCallRequested, TurnEnded
 from voiceagent.providers.engines.pipelined import PipelinedEngine
 from voiceagent.rbac_bootstrap import PERMISSIONS, bootstrap_tenant_rbac
 from voiceagent.runtime.call_task import CallTaskDependencies, CancellationSignal, run_call_task
+from voiceagent.runtime.conversation_persistence import ConversationPersistence
 from voiceagent.runtime.db import DatabaseBoundary
 from voiceagent.runtime.privacy import StaticAiDataPolicySource
 from voiceagent.telephony.fakes import FakeMediaProvider, FakeTelephonyProvider
@@ -322,6 +324,7 @@ def test_run_call_task_dispatches_a_real_tool_call_end_to_end(
         db=db,
         policy_source=_permissive_policy_source(),
         tool_gateway=ToolGateway(),
+        conversation_persistence=ConversationPersistence(db),
         system_actor_user_id=system_actor_user_id,
         system_service_account_name=bootstrapped_service_account,
     )
@@ -350,6 +353,18 @@ def test_run_call_task_dispatches_a_real_tool_call_end_to_end(
         else:
             raise AssertionError("call.hangup was never dispatched through the real gateway")
 
+        # Phase 2.5: wait for the durable "tool_result" turn too (not just
+        # the telephony side effect above) before cancelling -- otherwise
+        # cancellation could race ahead of ToolGateway.execute() actually
+        # returning and cut off this turn's own persistence.
+        for _ in range(200):
+            turns = list_conversation_turns(tenant_context, call.id)
+            if any(turn.role == "tool_result" for turn in turns):
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("the durable tool_result turn was never persisted")
+
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
@@ -362,3 +377,20 @@ def test_run_call_task_dispatches_a_real_tool_call_end_to_end(
     assert call_ref not in telephony.live_calls
     entries = list_audit_log(tenant_context.tenant_id, resource_type="tool_call")
     assert any((entry.entry_metadata or {}).get("status") == "succeeded" for entry in entries)
+
+    # Phase 2.5: the real Tool Gateway dispatch above also produced durable
+    # conversation turns -- the assistant's tool-call turn ordered strictly
+    # before its own tool-result turn (brief section 5), through the real
+    # ConversationPersistence -> DatabaseBoundary -> PostgreSQL path, not a
+    # fake.
+    turns = list_conversation_turns(tenant_context, call.id)
+    sequences = [turn.sequence for turn in turns]
+    assert sequences == sorted(sequences)
+    roles = [turn.role for turn in turns]
+    assert "tool_call" in roles
+    assert "tool_result" in roles
+    tool_call_index = roles.index("tool_call")
+    tool_result_index = roles.index("tool_result")
+    assert tool_call_index < tool_result_index
+    tool_call_turn = turns[tool_call_index]
+    assert tool_call_turn.tool_payload == {"name": "call.hangup", "arguments": {}}

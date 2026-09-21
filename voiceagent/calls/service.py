@@ -111,13 +111,31 @@ def get_call_session(context: TenantContext, call_session_id: uuid.UUID) -> Call
         return row
 
 
-def list_call_sessions(context: TenantContext) -> Sequence[CallSession]:
+def list_call_sessions(
+    context: TenantContext,
+    *,
+    status: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+) -> Sequence[CallSession]:
+    """`status`/`limit`/`offset` are all optional (Phase 2.5 brief section
+    11: call-history "filtering/pagination") -- omitting every one of them
+    preserves this function's original, unfiltered, unlimited Phase 2.1
+    behavior for its one other caller
+    (`voiceagent.runtime.reconciliation`-adjacent callers use
+    `list_non_terminal_call_sessions()` instead, unaffected by this
+    signature). Ordered newest-first (`created_at` descending, `id`
+    descending as a stable tie-break) so pagination is deterministic."""
     with tenant_scope(context) as session:
-        rows = (
-            session.execute(select(CallSession).where(CallSession.tenant_id == context.tenant_id))
-            .scalars()
-            .all()
-        )
+        query = select(CallSession).where(CallSession.tenant_id == context.tenant_id)
+        if status is not None:
+            query = query.where(CallSession.status == status)
+        query = query.order_by(CallSession.created_at.desc(), CallSession.id.desc())
+        if offset:
+            query = query.offset(offset)
+        if limit is not None:
+            query = query.limit(limit)
+        rows = session.execute(query).scalars().all()
         for row in rows:
             session.expunge(row)
         return rows

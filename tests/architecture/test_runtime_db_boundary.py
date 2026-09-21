@@ -33,6 +33,7 @@ _SYNC_DB_TOUCHING_NAMES = frozenset(
         "claim_runtime_ownership",
         "authorize_call_data_access",
         "authorize_data_access",
+        "persist_conversation_turn",
         "tenant_scope",
         "session_scope",
         "tenant_session_scope",

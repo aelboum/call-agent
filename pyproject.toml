@@ -66,6 +66,7 @@ packages = [
     "voiceagent.api.v1",
     "voiceagent.calls",
     "voiceagent.config",
+    "voiceagent.conversations",
     "voiceagent.db",
     "voiceagent.phone_numbers",
     "voiceagent.providers",
@@ -165,6 +166,7 @@ type = "forbidden"
 source_modules = [
     "voiceagent.api",
     "voiceagent.config",
+    "voiceagent.conversations",
     "voiceagent.db",
     "voiceagent.providers",
     "voiceagent.runtime",
@@ -188,6 +190,7 @@ type = "forbidden"
 source_modules = [
     "voiceagent.api",
     "voiceagent.config",
+    "voiceagent.conversations",
     "voiceagent.db",
     "voiceagent.runtime",
     "voiceagent.telephony",
@@ -221,6 +224,7 @@ type = "forbidden"
 source_modules = [
     "voiceagent.api",
     "voiceagent.config",
+    "voiceagent.conversations",
     "voiceagent.db",
     "voiceagent.runtime",
     "voiceagent.telephony",
@@ -241,6 +245,7 @@ type = "forbidden"
 source_modules = [
     "voiceagent.api",
     "voiceagent.config",
+    "voiceagent.conversations",
     "voiceagent.db",
     "voiceagent.runtime",
     "voiceagent.telephony",
@@ -262,6 +267,7 @@ type = "forbidden"
 source_modules = [
     "voiceagent.api",
     "voiceagent.config",
+    "voiceagent.conversations",
     "voiceagent.db",
     "voiceagent.runtime",
     "voiceagent.telephony",
@@ -295,3 +301,21 @@ source_modules = [
     "voiceagent.providers.engines.factory",
 ]
 forbidden_modules = ["voiceagent.tools"]
+
+# Phase 2.5: the ConversationEngine emits product-owned events
+# (SystemPromptSet/FinalTranscript/AssistantResponse/ToolCallRequested); it
+# never persists one itself. Persistence belongs to
+# `voiceagent.runtime.conversation_persistence`, which
+# `voiceagent.runtime.call_task` alone wires into the pump as a plain,
+# synchronous callback -- mirroring the identical Tool Gateway fence above.
+[[tool.importlinter.contracts]]
+name = "The ConversationEngine never imports conversation persistence"
+type = "forbidden"
+source_modules = [
+    "voiceagent.providers.engines.contracts",
+    "voiceagent.providers.engines.pipelined",
+    "voiceagent.providers.engines.realtime",
+    "voiceagent.providers.engines.fakes",
+    "voiceagent.providers.engines.factory",
+]
+forbidden_modules = ["voiceagent.conversations", "voiceagent.db"]

@@ -179,6 +179,26 @@ class RuntimeSettings:
     #: audited as a `SYSTEM` actor (no id to attribute cross-tenant), never
     #: silently skipped.
     system_service_account_name: str = "voiceagent-runtime"
+    #: Per-call bound on `voiceagent.runtime.conversation_persistence
+    #: .ConversationPersistence`'s own queue (Phase 2.5 brief section 19:
+    #: "never allow an unbounded queue"). A queue this full for one call
+    #: means persistence is falling behind that call's own event rate;
+    #: further turns are dropped and logged, never blocked on, and never
+    #: grown past this bound.
+    conversation_persistence_queue_size: int = 256
+    #: How many times a single conversation turn's write is retried (with a
+    #: linear backoff, `conversation_persistence_retry_backoff_seconds`)
+    #: before the failure is logged as final and the turn is given up on
+    #: (brief section 7: "bounded retry where appropriate").
+    conversation_persistence_max_retries: int = 3
+    #: The backoff multiplier between retries above.
+    conversation_persistence_retry_backoff_seconds: float = 0.5
+    #: How long `run_call_task()`'s own teardown waits for a call's
+    #: conversation-persistence worker to drain its already-queued turns
+    #: before force-cancelling it (brief section 6: "deterministic shutdown
+    #: behavior") -- bounds how much a slow/unavailable database can delay
+    #: one call's own teardown.
+    conversation_persistence_drain_timeout_seconds: float = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -356,6 +376,44 @@ def settings_from_env(platform: PlatformSettings | None = None) -> Settings:
             system_service_account_name=os.environ.get(
                 "VOICEAGENT_RUNTIME_SYSTEM_SERVICE_ACCOUNT_NAME",
                 defaults.system_service_account_name,
+            ),
+            conversation_persistence_queue_size=(
+                _parse_int("VOICEAGENT_RUNTIME_CONVERSATION_PERSISTENCE_QUEUE_SIZE", raw)
+                if (raw := os.environ.get("VOICEAGENT_RUNTIME_CONVERSATION_PERSISTENCE_QUEUE_SIZE"))
+                is not None
+                else defaults.conversation_persistence_queue_size
+            ),
+            conversation_persistence_max_retries=(
+                _parse_int("VOICEAGENT_RUNTIME_CONVERSATION_PERSISTENCE_MAX_RETRIES", raw)
+                if (
+                    raw := os.environ.get("VOICEAGENT_RUNTIME_CONVERSATION_PERSISTENCE_MAX_RETRIES")
+                )
+                is not None
+                else defaults.conversation_persistence_max_retries
+            ),
+            conversation_persistence_retry_backoff_seconds=(
+                _parse_float(
+                    "VOICEAGENT_RUNTIME_CONVERSATION_PERSISTENCE_RETRY_BACKOFF_SECONDS", raw
+                )
+                if (
+                    raw := os.environ.get(
+                        "VOICEAGENT_RUNTIME_CONVERSATION_PERSISTENCE_RETRY_BACKOFF_SECONDS"
+                    )
+                )
+                is not None
+                else defaults.conversation_persistence_retry_backoff_seconds
+            ),
+            conversation_persistence_drain_timeout_seconds=(
+                _parse_float(
+                    "VOICEAGENT_RUNTIME_CONVERSATION_PERSISTENCE_DRAIN_TIMEOUT_SECONDS", raw
+                )
+                if (
+                    raw := os.environ.get(
+                        "VOICEAGENT_RUNTIME_CONVERSATION_PERSISTENCE_DRAIN_TIMEOUT_SECONDS"
+                    )
+                )
+                is not None
+                else defaults.conversation_persistence_drain_timeout_seconds
             ),
         ),
     )

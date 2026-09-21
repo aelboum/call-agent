@@ -7,7 +7,9 @@ mapping, malformed-event handling and cancellation for
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
+from collections.abc import Sequence
 
 import pytest
 from websockets.exceptions import InvalidStatus
@@ -24,6 +26,17 @@ from voiceagent.providers.stt.deepgram import (
     DeepgramSttProvider,
     create_deepgram_stt_provider,
 )
+
+
+def _without_event_ids(events: Sequence[object]) -> list[object]:
+    """`FinalTranscript.event_id` (Phase 2.5) is a random per-instance
+    idempotency key -- irrelevant to this file's own "does the adapter map
+    the wire shape correctly" assertions, so it is normalized out before
+    equality comparison."""
+    return [
+        dataclasses.replace(event, event_id="") if isinstance(event, FinalTranscript) else event
+        for event in events
+    ]
 
 
 class _FakeStatusResponse:
@@ -90,10 +103,9 @@ def test_stream_sends_raw_audio_and_yields_partial_and_final_transcripts(
         return [event async for event in provider.stream(_one_frame_audio())]
 
     events = asyncio.run(scenario())
-    assert events == [
-        PartialTranscript(text="hall"),
-        FinalTranscript(text="hallo", confidence=0.97),
-    ]
+    assert _without_event_ids(events) == _without_event_ids(
+        [PartialTranscript(text="hall"), FinalTranscript(text="hallo", confidence=0.97)]
+    )
     assert connection.sent[0] == b"\x00\x01\x02\x03"  # raw binary, not JSON-wrapped.
     assert json.loads(connection.sent[-1]) == {"type": "CloseStream"}
 
@@ -112,7 +124,7 @@ def test_stream_drops_malformed_events_without_raising(
         return [event async for event in provider.stream(_empty_audio())]
 
     events = asyncio.run(scenario())
-    assert events == [FinalTranscript(text="ok")]
+    assert _without_event_ids(events) == _without_event_ids([FinalTranscript(text="ok")])
 
 
 def test_auth_failure_maps_to_auth_error_code(mock_websockets_connect) -> None:

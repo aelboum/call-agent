@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import dataclasses
 import json
+from collections.abc import Sequence
 
 import pytest
 from websockets.exceptions import InvalidStatus
@@ -26,6 +28,17 @@ from voiceagent.providers.stt.assemblyai import (
     AssemblyAiSttProvider,
     create_assemblyai_stt_provider,
 )
+
+
+def _without_event_ids(events: Sequence[object]) -> list[object]:
+    """`FinalTranscript.event_id` (Phase 2.5) is a random per-instance
+    idempotency key -- irrelevant to this file's own "does the adapter map
+    the wire shape correctly" assertions, so it is normalized out before
+    equality comparison."""
+    return [
+        dataclasses.replace(event, event_id="") if isinstance(event, FinalTranscript) else event
+        for event in events
+    ]
 
 
 class _FakeStatusResponse:
@@ -72,7 +85,9 @@ def test_stream_sends_base64_json_audio_and_yields_partial_and_final_transcripts
         return [event async for event in provider.stream(_one_frame_audio())]
 
     events = asyncio.run(scenario())
-    assert events == [PartialTranscript(text="hall"), FinalTranscript(text="hallo", confidence=0.9)]
+    assert _without_event_ids(events) == _without_event_ids(
+        [PartialTranscript(text="hall"), FinalTranscript(text="hallo", confidence=0.9)]
+    )
 
     sent_audio = json.loads(connection.sent[0])
     assert base64.b64decode(sent_audio["audio_data"]) == b"\xaa\xbb"

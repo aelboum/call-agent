@@ -160,6 +160,7 @@ def test_row_level_security_is_enabled_and_forced_for_every_table() -> None:
         "agent_versions": (True, True),
         "phone_numbers": (True, True),
         "call_sessions": (True, True),
+        "conversation_turns": (True, True),
     }
 
 

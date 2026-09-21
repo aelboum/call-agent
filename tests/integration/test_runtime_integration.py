@@ -44,6 +44,7 @@ from voiceagent.providers.engines.contracts import EngineSessionConfig, TurnEnde
 from voiceagent.providers.engines.pipelined import PipelinedEngine
 from voiceagent.runtime.assignment import NoRuntimeCapacityError, assign_call_to_runtime
 from voiceagent.runtime.call_task import CallTaskDependencies, CancellationSignal, run_call_task
+from voiceagent.runtime.conversation_persistence import ConversationPersistence
 from voiceagent.runtime.db import DatabaseBoundary
 from voiceagent.runtime.errors import DataAuthorizationDeniedError
 from voiceagent.runtime.fakes import FakeHeartbeatStore
@@ -297,6 +298,7 @@ def test_run_call_task_happy_path_completes_and_finalizes(
         db=db,
         policy_source=_permissive_policy_source(),
         tool_gateway=ToolGateway(),
+        conversation_persistence=ConversationPersistence(db),
         system_actor_user_id=system_actor_user_id,
         system_service_account_name="voiceagent-runtime",
     )
@@ -345,6 +347,7 @@ def test_run_call_task_denied_authorization_never_starts_the_engine(
         db=db,
         policy_source=StaticAiDataPolicySource(AiProviderSettings(eligible_providers=("other",))),
         tool_gateway=ToolGateway(),
+        conversation_persistence=ConversationPersistence(db),
         system_actor_user_id=system_actor_user_id,
         system_service_account_name="voiceagent-runtime",
     )
@@ -387,6 +390,7 @@ def _deps(
         db=db,
         policy_source=_permissive_policy_source(),
         tool_gateway=tool_gateway if tool_gateway is not None else ToolGateway(),
+        conversation_persistence=ConversationPersistence(db),
         system_actor_user_id=system_actor_user_id,
         system_service_account_name=system_service_account_name,
     )
@@ -463,6 +467,7 @@ def test_one_call_failing_does_not_affect_others(make_call_session, system_actor
         db=db,
         policy_source=_permissive_policy_source(),
         tool_gateway=ToolGateway(),
+        conversation_persistence=ConversationPersistence(db),
         system_actor_user_id=system_actor_user_id,
         system_service_account_name="voiceagent-runtime",
     )

@@ -9,11 +9,12 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, ConfigDict
 
 from voiceagent.api.errors import not_found
 from voiceagent.calls.errors import CallSessionNotFoundError
+from voiceagent.calls.lifecycle import VALID_STATUSES
 from voiceagent.calls.models import CallSession
 from voiceagent.calls.permissions import RESOURCE
 from voiceagent.calls.service import get_call_session, list_call_sessions
@@ -62,6 +63,19 @@ def get_call_session_route(
 
 @router.get("")
 def list_call_sessions_route(
+    status: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
     context: TenantContext = Depends(_read),  # noqa: B008
 ) -> list[CallSessionOut]:
-    return [CallSessionOut.from_model(call) for call in list_call_sessions(context)]
+    """Newest-first, paginated (`limit`/`offset`), optionally filtered to one
+    lifecycle `status`. An unrecognized `status` value matches no row (the
+    same `CHECK` constraint that governs `CallSession.status` itself) rather
+    than being rejected -- there is no distinct-response reason to prefer a
+    422 over an empty page here."""
+    if status is not None and status not in VALID_STATUSES:
+        return []
+    return [
+        CallSessionOut.from_model(call)
+        for call in list_call_sessions(context, status=status, limit=limit, offset=offset)
+    ]

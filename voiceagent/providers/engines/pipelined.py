@@ -27,6 +27,7 @@ import contextlib
 from collections.abc import AsyncIterator
 
 from voiceagent.providers.engines.contracts import (
+    AssistantResponse,
     AudioOut,
     EngineError,
     EngineEvent,
@@ -36,6 +37,7 @@ from voiceagent.providers.engines.contracts import (
     LlmProvider,
     PartialTranscript,
     SttProvider,
+    SystemPromptSet,
     ToolCallRequested,
     ToolResult,
     TtsProvider,
@@ -74,6 +76,14 @@ class PipelinedEngineSession:
         self._events: asyncio.Queue[EngineEvent | None] = asyncio.Queue()
         self._pending_tool_results: dict[str, asyncio.Future[ToolResult]] = {}
         self._turn_task: asyncio.Task[None] | None = None
+        # Durable "system"/"assistant" turns (Phase 2.5): emitted once, up
+        # front, before any audio has been sent or received -- buffered by
+        # `self._events` (an ordinary asyncio.Queue) until a consumer starts
+        # draining `events()`, exactly like every other event this session
+        # emits.
+        self._emit(SystemPromptSet(instructions=config.instructions))
+        if config.greeting:
+            self._emit(AssistantResponse(text=config.greeting))
         self._stt_task: asyncio.Task[None] = asyncio.create_task(self._consume_stt())
 
     def _emit(self, event: EngineEvent) -> None:
@@ -165,6 +175,10 @@ class PipelinedEngineSession:
                 break
         if buffer:
             self._messages.append({"role": "assistant", "content": buffer})
+            # Emitted once, before synthesis: the durable "assistant" turn
+            # (Phase 2.5) is the text the agent decided to say, independent
+            # of how many AudioOut frames its synthesis produces.
+            self._emit(AssistantResponse(text=buffer))
             async for audio in self._tts.synthesize(buffer, self.config.voice):
                 self._emit(audio)
         self._emit(TurnEnded())

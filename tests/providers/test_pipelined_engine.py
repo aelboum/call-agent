@@ -14,12 +14,14 @@ from voiceagent.providers.engines.component_fakes import (
     FakeTtsProvider,
 )
 from voiceagent.providers.engines.contracts import (
+    AssistantResponse,
     AudioOut,
     ConversationEngine,
     EngineSession,
     EngineSessionConfig,
     FinalTranscript,
     PartialTranscript,
+    SystemPromptSet,
     ToolCallRequested,
     ToolResult,
     TurnEnded,
@@ -65,10 +67,17 @@ def test_full_turn_pipeline_ordering() -> None:
 
     events = asyncio.run(scenario())
     kinds = [type(event) for event in events]
-    assert kinds[0] is FinalTranscript
+    # SystemPromptSet and the configured greeting (as an AssistantResponse)
+    # are emitted at session start, ahead of anything caller-driven
+    # (Phase 2.5: the durable "system"/"assistant" turns).
+    assert kinds[0] is SystemPromptSet
+    assert kinds[1] is AssistantResponse
     assert AudioOut in kinds
     assert kinds[-1] is TurnEnded
     assert kinds.index(FinalTranscript) < kinds.index(AudioOut) < len(kinds)
+    # The turn's own finalized assistant text, distinct from the greeting.
+    turn_response = [event for event in events if isinstance(event, AssistantResponse)][-1]
+    assert turn_response.text == "Sure, one moment."
 
 
 def test_partial_and_final_transcripts_are_forwarded() -> None:
@@ -148,7 +157,11 @@ def test_close_is_idempotent_and_ends_the_event_stream() -> None:
         await session.close()
         return [event async for event in session.events()]
 
-    assert asyncio.run(scenario()) == []
+    # The session-start SystemPromptSet/greeting-AssistantResponse pair is
+    # already queued the moment the session is constructed -- close() ends
+    # the stream after them, it does not discard them.
+    events = asyncio.run(scenario())
+    assert [type(event) for event in events] == [SystemPromptSet, AssistantResponse]
 
 
 def test_send_audio_after_close_raises() -> None:

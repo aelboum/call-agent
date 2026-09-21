@@ -35,12 +35,14 @@ Phase 1 defines the contract and a deterministic fake. No real engine exists.
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
 __all__ = [
+    "AssistantResponse",
     "AudioOut",
     "ConversationEngine",
     "EngineError",
@@ -55,6 +57,7 @@ __all__ = [
     "SpeechEnded",
     "SpeechStarted",
     "SttProvider",
+    "SystemPromptSet",
     "ToolCallRequested",
     "ToolResult",
     "ToolSpec",
@@ -64,6 +67,18 @@ __all__ = [
     "VoiceCatalog",
     "VoiceRef",
 ]
+
+
+def _new_event_id() -> str:
+    """A stable, provider-neutral idempotency key for one conversation-turn
+    -shaped event (Phase 2.5: `docs/PHASE-2.5-STATUS.md`, "Idempotency").
+    Generated once, at event construction, so a persistence retry of the
+    *same* event object always carries the *same* id -- never regenerated
+    per delivery attempt. Never a provider SDK id: an engine that has no
+    natural one of its own (e.g. a finalized STT transcript) still gets a
+    stable one here, at the one product-owned boundary every engine event
+    already crosses."""
+    return uuid.uuid4().hex
 
 
 class EngineErrorCode(StrEnum):
@@ -163,8 +178,40 @@ class PartialTranscript:
 
 @dataclass(frozen=True, slots=True)
 class FinalTranscript:
+    """A finalized (not partial) caller utterance -- the durable "user" turn
+    (Phase 2.5). `event_id` is this event's own stable idempotency key,
+    independent of any provider-specific transcript id; a partial (still
+    revisable) result stays a `PartialTranscript` and is never persisted."""
+
     text: str
     confidence: float | None = None
+    event_id: str = field(default_factory=_new_event_id)
+
+
+@dataclass(frozen=True, slots=True)
+class SystemPromptSet:
+    """The resolved system instructions a session started with (Phase 2.5
+    addition to the contract) -- the durable "system" turn. Emitted once, at
+    session start, by every `ConversationEngine` implementation that has a
+    system prompt to record (`PipelinedEngineSession`; a realtime provider
+    session may have none of its own to report and is not required to emit
+    this)."""
+
+    instructions: str
+    event_id: str = field(default_factory=_new_event_id)
+
+
+@dataclass(frozen=True, slots=True)
+class AssistantResponse:
+    """A finalized assistant text turn -- the durable "assistant" turn (Phase
+    2.5 addition to the contract). Distinct from `AudioOut`: this event
+    carries the text the agent decided to say, once, independent of how many
+    `AudioOut` frames its synthesis produces or whether synthesis happens at
+    all. Emitted once per completed assistant utterance, including the
+    configured greeting, if any."""
+
+    text: str
+    event_id: str = field(default_factory=_new_event_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,6 +263,8 @@ type EngineEvent = (
     AudioOut
     | PartialTranscript
     | FinalTranscript
+    | SystemPromptSet
+    | AssistantResponse
     | SpeechStarted
     | SpeechEnded
     | ToolCallRequested

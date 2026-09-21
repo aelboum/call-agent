@@ -53,6 +53,7 @@ from core.rbac import (
 
 from voiceagent.agents import permissions as agents_permissions
 from voiceagent.calls import permissions as calls_permissions
+from voiceagent.conversations import permissions as conversations_permissions
 from voiceagent.phone_numbers import permissions as phone_numbers_permissions
 from voiceagent.tools import permissions as tools_permissions
 from voiceagent.tools.registry import TOOL_REGISTRY
@@ -84,6 +85,7 @@ PERMISSIONS: tuple[tuple[str, str], ...] = (
     (agents_permissions.RESOURCE, "read"),
     (agents_permissions.RESOURCE, "write"),
     (calls_permissions.RESOURCE, "read"),
+    (conversations_permissions.RESOURCE, "read"),
     (phone_numbers_permissions.RESOURCE, "read"),
     (phone_numbers_permissions.RESOURCE, "write"),
     # Phase 2.4: one permission per built-in Tool Gateway tool
@@ -116,6 +118,7 @@ def register_permissions() -> None:
     below) is tenant-scoped."""
     agents_permissions.register()
     calls_permissions.register()
+    conversations_permissions.register()
     phone_numbers_permissions.register()
     tools_permissions.register()
 

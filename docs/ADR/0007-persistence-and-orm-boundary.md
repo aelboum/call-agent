@@ -187,3 +187,28 @@ SaaS-OS `infra/db/orm.py` (the security rationale), `infra/db/rls.py`,
 `examples/reference-consumer/` (models vs migration split), SaaS-OS ADR-0002
 (tenant isolation), ADR-0016 (independent migration histories);
 `docs/PHASE-0-ARCHITECTURE.md` §2.4 G-1/G-4, §19 OD-4, §22.
+
+## Phase 2.5 addendum: conversation-turn ordering, at `voiceagent.conversations`
+
+Phase 2.5 (`docs/PHASE-2.5-STATUS.md`) needed a monotonic per-call ordering
+value for `app.conversation_turns` and found this ADR's point 2
+("`func`/`text` never reintroduced") directly load-bearing for *how* that
+value gets assigned, which the original decision did not anticipate.
+
+A PostgreSQL `IDENTITY`/`SERIAL` column would be the ordinary choice, but
+nothing in `infra.db`'s exported surface expresses one at the ORM layer in a
+way this product's own no-autogenerate, hand-written-migration discipline
+(point 4) could bind reliably without also reaching for `sqlalchemy.func`
+patterns this ADR forecloses. Instead,
+`voiceagent.conversations.service.persist_conversation_turn()` computes the
+next `sequence` value in Python from the small, per-call set of existing
+ones -- **the exact pattern point 2's own table already establishes** for
+`voiceagent.agents.service.create_draft_version()`'s `version_number`
+("no `func.max()`... computed in Python instead") -- made atomic against a
+concurrent writer for the same call by a `SELECT ... FOR UPDATE` lock on the
+owning `CallSession` row, the identical primitive
+`voiceagent.calls.service.claim_runtime_ownership()` already uses for its
+own read-then-write invariant. No new locking primitive, no `func`, no
+`text`, and no upstream change requested -- this addendum records the
+pattern as intentional and reusable, not improvised once more for Phase 2.5
+alone.
