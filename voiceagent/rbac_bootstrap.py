@@ -54,6 +54,8 @@ from core.rbac import (
 from voiceagent.agents import permissions as agents_permissions
 from voiceagent.calls import permissions as calls_permissions
 from voiceagent.phone_numbers import permissions as phone_numbers_permissions
+from voiceagent.tools import permissions as tools_permissions
+from voiceagent.tools.registry import TOOL_REGISTRY
 
 __all__ = [
     "DEFAULT_ROLE_NAME",
@@ -70,12 +72,25 @@ __all__ = [
 #: permissions exist"). Kept in sync by hand with each `voiceagent.*.permissions`
 #: module; a mismatch would under- or over-grant, which is why both are small
 #: and read together.
+#:
+#: The tools portion (Phase 2.4) is the one deliberate exception: it is
+#: computed from `TOOL_REGISTRY.known_tool_ids()` rather than hand-listed,
+#: because `voiceagent.tools.permissions.register()` already derives its own
+#: permission set the same way (see that module) -- hand-listing tool IDs a
+#: *second* time here would be the exact "mismatch would under- or
+#: over-grant" risk this docstring warns about, applied to the one case
+#: where a second static list genuinely could drift from the first.
 PERMISSIONS: tuple[tuple[str, str], ...] = (
     (agents_permissions.RESOURCE, "read"),
     (agents_permissions.RESOURCE, "write"),
     (calls_permissions.RESOURCE, "read"),
     (phone_numbers_permissions.RESOURCE, "read"),
     (phone_numbers_permissions.RESOURCE, "write"),
+    # Phase 2.4: one permission per built-in Tool Gateway tool
+    # (`voiceagent.tools.permissions`) -- computed from `TOOL_REGISTRY` at
+    # import time, not hand-listed, so this tuple can never omit a
+    # registered tool's permission or list one that does not exist.
+    *((tools_permissions.RESOURCE, tool_id) for tool_id in TOOL_REGISTRY.known_tool_ids()),
 )
 
 #: The role bootstrap creates/reuses -- "which role receives them" (brief
@@ -102,6 +117,7 @@ def register_permissions() -> None:
     agents_permissions.register()
     calls_permissions.register()
     phone_numbers_permissions.register()
+    tools_permissions.register()
 
 
 def _get_or_create_role(tenant_id: uuid.UUID, name: str) -> uuid.UUID:

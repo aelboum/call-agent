@@ -157,6 +157,28 @@ class RuntimeSettings:
     #: refuses to call `authorize_data_access()` without it, rather than
     #: guessing a UUID that would fail its own foreign key at write time).
     system_actor_user_id: uuid.UUID | None = None
+    #: The `core.identity.ServiceAccount.name` the runtime resolves, *per
+    #: tenant*, for `core.rbac.can()` authorization checks
+    #: (`voiceagent.tools.gateway`, Phase 2.4) -- a **name**, not a fixed
+    #: `uuid.UUID`, and deliberately so: unlike `system_actor_user_id` above
+    #: (a `core.users.id`, which is not tenant-bound -- one user row can hold
+    #: separate memberships in many tenants), a `core.identity.ServiceAccount`
+    #: row's `tenant_id` is fixed permanently at creation. One global service
+    #: account id therefore cannot authorize calls across more than the one
+    #: tenant it was created in -- a real design error caught during Phase
+    #: 2.4's own integration testing (a cross-tenant `core.rbac.can()` check
+    #: correctly failed closed, but writing its *audit* entry then violated
+    #: `core.audit_log`'s own `fk_audit_log_tenant_service_account` constraint,
+    #: which exists specifically to foreclose cross-tenant attribution --
+    #: see `docs/PHASE-2.4-STATUS.md`). An operator instead provisions one
+    #: service account *per tenant*, all sharing this one configured name
+    #: (e.g. via `scripts/bootstrap_rbac.py --service-account-name`), and
+    #: `ToolGateway.execute()` resolves the right row for the call's own
+    #: tenant at authorization time (`core.identity.list_service_accounts()`).
+    #: A tenant with no matching, active service account fails closed --
+    #: audited as a `SYSTEM` actor (no id to attribute cross-tenant), never
+    #: silently skipped.
+    system_service_account_name: str = "voiceagent-runtime"
 
 
 @dataclass(frozen=True, slots=True)
@@ -330,6 +352,10 @@ def settings_from_env(platform: PlatformSettings | None = None) -> Settings:
             system_actor_user_id=_parse_uuid(
                 "VOICEAGENT_RUNTIME_SYSTEM_ACTOR_USER_ID",
                 os.environ.get("VOICEAGENT_RUNTIME_SYSTEM_ACTOR_USER_ID"),
+            ),
+            system_service_account_name=os.environ.get(
+                "VOICEAGENT_RUNTIME_SYSTEM_SERVICE_ACCOUNT_NAME",
+                defaults.system_service_account_name,
             ),
         ),
     )

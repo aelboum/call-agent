@@ -128,6 +128,7 @@ def test_runtime_defaults_are_conservative(settings: Settings) -> None:
     assert settings.runtime.to_thread_pool_size > 0
     assert settings.runtime.heartbeat_ttl_seconds > settings.runtime.heartbeat_interval_seconds
     assert settings.runtime.system_actor_user_id is None
+    assert settings.runtime.system_service_account_name == "voiceagent-runtime"
 
 
 def test_runtime_settings_parse_from_env(monkeypatch) -> None:
@@ -138,6 +139,7 @@ def test_runtime_settings_parse_from_env(monkeypatch) -> None:
     monkeypatch.setenv("VOICEAGENT_RUNTIME_HEARTBEAT_TTL_SECONDS", "7.5")
     monkeypatch.setenv("VOICEAGENT_RUNTIME_RECONCILIATION_INTERVAL_SECONDS", "60")
     monkeypatch.setenv("VOICEAGENT_RUNTIME_SYSTEM_ACTOR_USER_ID", str(system_actor))
+    monkeypatch.setenv("VOICEAGENT_RUNTIME_SYSTEM_SERVICE_ACCOUNT_NAME", "custom-runtime-name")
 
     runtime = settings_from_env(_platform()).runtime
     assert runtime == RuntimeSettings(
@@ -147,6 +149,7 @@ def test_runtime_settings_parse_from_env(monkeypatch) -> None:
         heartbeat_ttl_seconds=7.5,
         reconciliation_interval_seconds=60.0,
         system_actor_user_id=system_actor,
+        system_service_account_name="custom-runtime-name",
     )
 
 

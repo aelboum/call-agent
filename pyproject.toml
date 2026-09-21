@@ -77,6 +77,7 @@ packages = [
     "voiceagent.telephony",
     "voiceagent.telephony.freeswitch",
     "voiceagent.tenancy",
+    "voiceagent.tools",
 ]
 
 [tool.ruff]
@@ -170,6 +171,7 @@ source_modules = [
     "voiceagent.tenancy",
     "voiceagent.telephony.contracts",
     "voiceagent.telephony.fakes",
+    "voiceagent.tools",
 ]
 forbidden_modules = ["voiceagent.telephony.freeswitch"]
 
@@ -190,6 +192,7 @@ source_modules = [
     "voiceagent.runtime",
     "voiceagent.telephony",
     "voiceagent.tenancy",
+    "voiceagent.tools",
     "voiceagent.providers.engines.contracts",
     "voiceagent.providers.engines.fakes",
 ]
@@ -222,6 +225,7 @@ source_modules = [
     "voiceagent.runtime",
     "voiceagent.telephony",
     "voiceagent.tenancy",
+    "voiceagent.tools",
     "voiceagent.providers.engines.contracts",
     "voiceagent.providers.engines.pipelined",
     "voiceagent.providers.engines.realtime",
@@ -241,6 +245,7 @@ source_modules = [
     "voiceagent.runtime",
     "voiceagent.telephony",
     "voiceagent.tenancy",
+    "voiceagent.tools",
     "voiceagent.providers.engines.contracts",
     "voiceagent.providers.engines.pipelined",
     "voiceagent.providers.engines.realtime",
@@ -261,6 +266,7 @@ source_modules = [
     "voiceagent.runtime",
     "voiceagent.telephony",
     "voiceagent.tenancy",
+    "voiceagent.tools",
     "voiceagent.providers.engines.contracts",
     "voiceagent.providers.engines.pipelined",
     "voiceagent.providers.engines.realtime",
@@ -269,3 +275,23 @@ forbidden_modules = [
     "voiceagent.providers.tts.elevenlabs",
     "voiceagent.providers.tts.deepgram_aura",
 ]
+
+# Phase 2.4: the ConversationEngine contract and its two implementations
+# never execute a tool themselves and never know which application service
+# implements one (ADR-0003 point 1; brief section 12: "the engine must not
+# execute the handler itself"). `voiceagent.runtime.call_task` is the only
+# module that imports `voiceagent.tools` -- it dispatches a
+# `ToolCallRequested` to the gateway and hands the `ToolResult` back to the
+# engine through the existing `EngineSession.submit_tool_result()` contract,
+# never the other way around.
+[[tool.importlinter.contracts]]
+name = "The ConversationEngine never imports the Tool Gateway"
+type = "forbidden"
+source_modules = [
+    "voiceagent.providers.engines.contracts",
+    "voiceagent.providers.engines.pipelined",
+    "voiceagent.providers.engines.realtime",
+    "voiceagent.providers.engines.fakes",
+    "voiceagent.providers.engines.factory",
+]
+forbidden_modules = ["voiceagent.tools"]

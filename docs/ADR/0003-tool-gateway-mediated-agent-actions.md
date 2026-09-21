@@ -101,3 +101,50 @@ HTTP/MCP tool classes.
 
 SaaS-OS ADR-0004 (tool-mediated access), ADR-0013 (external model boundary);
 `docs/PHASE-0-ARCHITECTURE.md` §8, §14.
+
+## Phase 2.4 addendum: implementation, at `voiceagent.tools`
+
+Phase 2.4 built the Gateway this ADR describes. Two of its mechanisms narrow
+what point 2's primitive list literally names, for reasons that did not exist
+when this ADR was written; both are documented here rather than left to be
+rediscovered from `voiceagent.tools.gateway`'s own docstring alone.
+
+1. **Package name is `voiceagent.tools`, not `callagent.tools.gateway`.**
+   Already implied by ADR-0005 (`callagent` retired; read `voiceagent.*`
+   throughout), restated here because this ADR predates ADR-0005 and still
+   uses the placeholder in its Decision section.
+2. **Idempotency is a bounded, in-memory, per-call cache, not
+   `core.idempotency.run_idempotent()`.** That primitive's `business_fn`
+   is synchronous and runs inside its own DB session/transaction; a Phase
+   2.4 tool handler's real work is an async `TelephonyProvider` call, which
+   cannot run inside that shape without either blocking the event loop on
+   network I/O under an open transaction or a thread-hop the primitive was
+   never designed for. `ToolGateway` instead keeps a `dict[call_session_id,
+   dict[tool_call_id, ToolResult]]`, cleared when the owning call task tears
+   down. This trades durability across a runtime-process crash for
+   compatibility with the async telephony boundary Phase 2.2 already
+   established -- an acceptable trade today because Phase 2.2 implements no
+   crash takeover either (a crashed runtime's calls are not resumed by
+   anything, so there is no redelivery path a durable idempotency store
+   would need to guard against yet). A future crash-takeover decision (Phase
+   2.0 report OQ-4) is exactly the point at which this trade should be
+   revisited, not before.
+3. **Point 7's "persisted `ToolCall` record" is one or more
+   `core.audit_log.record()` entries, not a new database table.** Phase
+   2.4's own brief prohibits a new domain table for something
+   `core.audit_log` already durably persists (tenant-scoped, queryable,
+   RLS-protected) -- a bespoke `tool_calls` table would duplicate that
+   persistence, not add a property the audit log lacks. `voiceagent.tools
+   .gateway` writes one audit entry per terminal outcome (denied,
+   validation_failed, started, succeeded, failed, timed_out, cancelled,
+   duplicate), each carrying `tool_id`, the granular status and
+   `call_session_id` in its metadata -- deliberately never the tool's raw
+   arguments (a transfer destination included), per this ADR's own point 8
+   ("internal detail never crosses that line") read together with the
+   ordinary duty not to duplicate PII into a second store beyond what
+   operational traceability needs.
+
+None of Phase 0's decisions above are reopened by this addendum: points 1-9
+stand as written, including that identity and scope never come from model
+output (point 4) and that two independent gates must both pass (point 6).
+`docs/PHASE-2.4-STATUS.md` is the full implementation report.
