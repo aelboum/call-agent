@@ -87,14 +87,25 @@ class PipelinedEngineSession:
             yield frame
 
     async def _consume_stt(self) -> None:
-        async for item in self._stt.stream(self._audio_iter()):
-            if isinstance(item, PartialTranscript):
-                self._emit(item)
-            elif isinstance(item, FinalTranscript):
-                self._emit(item)
-                self._messages.append({"role": "user", "content": item.text})
-                await self._run_turn()
-        self._events.put_nowait(None)
+        try:
+            async for item in self._stt.stream(self._audio_iter()):
+                if isinstance(item, PartialTranscript):
+                    self._emit(item)
+                elif isinstance(item, FinalTranscript):
+                    self._emit(item)
+                    self._messages.append({"role": "user", "content": item.text})
+                    await self._run_turn()
+        except EngineException as exc:
+            # An STT-stream-level failure (the connection itself died, an
+            # auth rejection, ...) ends this session's ability to keep
+            # listening -- surfaced as an event (ADR-0006: "surfaced rather
+            # than raised"), never left to crash the session's task
+            # silently. Phase 2.2's fakes never raised, so this path was
+            # never exercised before real adapters existed (Phase 2.3
+            # deviation -- see docs/PHASE-2.3-STATUS.md section 3).
+            self._emit(EngineError(code=exc.code, message=str(exc)))
+        finally:
+            self._events.put_nowait(None)
 
     async def _run_turn(self) -> None:
         self._turn_task = asyncio.create_task(self._turn())
@@ -118,6 +129,26 @@ class PipelinedEngineSession:
                 buffer += item
             elif isinstance(item, ToolCallRequested):
                 self._emit(item)
+                # Recorded *before* the tool result, exactly as an
+                # OpenAI-compatible chat-completions history requires: an
+                # assistant message carrying `tool_calls`, immediately
+                # followed by the matching `tool`-role message(s). Phase
+                # 2.2's fakes never round-tripped a real second
+                # `stream_turn()` call through a real provider, so this
+                # gap was never exercised before (Phase 2.3 deviation --
+                # see docs/PHASE-2.3-STATUS.md section 3). `tool_calls` is
+                # a provider-neutral key any `LlmProvider` adapter may read
+                # or ignore -- the contract's own message shape, not an
+                # OpenAI-specific concept leaking upward.
+                self._messages.append(
+                    {
+                        "role": "assistant",
+                        "content": buffer or None,
+                        "tool_calls": [
+                            {"id": item.call_id, "name": item.name, "arguments": item.arguments}
+                        ],
+                    }
+                )
                 buffer = ""
                 result = await self._await_tool_result(item.call_id)
                 self._messages.append(

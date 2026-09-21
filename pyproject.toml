@@ -25,6 +25,15 @@ license = { text = "UNLICENSED" }
 # therefore cannot independently drift from, the platform's stack.
 dependencies = [
     "saas-os @ git+https://github.com/aelboum/saas-os@ff550010e5eafecace7311038aadc99fcecfbe3d",
+    # Phase 2.3: the real STT adapters (Deepgram, AssemblyAI) need a
+    # WebSocket client for streaming transcription -- no vendor SDK is
+    # installed for either, so this is the only new dependency the
+    # multi-provider vertical slice requires. LLM (Gemini/Mistral/Groq) and
+    # TTS (ElevenLabs/Deepgram Aura) adapters use `httpx` (already present,
+    # transitively, via the platform's own stack) over SSE/HTTP-streaming,
+    # needing nothing new. Pinned exactly, not `>=`/`*` (repo dependency
+    # policy) -- the version installed and verified during this phase.
+    "websockets==17.1",
 ]
 
 [project.optional-dependencies]
@@ -61,6 +70,9 @@ packages = [
     "voiceagent.phone_numbers",
     "voiceagent.providers",
     "voiceagent.providers.engines",
+    "voiceagent.providers.stt",
+    "voiceagent.providers.llm",
+    "voiceagent.providers.tts",
     "voiceagent.runtime",
     "voiceagent.telephony",
     "voiceagent.telephony.freeswitch",
@@ -182,3 +194,78 @@ source_modules = [
     "voiceagent.providers.engines.fakes",
 ]
 forbidden_modules = ["pipecat"]
+
+# Phase 2.3: each vendor's request/response shape stays inside its own
+# adapter module. Everything above a component registry depends on
+# `voiceagent.providers.stt.registry.create_stt_provider()` (and the llm/tts
+# equivalents) -- never a vendor module directly.
+#
+# `voiceagent.providers.engines.factory` is deliberately NOT a source module
+# here: it legitimately *transitively* reaches every vendor module through
+# the registries it calls (`import-linter`'s "forbidden" contract treats
+# transitive reachability as a violation, which would make this contract
+# reject factory.py's own, correct, registry-mediated import). Factory.py's
+# own "no vendor module imported directly" property is instead enforced by
+# `tests/architecture/test_import_boundaries.py
+# ::test_vendor_adapter_modules_are_confined_to_their_own_registry`, an
+# AST scan that checks direct imports only -- the two enforcement layers
+# are complementary, not redundant, exactly as this repository's existing
+# Pipecat/FreeSWITCH fences already are (both an import-linter contract and
+# an AST test).
+[[tool.importlinter.contracts]]
+name = "STT vendor adapters stay behind voiceagent.providers.stt.registry"
+type = "forbidden"
+source_modules = [
+    "voiceagent.api",
+    "voiceagent.config",
+    "voiceagent.db",
+    "voiceagent.runtime",
+    "voiceagent.telephony",
+    "voiceagent.tenancy",
+    "voiceagent.providers.engines.contracts",
+    "voiceagent.providers.engines.pipelined",
+    "voiceagent.providers.engines.realtime",
+]
+forbidden_modules = [
+    "voiceagent.providers.stt.deepgram",
+    "voiceagent.providers.stt.assemblyai",
+]
+
+[[tool.importlinter.contracts]]
+name = "LLM vendor adapters stay behind voiceagent.providers.llm.registry"
+type = "forbidden"
+source_modules = [
+    "voiceagent.api",
+    "voiceagent.config",
+    "voiceagent.db",
+    "voiceagent.runtime",
+    "voiceagent.telephony",
+    "voiceagent.tenancy",
+    "voiceagent.providers.engines.contracts",
+    "voiceagent.providers.engines.pipelined",
+    "voiceagent.providers.engines.realtime",
+]
+forbidden_modules = [
+    "voiceagent.providers.llm.gemini",
+    "voiceagent.providers.llm.mistral",
+    "voiceagent.providers.llm.groq",
+]
+
+[[tool.importlinter.contracts]]
+name = "TTS vendor adapters stay behind voiceagent.providers.tts.registry"
+type = "forbidden"
+source_modules = [
+    "voiceagent.api",
+    "voiceagent.config",
+    "voiceagent.db",
+    "voiceagent.runtime",
+    "voiceagent.telephony",
+    "voiceagent.tenancy",
+    "voiceagent.providers.engines.contracts",
+    "voiceagent.providers.engines.pipelined",
+    "voiceagent.providers.engines.realtime",
+]
+forbidden_modules = [
+    "voiceagent.providers.tts.elevenlabs",
+    "voiceagent.providers.tts.deepgram_aura",
+]

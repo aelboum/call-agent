@@ -111,8 +111,49 @@ def test_no_commercial_ai_provider_sdk_is_imported_anywhere() -> None:
     imported by any product module -- ADR-0009 point 6 (none of the three
     providers researched for the first vertical slice becomes a hard
     architectural dependency), checked mechanically rather than by
-    convention, exactly like the Pipecat fence above."""
+    convention, exactly like the Pipecat fence above.
+
+    Still zero occurrences in Phase 2.3, and deliberately so: the real
+    Deepgram/ElevenLabs adapters (`voiceagent.providers.stt.deepgram`,
+    `voiceagent.providers.tts.elevenlabs`) are built directly against
+    `httpx`/`websockets`, never a vendor SDK package -- this assertion
+    needed no `allowed_modules` loosening to stay true."""
     assert _violations(("openai", "elevenlabs", "deepgram")) == []
+
+
+def test_no_additional_llm_vendor_sdk_is_imported_anywhere() -> None:
+    """Phase 2.3: Gemini, Mistral and Groq adapters are likewise built
+    directly against `httpx` -- no `google-generativeai`/`google-genai`,
+    `mistralai` or `groq` SDK package is a dependency of this product."""
+    assert _violations(("google.generativeai", "google.genai", "mistralai", "groq")) == []
+
+
+def test_vendor_adapter_modules_are_confined_to_their_own_registry() -> None:
+    """Phase 2.3 brief: "no Gemini/Mistral/Groq/Deepgram/ElevenLabs SDK
+    types may leak into CallRuntime/ConversationEngine/PipelinedEngine/
+    CallSession/API schemas/TelephonyProvider/MediaProvider/domain
+    models... provider-specific translation stays at the adapter boundary."
+    A second, AST-based enforcement layer alongside the matching
+    `pyproject.toml` import-linter "vendor adapters stay behind ...
+    registry" contracts -- this one works with nothing installed, exactly
+    like the Pipecat fence, and also catches the case those contracts
+    can't: `voiceagent.providers.engines.factory` itself importing a
+    vendor module directly instead of going through the registry."""
+    allowed = (
+        "voiceagent.providers.stt.registry",
+        "voiceagent.providers.llm.registry",
+        "voiceagent.providers.tts.registry",
+    )
+    vendor_modules = (
+        "voiceagent.providers.stt.deepgram",
+        "voiceagent.providers.stt.assemblyai",
+        "voiceagent.providers.llm.gemini",
+        "voiceagent.providers.llm.mistral",
+        "voiceagent.providers.llm.groq",
+        "voiceagent.providers.tts.elevenlabs",
+        "voiceagent.providers.tts.deepgram_aura",
+    )
+    assert _violations(vendor_modules, allowed_modules=allowed) == []
 
 
 def test_object_storage_sdk_is_not_imported_anywhere_yet() -> None:
