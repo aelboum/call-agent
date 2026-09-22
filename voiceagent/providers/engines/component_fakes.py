@@ -34,11 +34,25 @@ class FakeSttProvider:
     """Yields one `FinalTranscript` after every `frames_per_utterance` audio
     frames received, cycling through `texts` (repeating the last entry once
     exhausted, rather than raising, so a test need not predict the exact
-    number of utterances in advance)."""
+    number of utterances in advance).
 
-    def __init__(self, texts: Sequence[str] = ("hello",), *, frames_per_utterance: int = 1) -> None:
+    `emit_partial` (Phase 2.13, default `False` so every call site predating
+    this phase is unaffected) yields one `PartialTranscript` of the same text
+    immediately before each `FinalTranscript` -- the shape a test needs to
+    exercise `PipelinedEngineSession`'s barge-in signal
+    (`SpeechStarted`/`SpeechEnded`, emitted around a caller's first partial
+    result of an utterance)."""
+
+    def __init__(
+        self,
+        texts: Sequence[str] = ("hello",),
+        *,
+        frames_per_utterance: int = 1,
+        emit_partial: bool = False,
+    ) -> None:
         self._texts = list(texts)
         self._frames_per_utterance = frames_per_utterance
+        self._emit_partial = emit_partial
         self.frames_received = 0
 
     async def stream(
@@ -53,6 +67,8 @@ class FakeSttProvider:
                 count = 0
                 text = self._texts[min(utterance_index, len(self._texts) - 1)]
                 utterance_index += 1
+                if self._emit_partial:
+                    yield PartialTranscript(text=text)
                 yield FinalTranscript(text=text)
 
 

@@ -82,6 +82,33 @@ def test_an_error_response_raises_transport_error() -> None:
         asyncio.run(provider.answer("call-1"))
 
 
+class _SlowEslConnection(FakeEslConnection):
+    """A `FakeEslConnection` whose `send()` never returns -- simulates a
+    wedged control connection (Phase 2.13 hardening, brief §10: "every
+    external provider operation on the live call path must have an explicit
+    timeout")."""
+
+    async def send(self, command: str) -> str:
+        self.commands.append(command)
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")  # pragma: no cover
+
+
+def test_a_wedged_command_times_out_as_a_transport_error() -> None:
+    esl = _SlowEslConnection()
+    provider = FreeSwitchTelephonyProvider(esl, command_timeout_seconds=0.05)
+    with pytest.raises(TransportError):
+        asyncio.run(provider.answer("call-1"))
+    assert esl.commands == ["uuid_answer call-1"]
+
+
+def test_command_timeout_defaults_do_not_affect_a_normal_response() -> None:
+    esl = FakeEslConnection()
+    provider = FreeSwitchTelephonyProvider(esl, command_timeout_seconds=0.05)
+    asyncio.run(provider.answer("call-1"))
+    assert esl.commands == ["uuid_answer call-1"]
+
+
 def test_events_are_normalized_and_unmapped_events_are_dropped() -> None:
     esl = FakeEslConnection()
     provider = FreeSwitchTelephonyProvider(esl)

@@ -26,7 +26,7 @@ from core.tenancy import create_tenant
 
 from voiceagent.agents.config import AgentConfig
 from voiceagent.agents.service import create_agent, create_draft_version, publish_version
-from voiceagent.calls.errors import CallSessionAlreadyOwnedError
+from voiceagent.calls.errors import CallSessionAlreadyOwnedError, CallSessionOwnershipMismatchError
 from voiceagent.calls.service import (
     claim_runtime_ownership,
     create_call_session,
@@ -190,6 +190,78 @@ def test_assign_call_to_runtime_raises_when_no_capacity(call_session) -> None:
     heartbeats = {"full": _heartbeat("full", load=1, capacity=1)}
     with pytest.raises(NoRuntimeCapacityError):
         assign_call_to_runtime(context, call.id, heartbeats)
+
+
+# --------------------------------------------------------------------------
+# Runtime ownership enforcement (Phase 2.13 hardening, brief §15/§20/§21:
+# "owner accepted, non-owner rejected") -- transition_call_session()'s own
+# opt-in `expected_runtime_instance_id` guard, exercised directly against a
+# real CallSession row.
+# --------------------------------------------------------------------------
+
+
+def test_transition_call_session_accepts_the_owning_runtime(call_session) -> None:
+    context, call = call_session
+    claim_runtime_ownership(context, call.id, runtime_instance_id="runtime-a")
+
+    updated = transition_call_session(
+        context, call.id, to_status="answered", expected_runtime_instance_id="runtime-a"
+    )
+
+    assert updated.status == "answered"
+
+
+def test_transition_call_session_rejects_a_non_owning_runtime(call_session) -> None:
+    context, call = call_session
+    claim_runtime_ownership(context, call.id, runtime_instance_id="runtime-a")
+
+    with pytest.raises(CallSessionOwnershipMismatchError):
+        transition_call_session(
+            context, call.id, to_status="answered", expected_runtime_instance_id="runtime-b"
+        )
+
+    # The rejected attempt must not have mutated anything.
+    assert get_call_session(context, call.id).status == "initiated"
+
+
+def test_transition_call_session_rejects_when_the_call_has_no_owner_yet(call_session) -> None:
+    context, call = call_session
+    # Never claimed by any runtime -- a caller that supplies a real
+    # `expected_runtime_instance_id` must fail closed rather than silently
+    # proceeding against an unclaimed call.
+    with pytest.raises(CallSessionOwnershipMismatchError):
+        transition_call_session(
+            context, call.id, to_status="answered", expected_runtime_instance_id="runtime-a"
+        )
+
+
+def test_transition_call_session_skips_the_check_when_not_supplied(call_session) -> None:
+    """The default (`expected_runtime_instance_id=None`) is unenforced --
+    every caller predating Phase 2.13 (an operator script,
+    `voiceagent.runtime.reconciliation`, every hermetic test) continues to
+    get exactly this behavior, unclaimed call included."""
+    context, call = call_session
+    updated = transition_call_session(context, call.id, to_status="answered")
+    assert updated.status == "answered"
+
+
+def test_transition_call_session_ownership_check_does_not_block_a_later_owner_change(
+    call_session,
+) -> None:
+    """Reconciliation deliberately acts on a call despite its (crashed)
+    owning runtime being gone (module docstring below) -- proven here end to
+    end: a stale-owned call can still be moved to a terminal status by a
+    caller that passes no `expected_runtime_instance_id` at all, exactly
+    what `reconcile_tenant()` does."""
+    context, call = call_session
+    claim_runtime_ownership(context, call.id, runtime_instance_id="crashed-runtime")
+    transition_call_session(context, call.id, to_status="answered")
+
+    updated = transition_call_session(
+        context, call.id, to_status="interrupted", end_reason="runtime_crashed"
+    )
+
+    assert updated.status == "interrupted"
 
 
 # --------------------------------------------------------------------------
@@ -368,6 +440,179 @@ def test_run_call_task_denied_authorization_never_starts_the_engine(
     refreshed = get_call_session(context, call.id)
     assert refreshed.status == "failed"
     assert refreshed.end_reason == "authorization_denied"
+
+
+# --------------------------------------------------------------------------
+# Bounded teardown (Phase 2.13 hardening, brief §4/§16): a wedged
+# engine.close()/media.detach() must delay this call's own teardown by at
+# most its configured bound, never indefinitely, and the CallSession must
+# still end up in a determinate terminal state.
+# --------------------------------------------------------------------------
+
+
+class _SlowCloseSession:
+    """Wraps a real `EngineSession`, adding an artificial delay to
+    `close()` -- everything else passes straight through."""
+
+    def __init__(self, inner, *, close_delay_seconds: float) -> None:
+        self._inner = inner
+        self._close_delay_seconds = close_delay_seconds
+
+    async def send_audio(self, frame: bytes) -> None:
+        await self._inner.send_audio(frame)
+
+    async def interrupt(self) -> None:
+        await self._inner.interrupt()
+
+    async def submit_tool_result(self, result) -> None:
+        await self._inner.submit_tool_result(result)
+
+    async def close(self) -> None:
+        await asyncio.sleep(self._close_delay_seconds)
+        await self._inner.close()
+
+    def events(self):
+        return self._inner.events()
+
+
+class _SlowCloseEngine:
+    def __init__(self, inner, *, close_delay_seconds: float) -> None:
+        self._inner = inner
+        self._close_delay_seconds = close_delay_seconds
+
+    async def start(self, config: EngineSessionConfig) -> _SlowCloseSession:
+        session = await self._inner.start(config)
+        return _SlowCloseSession(session, close_delay_seconds=self._close_delay_seconds)
+
+
+class _SlowDetachMediaProvider:
+    """Wraps a real `MediaProvider`, adding an artificial delay to
+    `detach()` -- everything else passes straight through."""
+
+    def __init__(self, inner, *, detach_delay_seconds: float) -> None:
+        self._inner = inner
+        self._detach_delay_seconds = detach_delay_seconds
+
+    def supported_formats(self):
+        return self._inner.supported_formats()
+
+    async def attach(self, call_ref, fmt=None):
+        return await self._inner.attach(call_ref, fmt)
+
+    async def detach(self, call_ref) -> None:
+        await asyncio.sleep(self._detach_delay_seconds)
+        await self._inner.detach(call_ref)
+
+    def health(self, call_ref):
+        return self._inner.health(call_ref)
+
+
+def test_run_call_task_teardown_is_bounded_by_a_wedged_engine_close(
+    call_session, system_actor_user_id
+) -> None:
+    """`engine_session.close()` never returning must not stop the call from
+    finalizing -- `engine_close_timeout_seconds` bounds it (brief §4)."""
+    context, call = call_session
+    engine = _SlowCloseEngine(
+        PipelinedEngine(
+            FakeSttProvider(["hello"], frames_per_utterance=1),
+            FakeLlmProvider([[TurnEnded()]]),
+            FakeTtsProvider(),
+        ),
+        close_delay_seconds=5.0,
+    )
+    db = DatabaseBoundary(max_workers=2)
+    deps = CallTaskDependencies(
+        engine=engine,
+        media=FakeMediaProvider(),
+        telephony=FakeTelephonyProvider(),
+        db=db,
+        policy_source=_permissive_policy_source(),
+        tool_gateway=ToolGateway(),
+        conversation_persistence=ConversationPersistence(db),
+        system_actor_user_id=system_actor_user_id,
+        system_service_account_name="voiceagent-runtime",
+        engine_close_timeout_seconds=0.1,
+    )
+    cancellation = CancellationSignal()
+
+    async def scenario() -> float:
+        task = asyncio.create_task(
+            run_call_task(
+                context=context,
+                call_session_id=call.id,
+                call_ref="fake-call-slow-close",
+                deps=deps,
+                cancellation=cancellation,
+            )
+        )
+        await asyncio.sleep(0.1)
+        task.cancel()
+        started_at = asyncio.get_running_loop().time()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2.0)
+        return asyncio.get_running_loop().time() - started_at
+
+    try:
+        elapsed = asyncio.run(scenario())
+    finally:
+        db.close()
+
+    # Comfortably under the artificial 5s close() delay -- proves the bound
+    # actually applied, not just that the test's own outer wait_for did.
+    assert elapsed < 1.0, elapsed
+    assert get_call_session(context, call.id).status == "completed"
+
+
+def test_run_call_task_teardown_is_bounded_by_a_wedged_media_detach(
+    call_session, system_actor_user_id
+) -> None:
+    """`media.detach()` never returning must not stop the call from
+    finalizing -- `media_detach_timeout_seconds` bounds it (brief §4)."""
+    context, call = call_session
+    db = DatabaseBoundary(max_workers=2)
+    deps = CallTaskDependencies(
+        engine=PipelinedEngine(
+            FakeSttProvider(["hello"], frames_per_utterance=1),
+            FakeLlmProvider([[TurnEnded()]]),
+            FakeTtsProvider(),
+        ),
+        media=_SlowDetachMediaProvider(FakeMediaProvider(), detach_delay_seconds=5.0),
+        telephony=FakeTelephonyProvider(),
+        db=db,
+        policy_source=_permissive_policy_source(),
+        tool_gateway=ToolGateway(),
+        conversation_persistence=ConversationPersistence(db),
+        system_actor_user_id=system_actor_user_id,
+        system_service_account_name="voiceagent-runtime",
+        media_detach_timeout_seconds=0.1,
+    )
+    cancellation = CancellationSignal()
+
+    async def scenario() -> float:
+        task = asyncio.create_task(
+            run_call_task(
+                context=context,
+                call_session_id=call.id,
+                call_ref="fake-call-slow-detach",
+                deps=deps,
+                cancellation=cancellation,
+            )
+        )
+        await asyncio.sleep(0.1)
+        task.cancel()
+        started_at = asyncio.get_running_loop().time()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2.0)
+        return asyncio.get_running_loop().time() - started_at
+
+    try:
+        elapsed = asyncio.run(scenario())
+    finally:
+        db.close()
+
+    assert elapsed < 1.0, elapsed
+    assert get_call_session(context, call.id).status == "completed"
 
 
 # --------------------------------------------------------------------------

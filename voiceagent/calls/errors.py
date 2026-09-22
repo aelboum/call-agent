@@ -6,6 +6,7 @@ __all__ = [
     "CallSessionAlreadyOwnedError",
     "CallSessionError",
     "CallSessionNotFoundError",
+    "CallSessionOwnershipMismatchError",
     "InvalidCallSessionTransitionError",
 ]
 
@@ -44,3 +45,28 @@ class CallSessionAlreadyOwnedError(CallSessionError):
             f"{owning_runtime_instance_id!r}"
         )
         self.owning_runtime_instance_id = owning_runtime_instance_id
+
+
+class CallSessionOwnershipMismatchError(CallSessionError):
+    """Raised by `voiceagent.calls.service.transition_call_session()` when a
+    caller supplies `expected_runtime_instance_id` and that does not match
+    the call's own `runtime_instance_id` (Phase 2.13 brief §15/§20: "only the
+    owning runtime may operate a call"; "do not trust ... without validating
+    call/session ownership"). Distinct from `CallSessionAlreadyOwnedError`,
+    which `claim_runtime_ownership()` raises for a *conflicting claim*; this
+    one is raised for a conflicting *operation* -- a runtime attempting to
+    progress a call's lifecycle it does not (or no longer) hold."""
+
+    def __init__(
+        self,
+        call_session_id: object,
+        *,
+        expected_runtime_instance_id: str,
+        actual_runtime_instance_id: str | None,
+    ) -> None:
+        super().__init__(
+            f"CallSession {call_session_id} is owned by runtime "
+            f"{actual_runtime_instance_id!r}, not {expected_runtime_instance_id!r}"
+        )
+        self.expected_runtime_instance_id = expected_runtime_instance_id
+        self.actual_runtime_instance_id = actual_runtime_instance_id

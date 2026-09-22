@@ -81,6 +81,7 @@ from voiceagent.providers.engines.contracts import (
     ConversationEngine,
     EngineSessionConfig,
     FinalTranscript,
+    SpeechStarted,
     SystemPromptSet,
     ToolCallRequested,
     ToolResult,
@@ -151,6 +152,25 @@ class CallTaskDependencies:
     #: .system_service_account_name`'s own docstring explains why a single
     #: global id cannot work across tenants).
     system_service_account_name: str
+    #: Phase 2.13 (brief §15): the `voiceagent.runtime.supervisor.CallRuntime
+    #: .instance_id` this call task is running on, threaded through to every
+    #: `transition_call_session()` call below as `expected_runtime_instance_id`
+    #: so a stale or non-owning runtime cannot progress a call it does not
+    #: hold (`CallSession.runtime_instance_id`, claimed exclusively and
+    #: earlier by `voiceagent.runtime.assignment.assign_call_to_runtime()`).
+    #: `None` -- the default -- skips the check entirely, which is what every
+    #: caller predating this phase (no Call Orchestrator exists yet to supply
+    #: a real value; see `run_call_task()`'s own module docstring) continues
+    #: to get.
+    runtime_instance_id: str | None = None
+    #: Bounded teardown (brief §4): the maximum time `run_call_task()`'s own
+    #: `finally` block waits for `engine.close()`/`media.detach()`
+    #: respectively before giving up on that one step and moving on to the
+    #: next -- a wedged provider must delay this call's own teardown by at
+    #: most this much, never indefinitely, and must never block another
+    #: call's teardown at all (each call is its own `asyncio.Task`).
+    engine_close_timeout_seconds: float = 5.0
+    media_detach_timeout_seconds: float = 5.0
 
 
 def _engine_provider_name(agent_version: AgentVersion) -> str:
@@ -310,10 +330,19 @@ async def _run_pumps(
                 _persist(PendingTurn(event_id=event.event_id, role="user", content=event.text))
             elif isinstance(event, AssistantResponse):
                 _persist(PendingTurn(event_id=event.event_id, role="assistant", content=event.text))
-            # PartialTranscript/SpeechStarted/SpeechEnded/TurnEnded/
-            # UsageReported/EngineError: observability-only -- never
-            # persisted (brief section 4: "do not persist every transient
-            # STT partial").
+            elif isinstance(event, SpeechStarted):
+                # Barge-in (Phase 2.13, brief §9): the Call Runtime is the
+                # one place that calls `interrupt()` -- uniformly, across
+                # every `ConversationEngine` implementation
+                # (`voiceagent.providers.engines.realtime.RealtimeProviderSession
+                # .interrupt()`'s own docstring). Unconditional and
+                # unguarded by whether a turn is actually in flight:
+                # `interrupt()` is documented as idempotent and safe to call
+                # at any point, including with nothing to interrupt.
+                await engine_session.interrupt()
+            # PartialTranscript/SpeechEnded/TurnEnded/UsageReported/
+            # EngineError: observability-only -- never persisted (brief
+            # section 4: "do not persist every transient STT partial").
 
     caller_task = asyncio.create_task(pump_caller_audio())
     events_task = asyncio.create_task(pump_engine_events())
@@ -385,6 +414,7 @@ async def run_call_task(
                     call_session_id,
                     to_status="failed",
                     end_reason="authorization_denied",
+                    expected_runtime_instance_id=deps.runtime_instance_id,
                 )
                 finalized = True
                 return
@@ -414,10 +444,18 @@ async def run_call_task(
             # is this phase's stand-in for "answered", since no real
             # FreeSWITCH ANSWERED event is wired up yet).
             await deps.db.run(
-                transition_call_session, context, call_session_id, to_status="answered"
+                transition_call_session,
+                context,
+                call_session_id,
+                to_status="answered",
+                expected_runtime_instance_id=deps.runtime_instance_id,
             )
             await deps.db.run(
-                transition_call_session, context, call_session_id, to_status="in_progress"
+                transition_call_session,
+                context,
+                call_session_id,
+                to_status="in_progress",
+                expected_runtime_instance_id=deps.runtime_instance_id,
             )
 
             await _run_pumps(
@@ -427,14 +465,52 @@ async def run_call_task(
             deps.tool_gateway.forget_call(call_session_id)
             await deps.conversation_persistence.finish(call_session_id)
             if engine_session is not None:
-                with contextlib.suppress(Exception):
-                    await engine_session.close()
+                # Bounded (brief §4): a wedged engine/provider must delay
+                # this call's own teardown by at most
+                # `engine_close_timeout_seconds`, never indefinitely --
+                # `PipelinedEngineSession.close()` is already internally
+                # bounded the same way; this is the second, independent
+                # bound at the one place every engine's close() is awaited,
+                # regardless of which engine it is. One cleanup step's
+                # failure/timeout must never prevent the next
+                # (media.detach(), finalization) from running.
+                try:
+                    await asyncio.wait_for(
+                        engine_session.close(), timeout=deps.engine_close_timeout_seconds
+                    )
+                except TimeoutError:
+                    _logger.warning(
+                        "engine_session.close() timed out for CallSession %s (%.1fs)",
+                        call_session_id,
+                        deps.engine_close_timeout_seconds,
+                    )
+                except Exception:  # noqa: BLE001 -- best-effort external cleanup; see above.
+                    _logger.exception(
+                        "engine_session.close() raised for CallSession %s", call_session_id
+                    )
             if media_stream is not None:
-                with contextlib.suppress(Exception):
-                    await deps.media.detach(call_ref)
+                try:
+                    await asyncio.wait_for(
+                        deps.media.detach(call_ref), timeout=deps.media_detach_timeout_seconds
+                    )
+                except TimeoutError:
+                    _logger.warning(
+                        "media.detach() timed out for CallSession %s (%.1fs)",
+                        call_session_id,
+                        deps.media_detach_timeout_seconds,
+                    )
+                except Exception:  # noqa: BLE001 -- best-effort external cleanup; see above.
+                    _logger.exception("media.detach() raised for CallSession %s", call_session_id)
             if not finalized:
                 status, end_reason = _final_status(cancellation.reason)
                 try:
+                    # No `expected_runtime_instance_id` here, deliberately:
+                    # finalization's one job is to always leave the row in a
+                    # terminal state (this function's own docstring, "never
+                    # left in a non-terminal status") -- that guarantee must
+                    # hold even in the narrow, adversarial case an ownership
+                    # check exists to catch, so it is enforced on the
+                    # *operative* transitions above, never on this one.
                     await deps.db.run(
                         transition_call_session,
                         context,

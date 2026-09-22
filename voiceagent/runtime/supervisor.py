@@ -18,6 +18,22 @@ before `start_call()` is ever called); it only supervises calls it has
 already been told to run, keyed by `call_session_id`, and `start_call()` is
 idempotent for a call already running here so a redelivered assignment
 cannot start a second, duplicate task for the same call.
+
+**Bounded, per-call cancellation (Phase 2.13 hardening, brief §16):**
+`cancel_call()` waits for one call's own teardown for at most
+`cancel_timeout_seconds` before giving up on *waiting* -- it never forcibly
+kills the call's task a second way; `run_call_task()`'s own `finally` block
+is the one teardown path (`voiceagent.runtime.call_task`), and it keeps
+running to completion in the background even once this method has stopped
+waiting on it. This exists so that one call whose own teardown is wedged
+(a provider cleanup call that itself ignores cancellation) cannot block
+`shutdown()` -- or a caller cancelling one specific call -- forever.
+`shutdown()` cancels every owned call **concurrently**, not one at a time:
+sequential cancellation would let a single stuck call's bounded wait still
+serialize behind every other call's, defeating the point of bounding each
+one individually. "One broken call must not block shutdown forever" (brief
+§16) is therefore a property of `shutdown()` as a whole, not just of one
+call's own `cancel_call()`.
 """
 
 from __future__ import annotations
@@ -47,11 +63,13 @@ class CallRuntime:
         address: str,
         capacity: int,
         heartbeat_store: HeartbeatStore,
+        cancel_timeout_seconds: float = 10.0,
     ) -> None:
         self.instance_id = instance_id
         self.address = address
         self.capacity = capacity
         self._heartbeat_store = heartbeat_store
+        self._cancel_timeout_seconds = cancel_timeout_seconds
         self._tasks: dict[uuid.UUID, asyncio.Task[None]] = {}
         self._cancellations: dict[uuid.UUID, CancellationSignal] = {}
         self._errors: dict[uuid.UUID, BaseException] = {}
@@ -114,9 +132,18 @@ class CallRuntime:
             self._cancellations.pop(call_session_id, None)
 
     async def cancel_call(self, call_session_id: uuid.UUID, *, reason: str) -> None:
-        """Cancel one call and wait for its teardown to finish. A no-op if
-        the call is not (or no longer) running here -- cancelling an
-        already-finished or unknown call is not an error."""
+        """Cancel one call and wait -- bounded by `cancel_timeout_seconds`
+        -- for its teardown to finish. A no-op if the call is not (or no
+        longer) running here -- cancelling an already-finished or unknown
+        call is not an error.
+
+        If teardown does not finish within the bound, this method simply
+        stops waiting and returns; `task.cancel()` was already delivered, so
+        `run_call_task()`'s own teardown keeps running in the background
+        (`_wrap_call_task()` still pops it from `self._tasks` whenever it
+        eventually does finish) -- this method just refuses to let one
+        wedged call hold up its own caller, in particular `shutdown()`
+        cancelling every other call concurrently below."""
         task = self._tasks.get(call_session_id)
         if task is None or task.done():
             return
@@ -124,8 +151,18 @@ class CallRuntime:
         if cancellation is not None:
             cancellation.reason = reason
         task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=self._cancel_timeout_seconds)
+        except TimeoutError:
+            _logger.warning(
+                "call %s did not finish tearing down within %.1fs of cancellation (reason=%r); "
+                "no longer waiting on it, teardown continues in the background",
+                call_session_id,
+                self._cancel_timeout_seconds,
+                reason,
+            )
+        except asyncio.CancelledError:
+            pass
 
     def start_heartbeat(self, *, interval_seconds: float, ttl_seconds: float) -> None:
         """Idempotent. Runs until `shutdown()` cancels it -- a live
@@ -156,14 +193,38 @@ class CallRuntime:
         """Cancel every owned call cleanly, then deregister this runtime's
         heartbeat. A graceful shutdown is not the failure mode
         `voiceagent.runtime.reconciliation` reacts to -- deregistering here
-        is what keeps a clean stop from ever being mistaken for a crash."""
+        is what keeps a clean stop from ever being mistaken for a crash.
+
+        **Concurrent, not sequential** (Phase 2.13 hardening, brief §16):
+        every owned call is cancelled at once, each bounded independently by
+        `cancel_call()`'s own `cancel_timeout_seconds` -- cancelling one at a
+        time would let a single wedged call's bounded wait still serialize
+        in front of every call behind it, making the effective shutdown
+        bound `len(self._tasks) * cancel_timeout_seconds` instead of just
+        `cancel_timeout_seconds`. `return_exceptions=True` is required only
+        as a defensive backstop: `cancel_call()` itself already contains
+        every exception it can raise, but shutdown must never fail to
+        deregister this runtime's heartbeat because of a bug in one call's
+        own cancellation path."""
         if self._heartbeat_task is not None:
             self._heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._heartbeat_task
             self._heartbeat_task = None
 
-        for call_session_id in list(self._tasks.keys()):
-            await self.cancel_call(call_session_id, reason="runtime_shutdown")
+        results = await asyncio.gather(
+            *(
+                self.cancel_call(call_session_id, reason="runtime_shutdown")
+                for call_session_id in list(self._tasks.keys())
+            ),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+                _logger.exception(
+                    "cancel_call() raised during shutdown() -- continuing to deregister "
+                    "this runtime's heartbeat regardless",
+                    exc_info=result,
+                )
 
         await self._heartbeat_store.remove(self.instance_id)

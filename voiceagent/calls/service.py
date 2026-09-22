@@ -33,6 +33,7 @@ from datetime import UTC, datetime
 from voiceagent.calls.errors import (
     CallSessionAlreadyOwnedError,
     CallSessionNotFoundError,
+    CallSessionOwnershipMismatchError,
     InvalidCallSessionTransitionError,
 )
 from voiceagent.calls.lifecycle import TERMINAL_STATUSES, VALID_STATUSES, is_valid_transition
@@ -175,16 +176,42 @@ def transition_call_session(
     end_reason: str | None = None,
     fs_channel_uuid: str | None = None,
     runtime_instance_id: str | None = None,
+    expected_runtime_instance_id: str | None = None,
 ) -> CallSession:
     """Apply one lifecycle transition. A redelivered event that names the
     call's *current* status (including an already-terminal one) is a no-op
     success, never an error (Phase 2.0 report §16/§17: duplicate/delayed
-    lifecycle events must not corrupt state)."""
+    lifecycle events must not corrupt state).
+
+    `expected_runtime_instance_id` (Phase 2.13 brief §15/§20) is an optional,
+    opt-in ownership guard: when given, it must equal the call's own
+    `CallSession.runtime_instance_id` (set exclusively by
+    `claim_runtime_ownership()`) or this raises
+    `CallSessionOwnershipMismatchError` instead of applying anything -- a
+    stale or non-owning runtime must not be able to progress a call's
+    lifecycle. Omitted (the default), this check does not run at all, which
+    is what every caller that has no runtime-ownership concept of its own
+    (an operator script, a test, `voiceagent.runtime.reconciliation`, which
+    intentionally acts *despite* the owning runtime being gone) continues to
+    get unchanged. A call with no owner yet (`runtime_instance_id is None`)
+    never satisfies this check -- there is no runtime it could be correct to
+    match -- so a caller passing a real value here always fails closed
+    against an unclaimed call rather than silently proceeding."""
     if to_status not in VALID_STATUSES:
         raise InvalidCallSessionTransitionError(call_session_id, "?", to_status)
 
     with tenant_scope(context) as session:
         call = _get_row(session, context.tenant_id, call_session_id)
+
+        if (
+            expected_runtime_instance_id is not None
+            and call.runtime_instance_id != expected_runtime_instance_id
+        ):
+            raise CallSessionOwnershipMismatchError(
+                call_session_id,
+                expected_runtime_instance_id=expected_runtime_instance_id,
+                actual_runtime_instance_id=call.runtime_instance_id,
+            )
 
         if not is_valid_transition(call.status, to_status):
             raise InvalidCallSessionTransitionError(call_session_id, call.status, to_status)

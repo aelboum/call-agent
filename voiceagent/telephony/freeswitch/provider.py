@@ -15,10 +15,24 @@ instance is required by the default CI suite). `docs/PHASE-2.2-STATUS.md`
 records this explicitly as unverified-against-a-real-server, the same
 posture Phase 0 report §10.4 already took for `mod_audio_stream`'s wire
 protocol before its own conformance test existed.
+
+**Phase 2.13 hardening: every command is bounded** (brief §10 "every
+external provider operation on the live call path must have an explicit
+timeout"). `EslConnection.send()` (`voiceagent.telephony.freeswitch.esl`) is
+an injected protocol with no implementation yet in this repository (that
+module's own docstring: establishing the real TCP transport is explicitly
+out of scope) -- nothing before this phase bounded how long
+`_command()` would wait for a response, so a wedged or slow-to-answer
+control connection would hang whatever call operation was awaiting it (and,
+transitively, that call's own teardown) indefinitely. `command_timeout_seconds`
+normalizes a timeout into the existing `TransportError` taxonomy, the same
+one a dropped/refused connection already raises, so callers do not need a
+second error type to handle a slow command differently from a failed one.
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 
 from voiceagent.telephony.contracts import (
@@ -106,11 +120,19 @@ class FreeSwitchTelephonyProvider:
     FreeSWITCH-specific code path any command or event in this product ever
     passes through."""
 
-    def __init__(self, esl: EslConnection) -> None:
+    def __init__(self, esl: EslConnection, *, command_timeout_seconds: float = 10.0) -> None:
         self._esl = esl
+        self._command_timeout_seconds = command_timeout_seconds
 
     async def _command(self, command: str) -> str:
-        response = await self._esl.send(command)
+        try:
+            response = await asyncio.wait_for(
+                self._esl.send(command), timeout=self._command_timeout_seconds
+            )
+        except TimeoutError as exc:
+            raise TransportError(
+                f"ESL command timed out after {self._command_timeout_seconds}s: {command!r}"
+            ) from exc
         if response.startswith("-ERR"):
             raise TransportError(f"ESL command failed: {command!r} -> {response!r}")
         return response
