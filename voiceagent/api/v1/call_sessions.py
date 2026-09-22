@@ -49,6 +49,10 @@ from voiceagent.followups.service import (
     set_call_outcome,
 )
 from voiceagent.tenancy import TenantContext, require_tenant
+from voiceagent.workflows.errors import WorkflowExecutionNotFoundError
+from voiceagent.workflows.models import CallWorkflowExecution
+from voiceagent.workflows.permissions import RESOURCE as WORKFLOWS_RESOURCE
+from voiceagent.workflows.service import get_execution as get_workflow_execution
 
 router = APIRouter(prefix="/call-sessions", tags=["call-sessions"])
 
@@ -64,6 +68,7 @@ _follow_up_read = require_tenant(FOLLOW_UP_ACTIONS_RESOURCE, "read")
 _follow_up_create = require_tenant(FOLLOW_UP_ACTIONS_RESOURCE, "create")
 _analysis_read = require_tenant(CALL_ANALYSIS_RESOURCE, "read")
 _analysis_rebuild = require_tenant(CALL_ANALYSIS_RESOURCE, "rebuild")
+_workflow_read = require_tenant(WORKFLOWS_RESOURCE, "read")
 
 
 class CallSessionOut(BaseModel):
@@ -369,3 +374,41 @@ def rebuild_call_analysis_route(
     except CallSessionNotFoundError:
         raise not_found("call session") from None
     return CallAnalysisOut.from_model(analysis)
+
+
+# -- Phase 2.10: workflow execution (read-only) --------------------------------
+
+
+class CallWorkflowExecutionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    call_session_id: uuid.UUID
+    agent_version_id: uuid.UUID
+    status: str
+    current_step_id: str
+    steps_executed: int
+    started_at: datetime
+    ended_at: datetime | None
+    failure_reason: str | None
+
+    @classmethod
+    def from_model(cls, row: CallWorkflowExecution) -> CallWorkflowExecutionOut:
+        return cls.model_validate(row)
+
+
+@router.get("/{call_session_id}/workflow-execution")
+def get_call_workflow_execution_route(
+    call_session_id: uuid.UUID,
+    context: TenantContext = Depends(_workflow_read),  # noqa: B008
+) -> CallWorkflowExecutionOut:
+    """Read-only (brief API: "Only expose APIs that are genuinely
+    required") -- there is no route to trigger, cancel, or retry a
+    workflow execution directly; `workflow.advance` (the Tool Gateway tool)
+    is the only way one ever starts or advances, and it is reached only
+    through a live call's own model-issued tool call, never this API."""
+    try:
+        execution = get_workflow_execution(context, call_session_id)
+    except WorkflowExecutionNotFoundError:
+        raise not_found("call workflow execution") from None
+    return CallWorkflowExecutionOut.from_model(execution)

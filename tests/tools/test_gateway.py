@@ -28,7 +28,7 @@ from voiceagent.telephony.fakes import FakeTelephonyProvider
 from voiceagent.tenancy import TenantContext
 from voiceagent.tools.definitions import StrictToolModel, ToolDefinition, ToolRisk
 from voiceagent.tools.gateway import RESOURCE, ToolGateway
-from voiceagent.tools.registry import ToolRegistry
+from voiceagent.tools.registry import TOOL_REGISTRY, ToolRegistry
 
 
 @dataclass
@@ -569,3 +569,45 @@ def test_execution_context_carries_db_and_tenant_context_through(
     )
     assert captured["db"] is db
     assert captured["tenant_context"] is context
+
+
+def test_execution_context_carries_agent_version_and_gateway_self_reference(
+    db, context, audit, allow_authorization
+) -> None:
+    """Phase 2.10: `ToolExecutionContext.agent_version`/`tool_gateway`/
+    `system_service_account_name` are exactly what `workflow.advance`'s own
+    handler needs to invoke a nested tool through this same `ToolGateway`
+    instance -- see that field's own docstring."""
+    captured: dict[str, object] = {}
+
+    async def _capture(ctx, tool_input):
+        captured["agent_version"] = ctx.agent_version
+        captured["tool_gateway"] = ctx.tool_gateway
+        captured["system_service_account_name"] = ctx.system_service_account_name
+        return {"ok": True}
+
+    registry = _custom_registry(_capture)
+    gateway = ToolGateway(registry)
+    agent_version = _agent_version(context, tools=["test.custom"])
+    _run_execute(
+        gateway,
+        db=db,
+        context=context,
+        call_session_id=uuid.uuid4(),
+        agent_version=agent_version,
+        call_ref="ref",
+        telephony=FakeTelephonyProvider(),
+        system_service_account_name="voiceagent-runtime",
+        request=ToolCallRequested(call_id="c1", name="test.custom", arguments={}),
+    )
+    assert captured["agent_version"] is agent_version
+    assert captured["tool_gateway"] is gateway
+    assert captured["system_service_account_name"] == "voiceagent-runtime"
+
+
+def test_workflow_advance_is_a_registered_built_in_tool() -> None:
+    from voiceagent.workflows.config import WORKFLOW_TOOL_ID
+
+    definition = TOOL_REGISTRY.resolve(WORKFLOW_TOOL_ID)
+    assert definition.tool_id == "workflow.advance"
+    assert definition.permission_action == "workflow.advance"

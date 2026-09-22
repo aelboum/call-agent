@@ -61,6 +61,7 @@ from voiceagent.followups import permissions as followups_permissions
 from voiceagent.phone_numbers import permissions as phone_numbers_permissions
 from voiceagent.tools import permissions as tools_permissions
 from voiceagent.tools.registry import TOOL_REGISTRY
+from voiceagent.workflows import permissions as workflows_permissions
 
 __all__ = [
     "DEFAULT_ROLE_NAME",
@@ -114,6 +115,11 @@ PERMISSIONS: tuple[tuple[str, str], ...] = (
     # Phase 2.8: derived post-call analysis (read + explicit rebuild).
     (call_analysis_permissions.RESOURCE, "read"),
     (call_analysis_permissions.RESOURCE, "rebuild"),
+    # Phase 2.10: read-only visibility into a call's workflow execution.
+    # `workflow.advance` itself needs no separate "execute" permission --
+    # it is authorized the same way every other Tool Gateway tool already
+    # is, through the `tools_permissions`-derived tuple below.
+    (workflows_permissions.RESOURCE, "read"),
     # Phase 2.4: one permission per built-in Tool Gateway tool
     # (`voiceagent.tools.permissions`) -- computed from `TOOL_REGISTRY` at
     # import time, not hand-listed, so this tuple can never omit a
@@ -150,6 +156,7 @@ def register_permissions() -> None:
     calendars_permissions.register()
     followups_permissions.register()
     call_analysis_permissions.register()
+    workflows_permissions.register()
     tools_permissions.register()
 
 

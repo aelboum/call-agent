@@ -24,10 +24,18 @@ from voiceagent.agents.errors import (
     AgentVersionNotDraftError,
     AgentVersionNotFoundError,
     AgentVersionNotPublishedError,
+    InvalidAgentConfigError,
 )
 from voiceagent.agents.models import Agent, AgentVersion
 from voiceagent.db import select
 from voiceagent.tenancy import TenantContext, tenant_scope
+
+# Side-effect import: populates voiceagent.tools.registry.TOOL_REGISTRY
+# before validate_tool_references() below ever runs. Safe here (unlike in
+# voiceagent.agents.config): voiceagent.providers.engines.factory imports
+# voiceagent.agents.config, but never this module.
+from voiceagent.tools import handlers as _tool_handlers  # noqa: F401
+from voiceagent.workflows.validation import UnknownWorkflowToolError, validate_tool_references
 
 __all__ = [
     "archive_version",
@@ -121,7 +129,19 @@ def create_draft_version(
 ) -> AgentVersion:
     """Inserts a new `draft` row. Never mutates an existing row -- each call
     creates a fresh version number, even if an earlier draft was never
-    published (Phase 2.0 report §9.2's append-only model)."""
+    published (Phase 2.0 report §9.2's append-only model).
+
+    Phase 2.10: if `config.workflow` is set, every `tool` step's `tool_id`
+    must name a known, available Tool Gateway tool -- checked here, not by
+    `AgentConfig`/`WorkflowDefinition`'s own pydantic validation (see
+    `voiceagent.workflows.config`'s module docstring for why that check
+    cannot live there)."""
+    if config.workflow is not None:
+        try:
+            validate_tool_references(config.workflow)
+        except UnknownWorkflowToolError as exc:
+            raise InvalidAgentConfigError(str(exc)) from exc
+
     config_dict = canonical_config_dict(config)
     config_hash = compute_config_hash(config_dict)
 

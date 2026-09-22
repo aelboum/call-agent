@@ -357,6 +357,9 @@ class ToolGateway:
                 telephony=telephony,
                 tenant_context=context,
                 db=db,
+                agent_version=agent_version,
+                tool_gateway=self,
+                system_service_account_name=system_service_account_name,
             )
             result = await self._run_handler(
                 db=db,

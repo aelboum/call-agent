@@ -202,3 +202,26 @@ def test_phase_2_9_does_not_weaken_row_level_security(offline_sql: str) -> None:
     `0005`) are never repeated, dropped, or altered by `0007`."""
     assert offline_sql.count('ALTER TABLE "app"."follow_up_actions" ENABLE ROW LEVEL SECURITY') == 1
     assert offline_sql.count('ALTER TABLE "app"."follow_up_actions" FORCE ROW LEVEL SECURITY') == 1
+
+
+def test_phase_2_10_table_is_created(offline_sql: str) -> None:
+    assert "CREATE TABLE app.call_workflow_executions (" in offline_sql
+
+
+def test_phase_2_10_table_has_row_level_security(offline_sql: str) -> None:
+    assert 'ALTER TABLE "app"."call_workflow_executions" ENABLE ROW LEVEL SECURITY' in offline_sql
+    assert 'ALTER TABLE "app"."call_workflow_executions" FORCE ROW LEVEL SECURITY' in offline_sql
+
+
+def test_call_workflow_executions_one_per_call_constraint_exists(offline_sql: str) -> None:
+    assert "uq_call_workflow_executions_call_session" in offline_sql
+
+
+def test_phase_2_10_does_not_create_a_second_workflow_definition_table(offline_sql: str) -> None:
+    """The workflow *definition* lives inside the existing, immutable
+    `app.agent_versions.config` JSON column -- Phase 2.10 adds no
+    `workflows`/`workflow_versions` table (also covered generically by
+    `test_deferred_domain_tables_are_never_created` above)."""
+    assert offline_sql.count("CREATE TABLE app.call_workflow_executions (") == 1
+    assert "CREATE TABLE app.workflows (" not in offline_sql
+    assert "CREATE TABLE app.workflow_versions (" not in offline_sql

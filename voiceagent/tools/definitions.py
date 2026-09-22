@@ -22,9 +22,11 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel, ConfigDict
 
 if TYPE_CHECKING:
+    from voiceagent.agents.models import AgentVersion
     from voiceagent.runtime.db import DatabaseBoundary
     from voiceagent.telephony.contracts import CallRef, TelephonyProvider
     from voiceagent.tenancy import TenantContext
+    from voiceagent.tools.gateway import ToolGateway
 
 __all__ = [
     "StrictToolModel",
@@ -92,6 +94,23 @@ class ToolExecutionContext:
     by `voiceagent.runtime.call_task` -- passed through, not re-derived.
     Optional, defaulting to `None`, so the four Phase 2.4 call-control
     handlers (which need neither) are unaffected.
+
+    `agent_version`/`tool_gateway`/`system_service_account_name` (Phase
+    2.10) exist for exactly one handler: `voiceagent.tools.handlers
+    ._workflow_advance` (`workflow.advance`). A workflow `tool` step must
+    invoke another Tool Gateway tool with the identical enforcement --
+    allowlist, RBAC, idempotency, audit -- an ordinary model-issued call
+    gets (brief STEP TYPES: "For tool steps... enforce its existing
+    permission checks"). Rather than re-deriving any of that, the handler
+    is simply handed the same `ToolGateway` instance already executing it
+    (`voiceagent.tools.gateway.ToolGateway.execute()` passes `self`) and
+    calls `.execute()` on it again, recursively, for the one nested tool
+    call a workflow step names -- never for `workflow.advance` itself
+    (`voiceagent.workflows.config.WorkflowToolStep` rejects that at parse
+    time), so this recursion is bounded to depth one. `agent_version` is
+    the same object `ToolGateway.execute()` was already handed by
+    `voiceagent.runtime.call_task` -- passed through so a workflow handler
+    never needs its own database round trip just to re-fetch it.
     """
 
     tenant_id: uuid.UUID
@@ -103,6 +122,9 @@ class ToolExecutionContext:
     telephony: TelephonyProvider
     tenant_context: TenantContext | None = None
     db: DatabaseBoundary | None = None
+    agent_version: AgentVersion | None = None
+    tool_gateway: ToolGateway | None = None
+    system_service_account_name: str | None = None
 
 
 type ToolHandler = Callable[

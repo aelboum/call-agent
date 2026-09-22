@@ -32,6 +32,20 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from voiceagent.workflows.config import WorkflowDefinition
+
+# NOTE: this module deliberately does NOT import voiceagent.tools.handlers
+# for TOOL_REGISTRY's registration side effect, even though
+# WorkflowDefinition's own tool-id validator needs that registry populated
+# to be meaningful -- voiceagent.providers.engines.factory imports this
+# module (for EngineSelection) and must never transitively reach
+# voiceagent.tools/voiceagent.conversations/voiceagent.db (import-linter's
+# "The ConversationEngine never imports the Tool Gateway" contract). The
+# side-effect import instead lives in voiceagent.api.v1.agents (the one
+# place a workflow-bearing AgentConfig is actually parsed from an untrusted
+# request body) and at the top of every hermetic test that constructs a
+# WorkflowDefinition tool step directly.
+
 __all__ = ["AgentConfig", "canonical_config_dict", "compute_config_hash"]
 
 
@@ -98,9 +112,11 @@ class PrivacySettings(_Strict):
 
 class AgentConfig(_Strict):
     """The exact shape from Phase 2.0 report §9.3. `workflow` is `None` for
-    the prompt-only "no-workflow happy path" (Phase 0 report §3.5) -- its
-    structured shape is Phase 3 work (Phase 0 report §9) and is deliberately
-    left as an opaque, nullable value here rather than guessed at."""
+    the prompt-only "no-workflow happy path" (Phase 0 report §3.5) -- when
+    present, it is the closed, bounded
+    `voiceagent.workflows.config.WorkflowDefinition` shape Phase 2.10 adds
+    (a finite, acyclic, five-step-type graph; see that module's own
+    docstring), never an arbitrary or opaque document."""
 
     instructions: str
     greeting: str | None = None
@@ -108,7 +124,7 @@ class AgentConfig(_Strict):
     voice: VoiceRef
     engine: EngineSelection
     tools: list[ToolBinding] = Field(default_factory=list)
-    workflow: dict[str, object] | None = None
+    workflow: WorkflowDefinition | None = None
     transfer_rules: list[TransferRule] = Field(default_factory=list)
     business_hours: BusinessHours
     call_limits: CallLimits = Field(default_factory=CallLimits)

@@ -1,5 +1,6 @@
 """Phase 2.4's four built-in call-control tools, plus Phase 2.6's four
-Contact/Calendar tools, plus Phase 2.7's two Call Outcome/Follow-up tools.
+Contact/Calendar tools, plus Phase 2.7's two Call Outcome/Follow-up tools,
+plus Phase 2.10's one controlled-workflow tool (`workflow.advance`).
 
 Every Phase 2.4 handler is `Tool -> application capability ->
 TelephonyProvider` (brief section 13) -- none of them imports FreeSWITCH/ESL,
@@ -49,6 +50,14 @@ only, taken from `ctx.call_session_id`, never from model output (ADR-0003
 point 4 -- the same rule `HangupInput`'s own docstring states for
 `call.hangup`). See `voiceagent.followups.service`'s own module docstring
 for why neither input model carries a `contact_id` field either.
+
+**Phase 2.10's one handler, `workflow.advance`, is `Tool -> voiceagent
+.workflows.executor.run_workflow() -> {application service, nested Tool
+Gateway call}`.** It takes no arguments (the workflow it advances is always
+the one published on *this* call's own `AgentVersion`) and is the only
+handler in this file that reads `ctx.agent_version`/`ctx.tool_gateway`/
+`ctx.system_service_account_name` -- see `ToolExecutionContext`'s own
+docstring for why those three exist at all.
 """
 
 from __future__ import annotations
@@ -86,10 +95,14 @@ from voiceagent.tools.definitions import (
 )
 from voiceagent.tools.errors import ToolExecutionError
 from voiceagent.tools.registry import TOOL_REGISTRY
+from voiceagent.workflows.config import WORKFLOW_TOOL_ID
+from voiceagent.workflows.executor import run_workflow
 
 if TYPE_CHECKING:
+    from voiceagent.agents.models import AgentVersion
     from voiceagent.runtime.db import DatabaseBoundary
     from voiceagent.tenancy import TenantContext
+    from voiceagent.tools.gateway import ToolGateway
 
 __all__ = [
     "AppointmentRef",
@@ -115,6 +128,8 @@ __all__ = [
     "SetOutcomeOutput",
     "TransferInput",
     "TransferOutput",
+    "WorkflowAdvanceInput",
+    "WorkflowAdvanceOutput",
 ]
 
 #: E.164: a leading `+`, a non-zero first digit, up to 15 digits total.
@@ -675,5 +690,106 @@ TOOL_REGISTRY.register(
         idempotent=False,
         timeout_seconds=_DB_TIMEOUT_SECONDS,
         handler=_create_follow_up,
+    )
+)
+
+
+# -- Phase 2.10: workflow.advance ---------------------------------------------
+
+#: Generous relative to a single DB round trip: one `workflow.advance` call
+#: may walk several steps, one of which may itself be a nested Tool Gateway
+#: call with its own (typically 10s) timeout -- see
+#: `voiceagent.workflows.executor`'s own module docstring for why the loop
+#: itself has no separate timeout: this `ToolDefinition.timeout_seconds`,
+#: enforced by `voiceagent.tools.gateway.ToolGateway._run_handler()`, is the
+#: one bound that covers the whole run.
+_WORKFLOW_ADVANCE_TIMEOUT_SECONDS = 45.0
+
+
+class WorkflowAdvanceInput(StrictToolModel):
+    """No arguments: the workflow to advance is always the one published on
+    *this* call's own `AgentVersion` -- the model can never name, construct,
+    or select a different one (brief LLM BOUNDARY)."""
+
+
+class WorkflowAdvanceOutput(StrictToolModel):
+    status: Literal["completed", "failed", "cancelled", "not_configured", "running"]
+    steps_executed: int
+    final_step_id: str | None = None
+    failure_reason: str | None = None
+
+
+def _require_workflow_context(
+    ctx: ToolExecutionContext,
+) -> tuple[DatabaseBoundary, TenantContext, AgentVersion, ToolGateway, str]:
+    """`workflow.advance` is only ever reachable through `voiceagent.tools
+    .gateway.ToolGateway.execute()`, which always populates `db`/
+    `tenant_context`/`agent_version`/`tool_gateway`/
+    `system_service_account_name` (see `ToolExecutionContext`'s own
+    docstring). `None` here would be a caller bug, not a real, reachable
+    runtime state -- raised as a normalized `ToolExecutionError`, the same
+    as `_require_db_context()` above."""
+    if (
+        ctx.db is None
+        or ctx.tenant_context is None
+        or ctx.agent_version is None
+        or ctx.tool_gateway is None
+        or ctx.system_service_account_name is None
+    ):
+        raise ToolExecutionError("internal_error", "tool execution context is incomplete")
+    return (
+        ctx.db,
+        ctx.tenant_context,
+        ctx.agent_version,
+        ctx.tool_gateway,
+        ctx.system_service_account_name,
+    )
+
+
+async def _workflow_advance(
+    ctx: ToolExecutionContext, _input: StrictToolModel
+) -> dict[str, object]:
+    db, tenant_context, agent_version, tool_gateway, system_service_account_name = (
+        _require_workflow_context(ctx)
+    )
+    result = await run_workflow(
+        db=db,
+        context=tenant_context,
+        call_session_id=ctx.call_session_id,
+        agent_version=agent_version,
+        tool_gateway=tool_gateway,
+        call_ref=ctx.call_ref,
+        telephony=ctx.telephony,
+        system_service_account_name=system_service_account_name,
+    )
+    if result.error_code is not None:
+        # Only a genuine invocation-level problem (no workflow configured,
+        # one already running, or a corrupted definition) raises here --
+        # a workflow that ran and legitimately failed a step is reported as
+        # a normal `status="failed"` value below (ADR-0003 point 8:
+        # "failures are values at the model boundary"), never an exception.
+        raise ToolExecutionError(result.error_code, "the workflow could not be advanced")
+    return {
+        "status": result.status,
+        "steps_executed": result.steps_executed,
+        "final_step_id": result.final_step_id,
+        "failure_reason": result.failure_reason,
+    }
+
+
+# -- registration ------------------------------------------------------------
+
+TOOL_REGISTRY.register(
+    ToolDefinition(
+        tool_id=WORKFLOW_TOOL_ID,
+        name=WORKFLOW_TOOL_ID,
+        description="Advance the current call's configured workflow, if the agent has one.",
+        input_model=WorkflowAdvanceInput,
+        output_model=WorkflowAdvanceOutput,
+        permission_action=WORKFLOW_TOOL_ID,
+        risk=ToolRisk.LOW,
+        idempotent=True,
+        timeout_seconds=_WORKFLOW_ADVANCE_TIMEOUT_SECONDS,
+        handler=_workflow_advance,
     )
 )
