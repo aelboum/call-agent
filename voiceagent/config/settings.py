@@ -35,6 +35,7 @@ from core.config import get_settings as get_platform_settings
 
 __all__ = [
     "AiProviderSettings",
+    "CallIntelligenceSettings",
     "ConfigurationError",
     "FreeSwitchSettings",
     "ObjectStorageSettings",
@@ -202,6 +203,36 @@ class RuntimeSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class CallIntelligenceSettings:
+    """`voiceagent.call_intelligence.worker.CallAiAnalysisWorker` process
+    tunables (Phase 2.12). Deliberately its own dataclass, not a widening of
+    `RuntimeSettings`: this worker is a background process, sharing neither
+    the call-runtime's own `to_thread_pool_size`-bounded `DatabaseBoundary`
+    nor its `system_actor_user_id` (see `voiceagent.followups.worker
+    .FollowUpWorker`'s own module docstring for why a background worker
+    keeps its own separate system-actor value rather than sharing that
+    dataclass).
+
+    `provider`/`model` select the post-call analysis provider
+    (`voiceagent.providers.call_intelligence.registry`) -- `"fake"` by
+    default, matching every other AI provider selector in this product
+    (`AiProviderSettings.default_engine`). `system_actor_user_id` is `None`
+    by default (fail-closed: `voiceagent.call_intelligence.analyzer
+    ._authorize()` cannot call `authorize_data_access()` without one, the
+    identical discipline `RuntimeSettings.system_actor_user_id` already
+    establishes).
+    """
+
+    provider: str = "fake"
+    model: str = "fake-model"
+    timeout_seconds: float = 30.0
+    system_actor_user_id: uuid.UUID | None = None
+    poll_interval_seconds: float = 30.0
+    max_claims_per_tenant_per_tick: int = 5
+    max_concurrent_tenants: int = 4
+
+
+@dataclass(frozen=True, slots=True)
 class Settings:
     """The product's configuration root.
 
@@ -216,6 +247,7 @@ class Settings:
     freeswitch: FreeSwitchSettings = field(default_factory=FreeSwitchSettings)
     ai_providers: AiProviderSettings = field(default_factory=AiProviderSettings)
     runtime: RuntimeSettings = field(default_factory=RuntimeSettings)
+    call_intelligence: CallIntelligenceSettings = field(default_factory=CallIntelligenceSettings)
 
     @property
     def environment(self) -> str:
@@ -415,6 +447,44 @@ def settings_from_env(platform: PlatformSettings | None = None) -> Settings:
                 is not None
                 else defaults.conversation_persistence_drain_timeout_seconds
             ),
+        ),
+        call_intelligence=_call_intelligence_settings_from_env(),
+    )
+
+
+def _call_intelligence_settings_from_env() -> CallIntelligenceSettings:
+    defaults = CallIntelligenceSettings()
+    return CallIntelligenceSettings(
+        provider=os.environ.get("VOICEAGENT_CALL_INTELLIGENCE_PROVIDER", defaults.provider),
+        model=os.environ.get("VOICEAGENT_CALL_INTELLIGENCE_MODEL", defaults.model),
+        timeout_seconds=(
+            _parse_float("VOICEAGENT_CALL_INTELLIGENCE_TIMEOUT_SECONDS", raw)
+            if (raw := os.environ.get("VOICEAGENT_CALL_INTELLIGENCE_TIMEOUT_SECONDS")) is not None
+            else defaults.timeout_seconds
+        ),
+        system_actor_user_id=_parse_uuid(
+            "VOICEAGENT_CALL_INTELLIGENCE_SYSTEM_ACTOR_USER_ID",
+            os.environ.get("VOICEAGENT_CALL_INTELLIGENCE_SYSTEM_ACTOR_USER_ID"),
+        ),
+        poll_interval_seconds=(
+            _parse_float("VOICEAGENT_CALL_INTELLIGENCE_POLL_INTERVAL_SECONDS", raw)
+            if (raw := os.environ.get("VOICEAGENT_CALL_INTELLIGENCE_POLL_INTERVAL_SECONDS"))
+            is not None
+            else defaults.poll_interval_seconds
+        ),
+        max_claims_per_tenant_per_tick=(
+            _parse_int("VOICEAGENT_CALL_INTELLIGENCE_MAX_CLAIMS_PER_TENANT_PER_TICK", raw)
+            if (
+                raw := os.environ.get("VOICEAGENT_CALL_INTELLIGENCE_MAX_CLAIMS_PER_TENANT_PER_TICK")
+            )
+            is not None
+            else defaults.max_claims_per_tenant_per_tick
+        ),
+        max_concurrent_tenants=(
+            _parse_int("VOICEAGENT_CALL_INTELLIGENCE_MAX_CONCURRENT_TENANTS", raw)
+            if (raw := os.environ.get("VOICEAGENT_CALL_INTELLIGENCE_MAX_CONCURRENT_TENANTS"))
+            is not None
+            else defaults.max_concurrent_tenants
         ),
     )
 

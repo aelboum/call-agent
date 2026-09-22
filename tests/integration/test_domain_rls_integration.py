@@ -173,6 +173,7 @@ def test_row_level_security_is_enabled_and_forced_for_every_table() -> None:
         "call_workflow_executions": (True, True),
         "knowledge_sources": (True, True),
         "knowledge_items": (True, True),
+        "call_ai_analyses": (True, True),
     }
 
 

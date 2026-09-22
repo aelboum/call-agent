@@ -54,6 +54,7 @@ from core.rbac import (
 from voiceagent.agents import permissions as agents_permissions
 from voiceagent.calendars import permissions as calendars_permissions
 from voiceagent.call_analysis import permissions as call_analysis_permissions
+from voiceagent.call_intelligence import permissions as call_intelligence_permissions
 from voiceagent.calls import permissions as calls_permissions
 from voiceagent.contacts import permissions as contacts_permissions
 from voiceagent.conversations import permissions as conversations_permissions
@@ -133,6 +134,11 @@ PERMISSIONS: tuple[tuple[str, str], ...] = (
     (knowledge_permissions.RESOURCE_ITEMS, "update"),
     (knowledge_permissions.RESOURCE_ITEMS, "activate"),
     (knowledge_permissions.RESOURCE_ITEMS, "deactivate"),
+    # Phase 2.12: AI post-call analysis (read + explicit rebuild) -- mirrors
+    # Phase 2.8's own (call_analysis_permissions.RESOURCE, "read"/"rebuild")
+    # shape exactly.
+    (call_intelligence_permissions.RESOURCE, "read"),
+    (call_intelligence_permissions.RESOURCE, "rebuild"),
     # Phase 2.4: one permission per built-in Tool Gateway tool
     # (`voiceagent.tools.permissions`) -- computed from `TOOL_REGISTRY` at
     # import time, not hand-listed, so this tuple can never omit a
@@ -171,6 +177,7 @@ def register_permissions() -> None:
     call_analysis_permissions.register()
     workflows_permissions.register()
     knowledge_permissions.register()
+    call_intelligence_permissions.register()
     tools_permissions.register()
 
 

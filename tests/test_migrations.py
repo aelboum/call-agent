@@ -265,3 +265,38 @@ def test_phase_2_11_does_not_create_a_vector_or_generic_document_table(
     )
     for statement in forbidden:
         assert statement not in offline_sql
+
+
+def test_phase_2_12_table_is_created(offline_sql: str) -> None:
+    assert "CREATE TABLE app.call_ai_analyses (" in offline_sql
+
+
+def test_phase_2_12_table_has_row_level_security(offline_sql: str) -> None:
+    assert 'ALTER TABLE "app"."call_ai_analyses" ENABLE ROW LEVEL SECURITY' in offline_sql
+    assert 'ALTER TABLE "app"."call_ai_analyses" FORCE ROW LEVEL SECURITY' in offline_sql
+
+
+def test_call_ai_analyses_versioned_uniqueness_constraint_exists(offline_sql: str) -> None:
+    """Brief VERSIONING: one row per *version*, not one row per call --
+    `UNIQUE(call_session_id, version)`, never a plain
+    `UNIQUE(call_session_id)`."""
+    assert "uq_call_ai_analyses_call_session_version" in offline_sql
+
+
+def test_call_ai_analyses_completed_immutability_trigger_exists(offline_sql: str) -> None:
+    assert "call_ai_analyses_completed_immutable" in offline_sql
+    assert "app.forbid_call_ai_analysis_completed_update" in offline_sql
+
+
+def test_phase_2_12_does_not_create_a_vector_or_generic_analytics_table(offline_sql: str) -> None:
+    """Brief SCOPE RESTRICTIONS: no vector database, no external analytics
+    database, no generic event/task framework table."""
+    forbidden = (
+        "CREATE TABLE app.embeddings (",
+        "CREATE TABLE app.events (",
+        "CREATE TABLE app.tasks (",
+        "CREATE TABLE app.jobs (",
+    )
+    for statement in forbidden:
+        assert statement not in offline_sql
+    assert offline_sql.count("CREATE EXTENSION") == 0
