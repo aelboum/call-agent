@@ -16,7 +16,8 @@ ConversationEngine.start()
     |
 audio <-> engine event pump, until cancelled or either side ends
     |
-teardown: close engine, detach media, finalize CallSession (DatabaseBoundary.run)
+teardown: close engine, detach media, finalize CallSession,
+          build CallAnalysis                (DatabaseBoundary.run)
 ```
 
 **No database access happens inside the pump** (`_run_pumps()`) -- only
@@ -47,6 +48,16 @@ it is still unreachable at execution time regardless (the gateway's own
 allowlist-plus-registry check is the real, independent enforcement point;
 what is advertised here is a convenience, never a security boundary by
 itself).
+
+**Phase 2.8 adds one best-effort step to teardown**: after `CallSession`
+finalization, `run_call_task()` calls `voiceagent.call_analysis.service
+.build_call_analysis()` through the same `deps.db.run()` seam every other
+write here already crosses -- no new background mechanism, no job
+framework (brief section 6). It runs strictly after the audio pump has
+already stopped, so it never blocks the audio path; a failure is logged and
+swallowed, never allowed to crash this call's teardown or another call's
+task, and is always recoverable later through the explicit
+`POST /v1/call-sessions/{id}/analysis/rebuild` route.
 """
 
 from __future__ import annotations
@@ -60,6 +71,7 @@ from dataclasses import dataclass
 
 from voiceagent.agents.models import AgentVersion
 from voiceagent.agents.service import get_agent_version
+from voiceagent.call_analysis.service import build_call_analysis
 from voiceagent.calls.errors import InvalidCallSessionTransitionError
 from voiceagent.calls.service import get_call_session, transition_call_session
 from voiceagent.observability import bind_correlation_context
@@ -453,3 +465,18 @@ async def run_call_task(
                     _logger.exception(
                         "failed to finalize CallSession %s to status=%r", call_session_id, status
                     )
+            # Phase 2.8: best-effort post-call analysis build, after the
+            # CallSession's own finalization above (accurate duration_ms
+            # needs ended_at already set) -- the exact same DatabaseBoundary
+            # seam every other write in this function already crosses, never
+            # a new background/job mechanism (brief section 6). Never
+            # allowed to fail call teardown or crash another call's task:
+            # a stale/missing CallAnalysis row is always recoverable later
+            # through `POST /v1/call-sessions/{id}/analysis/rebuild`, so
+            # logging and moving on is correct here, not merely convenient.
+            try:
+                await deps.db.run(build_call_analysis, context, call_session_id)
+            except Exception:  # noqa: BLE001 -- see comment above.
+                _logger.exception(
+                    "failed to build CallAnalysis for CallSession %s", call_session_id
+                )

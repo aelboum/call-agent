@@ -23,6 +23,10 @@ from voiceagent.calendars.errors import (
     InvalidIntervalError,
     NaiveDatetimeError,
 )
+from voiceagent.call_analysis.errors import CallAnalysisNotFoundError
+from voiceagent.call_analysis.models import CallAnalysis
+from voiceagent.call_analysis.permissions import RESOURCE as CALL_ANALYSIS_RESOURCE
+from voiceagent.call_analysis.service import build_call_analysis, get_call_analysis
 from voiceagent.calls.errors import CallSessionNotFoundError
 from voiceagent.calls.lifecycle import VALID_STATUSES
 from voiceagent.calls.models import CallSession
@@ -58,6 +62,8 @@ _outcome_read = require_tenant(CALL_OUTCOMES_RESOURCE, "read")
 _outcome_update = require_tenant(CALL_OUTCOMES_RESOURCE, "update")
 _follow_up_read = require_tenant(FOLLOW_UP_ACTIONS_RESOURCE, "read")
 _follow_up_create = require_tenant(FOLLOW_UP_ACTIONS_RESOURCE, "create")
+_analysis_read = require_tenant(CALL_ANALYSIS_RESOURCE, "read")
+_analysis_rebuild = require_tenant(CALL_ANALYSIS_RESOURCE, "rebuild")
 
 
 class CallSessionOut(BaseModel):
@@ -290,3 +296,68 @@ def create_follow_up_route(
     except CalendarEventConflictError:
         raise conflict("Requested interval conflicts with an existing appointment.") from None
     return FollowUpOut.from_model(row)
+
+
+# -- Phase 2.8: call analysis ---------------------------------------------------
+
+
+class CallAnalysisOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    call_session_id: uuid.UUID
+    status: str
+    turn_count: int
+    user_turn_count: int
+    assistant_turn_count: int
+    tool_call_count: int
+    tool_result_count: int
+    duration_ms: int | None
+    had_transfer: bool
+    had_hold: bool
+    contact_associated: bool
+    outcome: str | None
+    follow_up_count: int
+    appointment_follow_up_count: int
+    open_follow_up_count: int
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def from_model(cls, row: CallAnalysis) -> CallAnalysisOut:
+        return cls.model_validate(row)
+
+
+@router.get("/{call_session_id}/analysis")
+def get_call_analysis_route(
+    call_session_id: uuid.UUID,
+    context: TenantContext = Depends(_analysis_read),  # noqa: B008
+) -> CallAnalysisOut:
+    """Read-only (brief §7: "the default API should primarily be
+    read-oriented") -- never triggers a build. `404` for both "no such call"
+    and "call exists but has no analysis yet", matching every other
+    not-found response in this codebase (no response here distinguishes the
+    two)."""
+    try:
+        analysis = get_call_analysis(context, call_session_id)
+    except CallAnalysisNotFoundError:
+        raise not_found("call analysis") from None
+    return CallAnalysisOut.from_model(analysis)
+
+
+@router.post("/{call_session_id}/analysis/rebuild")
+def rebuild_call_analysis_route(
+    call_session_id: uuid.UUID,
+    context: TenantContext = Depends(_analysis_rebuild),  # noqa: B008
+) -> CallAnalysisOut:
+    """A separate, explicit permission from `read` (brief §8) -- justified
+    because outcome/follow-up data routinely changes *after* a call ends
+    (that is the entire point of the follow-up domain), so the snapshot
+    taken automatically at call-end is frequently stale for exactly those
+    fields; this route lets an authorized caller refresh it on demand.
+    Idempotent: `build_call_analysis()` upserts rather than duplicating."""
+    try:
+        analysis = build_call_analysis(context, call_session_id)
+    except CallSessionNotFoundError:
+        raise not_found("call session") from None
+    return CallAnalysisOut.from_model(analysis)

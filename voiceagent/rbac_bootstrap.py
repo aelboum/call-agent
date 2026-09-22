@@ -53,6 +53,7 @@ from core.rbac import (
 
 from voiceagent.agents import permissions as agents_permissions
 from voiceagent.calendars import permissions as calendars_permissions
+from voiceagent.call_analysis import permissions as call_analysis_permissions
 from voiceagent.calls import permissions as calls_permissions
 from voiceagent.contacts import permissions as contacts_permissions
 from voiceagent.conversations import permissions as conversations_permissions
@@ -108,6 +109,9 @@ PERMISSIONS: tuple[tuple[str, str], ...] = (
     (followups_permissions.FOLLOW_UP_ACTIONS_RESOURCE, "create"),
     (followups_permissions.FOLLOW_UP_ACTIONS_RESOURCE, "complete"),
     (followups_permissions.FOLLOW_UP_ACTIONS_RESOURCE, "cancel"),
+    # Phase 2.8: derived post-call analysis (read + explicit rebuild).
+    (call_analysis_permissions.RESOURCE, "read"),
+    (call_analysis_permissions.RESOURCE, "rebuild"),
     # Phase 2.4: one permission per built-in Tool Gateway tool
     # (`voiceagent.tools.permissions`) -- computed from `TOOL_REGISTRY` at
     # import time, not hand-listed, so this tuple can never omit a
@@ -143,6 +147,7 @@ def register_permissions() -> None:
     contacts_permissions.register()
     calendars_permissions.register()
     followups_permissions.register()
+    call_analysis_permissions.register()
     tools_permissions.register()
 
 

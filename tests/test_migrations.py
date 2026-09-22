@@ -160,3 +160,16 @@ def test_calendar_events_id_tenant_unique_constraint_is_added(offline_sql: str) 
     exactly the way `0003` fixed a matching gap in `0002` for
     `call_sessions` (see the migration's own module docstring)."""
     assert "uq_calendar_events_id_tenant" in offline_sql
+
+
+def test_phase_2_8_table_is_created(offline_sql: str) -> None:
+    assert "CREATE TABLE app.call_analysis (" in offline_sql
+
+
+def test_phase_2_8_table_has_row_level_security(offline_sql: str) -> None:
+    assert 'ALTER TABLE "app"."call_analysis" ENABLE ROW LEVEL SECURITY' in offline_sql
+    assert 'ALTER TABLE "app"."call_analysis" FORCE ROW LEVEL SECURITY' in offline_sql
+
+
+def test_call_analysis_one_per_call_constraint_exists(offline_sql: str) -> None:
+    assert "uq_call_analysis_call_session" in offline_sql
