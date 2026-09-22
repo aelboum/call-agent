@@ -538,3 +538,34 @@ def test_gateway_resource_matches_permissions_module_resource() -> None:
     from voiceagent.tools.permissions import RESOURCE as PERMISSIONS_RESOURCE
 
     assert RESOURCE == PERMISSIONS_RESOURCE == "voiceagent.tools"
+
+
+def test_execution_context_carries_db_and_tenant_context_through(
+    db, context, audit, allow_authorization
+) -> None:
+    """Phase 2.6: `ToolExecutionContext.db`/`tenant_context` are exactly the
+    `db`/`context` values passed into `execute()`, passed through unchanged
+    -- the seam a Contact/Calendar tool handler needs to call an application
+    service through `DatabaseBoundary.run()`."""
+    captured: dict[str, object] = {}
+
+    async def _capture(ctx, tool_input):
+        captured["db"] = ctx.db
+        captured["tenant_context"] = ctx.tenant_context
+        return {"ok": True}
+
+    registry = _custom_registry(_capture)
+    gateway = ToolGateway(registry)
+    _run_execute(
+        gateway,
+        db=db,
+        context=context,
+        call_session_id=uuid.uuid4(),
+        agent_version=_agent_version(context, tools=["test.custom"]),
+        call_ref="ref",
+        telephony=FakeTelephonyProvider(),
+        system_service_account_name="voiceagent-runtime",
+        request=ToolCallRequested(call_id="c1", name="test.custom", arguments={}),
+    )
+    assert captured["db"] is db
+    assert captured["tenant_context"] is context

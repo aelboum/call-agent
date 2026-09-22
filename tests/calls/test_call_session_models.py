@@ -34,6 +34,7 @@ def test_call_sessions_table_shape() -> None:
         "hangup_cause",
         "end_reason",
         "data_authorization_decision_id",
+        "contact_id",
         "created_at",
         "updated_at",
     }
@@ -75,12 +76,14 @@ def test_status_check_constraint_lists_exactly_the_seven_states() -> None:
 
 
 def test_composite_fks_are_tenant_aware() -> None:
+    """Phase 2.6 adds `fk_call_sessions_contact` (`contact_id`) to the three
+    Phase 2.1 composite FKs -- still every one tenant-aware."""
     table = cast(Table, CallSession.__table__)
     composite = [fk for fk in table.foreign_key_constraints if len(fk.columns) == 2]
-    assert len(composite) == 3
+    assert len(composite) == 4
     referenced_tables = set()
     for fk in composite:
         local = {col.name for col in fk.columns}
         assert "tenant_id" in local
         referenced_tables.add(next(iter(fk.elements)).column.table.name)
-    assert referenced_tables == {"phone_numbers", "agents", "agent_versions"}
+    assert referenced_tables == {"phone_numbers", "agents", "agent_versions", "contacts"}

@@ -161,6 +161,9 @@ def test_row_level_security_is_enabled_and_forced_for_every_table() -> None:
         "phone_numbers": (True, True),
         "call_sessions": (True, True),
         "conversation_turns": (True, True),
+        "contacts": (True, True),
+        "calendars": (True, True),
+        "calendar_events": (True, True),
     }
 
 

@@ -17,12 +17,18 @@ from voiceagent.calls.errors import CallSessionNotFoundError
 from voiceagent.calls.lifecycle import VALID_STATUSES
 from voiceagent.calls.models import CallSession
 from voiceagent.calls.permissions import RESOURCE
-from voiceagent.calls.service import get_call_session, list_call_sessions
+from voiceagent.calls.service import associate_call, get_call_session, list_call_sessions
+from voiceagent.contacts.errors import ContactNotFoundError
 from voiceagent.tenancy import TenantContext, require_tenant
 
 router = APIRouter(prefix="/call-sessions", tags=["call-sessions"])
 
 _read = require_tenant(RESOURCE, "read")
+#: Phase 2.6 (brief §16) adds one new action to the existing
+#: `voiceagent.call_sessions` resource, rather than reusing "read" for a
+#: write -- a role that can only read call sessions must not thereby be able
+#: to mutate one.
+_associate = require_tenant(RESOURCE, "associate")
 
 
 class CallSessionOut(BaseModel):
@@ -36,6 +42,7 @@ class CallSessionOut(BaseModel):
     phone_number_id: uuid.UUID
     agent_id: uuid.UUID
     agent_version_id: uuid.UUID
+    contact_id: uuid.UUID | None
     started_at: datetime | None
     answered_at: datetime | None
     ended_at: datetime | None
@@ -79,3 +86,28 @@ def list_call_sessions_route(
         CallSessionOut.from_model(call)
         for call in list_call_sessions(context, status=status, limit=limit, offset=offset)
     ]
+
+
+class CallSessionAssociateContactRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    contact_id: uuid.UUID
+
+
+@router.post("/{call_session_id}/contact")
+def associate_call_contact_route(
+    call_session_id: uuid.UUID,
+    payload: CallSessionAssociateContactRequest,
+    context: TenantContext = Depends(_associate),  # noqa: B008
+) -> CallSessionOut:
+    """Phase 2.6 brief §16. `associate_call()` reads both rows inside one
+    tenant-scoped session, so a `contact_id` belonging to a different tenant
+    (or no tenant at all) is indistinguishable from "no such contact" --
+    there is no cross-tenant lookup mechanism to expose."""
+    try:
+        call = associate_call(context, call_session_id, payload.contact_id)
+    except CallSessionNotFoundError:
+        raise not_found("call session") from None
+    except ContactNotFoundError:
+        raise not_found("contact") from None
+    return CallSessionOut.from_model(call)

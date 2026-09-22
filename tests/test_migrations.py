@@ -84,24 +84,26 @@ def test_version_table_is_distinct_from_the_platform_history(offline_sql: str) -
 
 
 def test_deferred_domain_tables_are_never_created(offline_sql: str) -> None:
-    """Superseded 2026-09-21 (Phase 2.1), superseded again 2026-09-22 (Phase
-    2.5): the Phase 1 version of this test asserted no migration ever
-    created a table, because Phase 1 had no domain. Phase 2.1 IS the first
-    domain slice (`app.agents`, `app.agent_versions`, `app.phone_numbers`,
-    `app.call_sessions`); Phase 2.5 adds durable conversation history
-    (`app.conversation_turns`) -- so both are correctly absent from this
-    list now, rather than a regression. `conversations` stays deferred
-    permanently, not merely "not yet": `voiceagent/conversations/models.py`'s
-    own module docstring records why this product has no use for a
-    conversation identity independent of `call_session_id`. Every other
-    Phase 2.0-deferred table (Phase 2.0 report §11.2 / Phase 2.1 brief §3)
-    must still never appear, in this migration or any other, ahead of the
-    phase that actually needs it."""
+    """Superseded 2026-09-21 (Phase 2.1), 2026-09-22 (Phase 2.5), and again
+    2026-09-22 (Phase 2.6): the Phase 1 version of this test asserted no
+    migration ever created a table, because Phase 1 had no domain. Phase 2.1
+    IS the first domain slice (`app.agents`, `app.agent_versions`,
+    `app.phone_numbers`, `app.call_sessions`); Phase 2.5 adds durable
+    conversation history (`app.conversation_turns`); Phase 2.6 adds Contacts
+    and a minimal internal calendar (`app.contacts`, `app.calendars`,
+    `app.calendar_events`) -- all correctly absent from this list now,
+    rather than a regression. `conversations` stays deferred permanently,
+    not merely "not yet": `voiceagent/conversations/models.py`'s own module
+    docstring records why this product has no use for a conversation
+    identity independent of `call_session_id`. `appointments` also stays
+    deferred permanently, not "not yet": Phase 2.6's appointment table is
+    named `calendar_events` (`docs/PHASE-2.6-STATUS.md`), not `appointments`.
+    Every other Phase 2.0-deferred table (Phase 2.0 report §11.2 / Phase 2.1
+    brief §3) must still never appear, in this migration or any other, ahead
+    of the phase that actually needs it."""
     deferred_tables = (
         "conversations",
-        "contacts",
         "contact_phones",
-        "calendars",
         "working_hours",
         "appointments",
         "tools",
@@ -123,3 +125,20 @@ def test_conversation_turns_table_is_created(offline_sql: str) -> None:
 def test_conversation_turns_has_row_level_security(offline_sql: str) -> None:
     assert 'ALTER TABLE "app"."conversation_turns" ENABLE ROW LEVEL SECURITY' in offline_sql
     assert 'ALTER TABLE "app"."conversation_turns" FORCE ROW LEVEL SECURITY' in offline_sql
+
+
+def test_phase_2_6_tables_are_created(offline_sql: str) -> None:
+    assert "CREATE TABLE app.contacts (" in offline_sql
+    assert "CREATE TABLE app.calendars (" in offline_sql
+    assert "CREATE TABLE app.calendar_events (" in offline_sql
+
+
+def test_phase_2_6_tables_have_row_level_security(offline_sql: str) -> None:
+    for table in ("contacts", "calendars", "calendar_events"):
+        assert f'ALTER TABLE "app"."{table}" ENABLE ROW LEVEL SECURITY' in offline_sql
+        assert f'ALTER TABLE "app"."{table}" FORCE ROW LEVEL SECURITY' in offline_sql
+
+
+def test_call_sessions_contact_id_column_is_added(offline_sql: str) -> None:
+    assert "ADD COLUMN contact_id" in offline_sql
+    assert "fk_call_sessions_contact" in offline_sql

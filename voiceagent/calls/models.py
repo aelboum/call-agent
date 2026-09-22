@@ -52,6 +52,10 @@ class CallSession(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     phone_number_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
     agent_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
     agent_version_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    #: Optional Phase 2.6 association to a `Contact` -- nullable, set only
+    #: through `voiceagent.calls.service.associate_call()`, never on the
+    #: audio hot path (brief §4/§17).
+    contact_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
     fs_channel_uuid: Mapped[str | None] = mapped_column(String(64), nullable=True)
     runtime_instance_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     runtime_assigned_at: Mapped[datetime | None] = mapped_column(
@@ -83,6 +87,11 @@ class CallSession(Base, UUIDPrimaryKeyMixin, TimestampMixin):
             ["app.agent_versions.id", "app.agent_versions.tenant_id"],
             name="fk_call_sessions_agent_version",
         ),
+        ForeignKeyConstraint(
+            ["contact_id", "tenant_id"],
+            ["app.contacts.id", "app.contacts.tenant_id"],
+            name="fk_call_sessions_contact",
+        ),
         CheckConstraint("direction IN ('inbound', 'outbound')", name="ck_call_sessions_direction"),
         CheckConstraint(
             "status IN ('initiated', 'ringing', 'answered', 'in_progress', "
@@ -92,6 +101,7 @@ class CallSession(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         Index("ix_call_sessions_tenant_id", "tenant_id"),
         Index("ix_call_sessions_phone_number_id", "phone_number_id"),
         Index("ix_call_sessions_agent_version_id", "agent_version_id"),
+        Index("ix_call_sessions_contact_id", "contact_id"),
         Index("ix_call_sessions_status", "status"),
         Index("ix_call_sessions_runtime_instance_id", "runtime_instance_id"),
         Index("ix_call_sessions_fs_channel_uuid", "fs_channel_uuid"),

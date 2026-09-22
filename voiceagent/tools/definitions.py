@@ -22,7 +22,9 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel, ConfigDict
 
 if TYPE_CHECKING:
+    from voiceagent.runtime.db import DatabaseBoundary
     from voiceagent.telephony.contracts import CallRef, TelephonyProvider
+    from voiceagent.tenancy import TenantContext
 
 __all__ = [
     "StrictToolModel",
@@ -76,6 +78,20 @@ class ToolExecutionContext:
     handler (Phase 2.4 brief section 7: "never infer tenant identity from
     user-controlled tool arguments") -- none of it comes from
     `ToolCallRequested.arguments`.
+
+    `tenant_context`/`db` (Phase 2.6) are the one addition since Phase 2.4:
+    a Contact/Calendar tool handler needs to call a synchronous application
+    service (`voiceagent.contacts.service`/`voiceagent.calendars.service`),
+    which requires the full `TenantContext` `tenant_scope()` takes, not just
+    a bare `tenant_id`, and must cross `DatabaseBoundary.run()` rather than
+    ever touching `voiceagent.db`/`voiceagent.tenancy.tenant_scope` directly
+    from inside `voiceagent.tools` (`tests/architecture
+    /test_tool_gateway_isolation.py
+    ::test_no_tool_module_imports_voiceagent_db_directly`). Both are the
+    exact `db`/`context` values `ToolGateway.execute()` was already handed
+    by `voiceagent.runtime.call_task` -- passed through, not re-derived.
+    Optional, defaulting to `None`, so the four Phase 2.4 call-control
+    handlers (which need neither) are unaffected.
     """
 
     tenant_id: uuid.UUID
@@ -85,6 +101,8 @@ class ToolExecutionContext:
     correlation_id: str
     call_ref: CallRef
     telephony: TelephonyProvider
+    tenant_context: TenantContext | None = None
+    db: DatabaseBoundary | None = None
 
 
 type ToolHandler = Callable[

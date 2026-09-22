@@ -9,6 +9,12 @@ __all__ = [
     "InvalidCallSessionTransitionError",
 ]
 
+# Phase 2.6 (brief §4) reuses `voiceagent.contacts.errors.ContactNotFoundError`
+# for "no such contact in this tenant" -- both when a contact_id is looked up
+# directly and when `associate_call()`'s contact_id belongs to no row this
+# tenant can see (including a cross-tenant id) -- rather than adding a second
+# not-found error class for the identical condition.
+
 
 class CallSessionError(Exception):
     """Base class for every CallSession domain error."""

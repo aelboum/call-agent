@@ -37,10 +37,13 @@ from voiceagent.calls.errors import (
 )
 from voiceagent.calls.lifecycle import TERMINAL_STATUSES, VALID_STATUSES, is_valid_transition
 from voiceagent.calls.models import CallSession
+from voiceagent.contacts.errors import ContactNotFoundError
+from voiceagent.contacts.models import Contact
 from voiceagent.db import select
 from voiceagent.tenancy import TenantContext, tenant_scope
 
 __all__ = [
+    "associate_call",
     "claim_runtime_ownership",
     "create_call_session",
     "get_call_session",
@@ -218,6 +221,31 @@ def transition_call_session(
             call.runtime_instance_id = runtime_instance_id
             call.runtime_assigned_at = now
 
+        session.flush()
+        session.refresh(call)
+        session.expunge(call)
+        return call
+
+
+def associate_call(
+    context: TenantContext, call_session_id: uuid.UUID, contact_id: uuid.UUID
+) -> CallSession:
+    """Associate `call_session_id` with `contact_id` (Phase 2.6 brief §4).
+
+    Both rows are read inside the same tenant-scoped session -- a
+    `contact_id` belonging to a different tenant is simply invisible under
+    RLS here, so it surfaces as the identical `ContactNotFoundError` a
+    same-tenant caller would get for a nonexistent id (brief §4: "no
+    cross-tenant association", §16: "do not expose a cross-tenant lookup
+    mechanism"). Never called from the audio hot path (brief §4/§17); the
+    existing `CallSession` lifecycle is otherwise untouched -- this sets
+    exactly one column."""
+    with tenant_scope(context) as session:
+        call = _get_row(session, context.tenant_id, call_session_id)
+        contact = session.get(Contact, contact_id)
+        if contact is None or contact.tenant_id != context.tenant_id:
+            raise ContactNotFoundError(contact_id)
+        call.contact_id = contact_id
         session.flush()
         session.refresh(call)
         session.expunge(call)

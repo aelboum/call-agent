@@ -355,6 +355,8 @@ class ToolGateway:
                 correlation_id=request.call_id,
                 call_ref=call_ref,
                 telephony=telephony,
+                tenant_context=context,
+                db=db,
             )
             result = await self._run_handler(
                 db=db,
