@@ -173,3 +173,32 @@ def test_phase_2_8_table_has_row_level_security(offline_sql: str) -> None:
 
 def test_call_analysis_one_per_call_constraint_exists(offline_sql: str) -> None:
     assert "uq_call_analysis_call_session" in offline_sql
+
+
+def test_phase_2_9_extends_follow_up_actions_not_a_second_table(offline_sql: str) -> None:
+    """Brief §3: "Do not create a second follow-up table" -- verified
+    directly: `follow_up_actions` is still created exactly once (by `0005`),
+    and Phase 2.9 only ever `ALTER TABLE`s it."""
+    assert offline_sql.count("CREATE TABLE app.follow_up_actions (") == 1
+    assert "ALTER TABLE app.follow_up_actions ADD COLUMN attempt_count" in offline_sql
+    assert "ALTER TABLE app.follow_up_actions ADD COLUMN next_attempt_at" in offline_sql
+    assert "ALTER TABLE app.follow_up_actions ADD COLUMN execution_id" in offline_sql
+
+
+def test_phase_2_9_widens_the_status_check_constraint(offline_sql: str) -> None:
+    assert "ck_follow_up_actions_status" in offline_sql
+    assert "'processing'" in offline_sql
+    assert "'failed'" in offline_sql
+
+
+def test_phase_2_9_adds_the_claim_lookup_partial_index(offline_sql: str) -> None:
+    assert "ix_follow_up_actions_claim_lookup" in offline_sql
+    assert "next_attempt_at IS NOT NULL" in offline_sql
+
+
+def test_phase_2_9_does_not_weaken_row_level_security(offline_sql: str) -> None:
+    """Brief §14: "Do not weaken existing policies" -- `follow_up_actions`'s
+    own `ENABLE`/`FORCE ROW LEVEL SECURITY` statements (issued once, by
+    `0005`) are never repeated, dropped, or altered by `0007`."""
+    assert offline_sql.count('ALTER TABLE "app"."follow_up_actions" ENABLE ROW LEVEL SECURITY') == 1
+    assert offline_sql.count('ALTER TABLE "app"."follow_up_actions" FORCE ROW LEVEL SECURITY') == 1

@@ -21,6 +21,7 @@ from voiceagent.db import (
     ForeignKey,
     ForeignKeyConstraint,
     Index,
+    Integer,
     Mapped,
     String,
     Text,
@@ -57,7 +58,13 @@ OUTCOME_VALUES = frozenset(
 )
 
 FOLLOW_UP_TYPES = frozenset({"appointment", "contact", "manual_follow_up"})
-FOLLOW_UP_STATUSES = frozenset({"pending", "completed", "cancelled"})
+
+#: Phase 2.9 brief §3: `"processing"` (claimed, execution in flight or its
+#: lease not yet expired) and `"failed"` (an execution attempt that did not
+#: succeed, retryable up to `voiceagent.followups.retry_policy.MAX_ATTEMPTS`)
+#: join the Phase 2.7 vocabulary. See `voiceagent.followups.lifecycle` for
+#: the transition table between them.
+FOLLOW_UP_STATUSES = frozenset({"pending", "processing", "completed", "cancelled", "failed"})
 
 
 class CallOutcome(Base, UUIDPrimaryKeyMixin, TimestampMixin):
@@ -115,6 +122,43 @@ class FollowUpAction(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     calendar_event_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    #: Phase 2.9 execution metadata (brief §8). `attempt_count` is every
+    #: claim ever made (a stale-lease reclaim counts). `next_attempt_at` is
+    #: the one internal scheduling/bookkeeping column `claim_due_follow_up()`
+    #: reads and writes -- it is never set by a caller directly, unlike
+    #: `due_at` (brief §4: "if the existing Phase 2.7 schema already has a
+    #: suitable scheduling field, reuse it" -- `due_at` remains the caller's
+    #: own, immutable-after-creation, "when should this happen" value; it
+    #: seeds `next_attempt_at` at creation and is never rewritten by
+    #: execution). `next_attempt_at`'s one column serves three purposes by
+    #: construction, never by a compound `OR` filter: "not due yet"
+    #: (`due_at`, copied in at creation), "lease not yet expired"
+    #: (`now + retry_policy.LEASE_SECONDS`, set at claim), and "backing off"
+    #: (`now + retry_policy.next_attempt_delay_seconds(attempt_count)`, set
+    #: on failure) -- `NULL` means "never eligible for automatic claim"
+    #: (brief §5's non-executable types, and a `'failed'` row that has
+    #: exhausted `retry_policy.MAX_ATTEMPTS`).
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_attempted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    #: A short, closed-vocabulary code (`retry_policy.FAILURE_REASONS`) --
+    #: never an exception message, stack trace, or raw provider response
+    #: (brief §8/§17).
+    failure_reason: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    #: A stable identity for this follow-up's execution, generated once at
+    #: its first claim and unchanged by every later attempt or stale-lease
+    #: reclaim (brief §7: "a stable execution/idempotency identity
+    #: associated with the FollowUpAction"). Carried into the audit trail
+    #: (`voiceagent.followups.service`) and into
+    #: `complete_follow_up_execution()`/`fail_follow_up_execution()`'s own
+    #: ownership check (`FollowUpExecutionConflictError`).
+    execution_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+
     __table_args__ = tenant_table_args(
         ForeignKeyConstraint(
             ["call_session_id", "tenant_id"],
@@ -136,16 +180,35 @@ class FollowUpAction(Base, UUIDPrimaryKeyMixin, TimestampMixin):
             name="ck_follow_up_actions_type",
         ),
         CheckConstraint(
-            "status IN ('pending', 'completed', 'cancelled')",
+            "status IN ('pending', 'processing', 'completed', 'cancelled', 'failed')",
             name="ck_follow_up_actions_status",
         ),
         CheckConstraint(
             "(type = 'appointment') = (calendar_event_id IS NOT NULL)",
             name="ck_follow_up_actions_appointment_requires_calendar_event",
         ),
+        CheckConstraint(
+            "attempt_count >= 0",
+            name="ck_follow_up_actions_attempt_count_non_negative",
+        ),
+        CheckConstraint(
+            "failure_reason IS NULL OR failure_reason IN ('calendar_event_not_found', "
+            "'calendar_event_cancelled', 'max_attempts_exceeded', 'unexpected_error')",
+            name="ck_follow_up_actions_failure_reason",
+        ),
         Index("ix_follow_up_actions_tenant_id", "tenant_id"),
         Index("ix_follow_up_actions_call_session_id", "call_session_id"),
         Index("ix_follow_up_actions_contact_id", "contact_id"),
         Index("ix_follow_up_actions_calendar_event_id", "calendar_event_id"),
         Index("ix_follow_up_actions_status", "status"),
+        #: The one index `claim_due_follow_up()`'s query needs (brief §14:
+        #: "appropriate indexes for due-action lookup") -- partial, since
+        #: `next_attempt_at IS NOT NULL` is a small minority of rows (brief
+        #: §5: only `EXECUTABLE_TYPES` ever gets a non-NULL value here).
+        Index(
+            "ix_follow_up_actions_claim_lookup",
+            "tenant_id",
+            "next_attempt_at",
+            postgresql_where="next_attempt_at IS NOT NULL",
+        ),
     )

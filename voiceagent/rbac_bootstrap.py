@@ -109,6 +109,8 @@ PERMISSIONS: tuple[tuple[str, str], ...] = (
     (followups_permissions.FOLLOW_UP_ACTIONS_RESOURCE, "create"),
     (followups_permissions.FOLLOW_UP_ACTIONS_RESOURCE, "complete"),
     (followups_permissions.FOLLOW_UP_ACTIONS_RESOURCE, "cancel"),
+    # Phase 2.9: administrative retry of a failed follow-up execution.
+    (followups_permissions.FOLLOW_UP_ACTIONS_RESOURCE, "retry"),
     # Phase 2.8: derived post-call analysis (read + explicit rebuild).
     (call_analysis_permissions.RESOURCE, "read"),
     (call_analysis_permissions.RESOURCE, "rebuild"),

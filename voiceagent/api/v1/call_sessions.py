@@ -223,6 +223,14 @@ class FollowUpOut(BaseModel):
     due_at: datetime | None
     calendar_event_id: uuid.UUID | None
     description: str | None
+    #: Phase 2.9 execution visibility (brief §12) -- see
+    #: `voiceagent.api.v1.follow_ups.FollowUpOut` for why `execution_id` is
+    #: not exposed here either.
+    attempt_count: int
+    next_attempt_at: datetime | None
+    last_attempted_at: datetime | None
+    completed_at: datetime | None
+    failure_reason: str | None
     created_at: datetime
     updated_at: datetime
 

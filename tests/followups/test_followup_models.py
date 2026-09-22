@@ -76,14 +76,26 @@ def test_follow_up_actions_table_shape() -> None:
         "due_at",
         "calendar_event_id",
         "description",
+        "attempt_count",
+        "next_attempt_at",
+        "last_attempted_at",
+        "completed_at",
+        "failure_reason",
+        "execution_id",
         "created_at",
         "updated_at",
     }
     assert not table.columns["call_session_id"].nullable
     assert not table.columns["type"].nullable
     assert not table.columns["status"].nullable
+    assert not table.columns["attempt_count"].nullable
     assert table.columns["due_at"].nullable
     assert table.columns["calendar_event_id"].nullable
+    assert table.columns["next_attempt_at"].nullable
+    assert table.columns["last_attempted_at"].nullable
+    assert table.columns["completed_at"].nullable
+    assert table.columns["failure_reason"].nullable
+    assert table.columns["execution_id"].nullable
 
 
 def test_follow_up_actions_type_check_lists_exactly_three_values() -> None:
@@ -94,11 +106,14 @@ def test_follow_up_actions_type_check_lists_exactly_three_values() -> None:
         assert value in type_check
 
 
-def test_follow_up_actions_status_check_lists_exactly_three_values() -> None:
+def test_follow_up_actions_status_check_lists_exactly_five_values() -> None:
+    """Phase 2.9 brief §3: `"processing"`/`"failed"` join the Phase 2.7
+    vocabulary -- widened, not reused blindly (see
+    `voiceagent.followups.lifecycle`'s own docstring)."""
     table = cast(Table, FollowUpAction.__table__)
     checks = [c.sqltext.text for c in table.constraints if isinstance(c, CheckConstraint)]
-    (status_check,) = [text for text in checks if "pending" in text]
-    for value in ("pending", "completed", "cancelled"):
+    (status_check,) = [text for text in checks if "pending" in text and "processing" in text]
+    for value in ("pending", "processing", "completed", "cancelled", "failed"):
         assert value in status_check
 
 
@@ -106,6 +121,45 @@ def test_follow_up_actions_appointment_requires_calendar_event_check_exists() ->
     table = cast(Table, FollowUpAction.__table__)
     checks = [c.sqltext.text for c in table.constraints if isinstance(c, CheckConstraint)]
     assert any("calendar_event_id" in text and "appointment" in text for text in checks)
+
+
+def test_follow_up_actions_attempt_count_non_negative_check_exists() -> None:
+    table = cast(Table, FollowUpAction.__table__)
+    checks = [c.sqltext.text for c in table.constraints if isinstance(c, CheckConstraint)]
+    assert any("attempt_count" in text and ">= 0" in text for text in checks)
+
+
+def test_follow_up_actions_failure_reason_check_lists_exactly_four_values() -> None:
+    table = cast(Table, FollowUpAction.__table__)
+    checks = [c.sqltext.text for c in table.constraints if isinstance(c, CheckConstraint)]
+    (failure_reason_check,) = [text for text in checks if "failure_reason" in text]
+    for value in (
+        "calendar_event_not_found",
+        "calendar_event_cancelled",
+        "max_attempts_exceeded",
+        "unexpected_error",
+    ):
+        assert value in failure_reason_check
+
+
+def test_follow_up_actions_failure_reason_check_matches_retry_policy() -> None:
+    """The CHECK constraint's closed vocabulary and
+    `retry_policy.FAILURE_REASONS` must never drift apart -- each is
+    hand-written (matching this schema's existing convention for
+    `type`/`status`), so this is asserted directly rather than assumed."""
+    from voiceagent.followups.retry_policy import FAILURE_REASONS
+
+    table = cast(Table, FollowUpAction.__table__)
+    checks = [c.sqltext.text for c in table.constraints if isinstance(c, CheckConstraint)]
+    (failure_reason_check,) = [text for text in checks if "failure_reason" in text]
+    for value in FAILURE_REASONS:
+        assert value in failure_reason_check
+
+
+def test_follow_up_actions_claim_lookup_index_exists() -> None:
+    table = cast(Table, FollowUpAction.__table__)
+    (index,) = [ix for ix in table.indexes if ix.name == "ix_follow_up_actions_claim_lookup"]
+    assert {col.name for col in index.columns} == {"tenant_id", "next_attempt_at"}
 
 
 def test_follow_up_actions_composite_fks_are_tenant_aware() -> None:

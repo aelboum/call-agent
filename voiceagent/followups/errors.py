@@ -9,7 +9,11 @@ __all__ = [
     "FollowUpActionNotFoundError",
     "FollowUpAppointmentRequiresCalendarEventError",
     "FollowUpError",
+    "FollowUpExecutionConflictError",
     "FollowUpInvalidRelationshipError",
+    "FollowUpNotRetryableError",
+    "InvalidFollowUpFailureReasonError",
+    "InvalidFollowUpStatusError",
     "InvalidFollowUpTransitionError",
     "InvalidFollowUpTypeError",
     "InvalidOutcomeValueError",
@@ -84,3 +88,42 @@ class FollowUpInvalidRelationshipError(FollowUpError):
 
     def __init__(self) -> None:
         super().__init__("calendar_event_id is only valid for an appointment follow-up.")
+
+
+class FollowUpExecutionConflictError(FollowUpError):
+    """Raised by `complete_follow_up_execution()`/`fail_follow_up_execution()`
+    when the row is no longer `status='processing'` under the caller's own
+    `execution_id` (Phase 2.9 brief §7) -- its lease already expired and a
+    different claim reclaimed (or finished) it first. Never a corruption:
+    the caller's own attempt simply lost the race and must not overwrite the
+    winner's outcome."""
+
+    def __init__(self, follow_up_id: object) -> None:
+        super().__init__(f"FollowUpAction {follow_up_id} is no longer owned by this execution.")
+
+
+class FollowUpNotRetryableError(FollowUpError):
+    """Raised by `reprocess_follow_up()` (Phase 2.9 brief §12/§13) when the
+    follow-up is not `status='failed'`, or has already exhausted
+    `voiceagent.followups.retry_policy.MAX_ATTEMPTS` -- the dedicated
+    administrative retry endpoint never raises the bounded-retry ceiling."""
+
+    def __init__(self, follow_up_id: object) -> None:
+        super().__init__(f"FollowUpAction {follow_up_id} is not retryable.")
+
+
+class InvalidFollowUpFailureReasonError(FollowUpError):
+    """`reason` is not one of `voiceagent.followups.retry_policy
+    .FAILURE_REASONS` -- `fail_follow_up_execution()`'s own closed
+    vocabulary (brief §8: never a raw exception message)."""
+
+    def __init__(self) -> None:
+        super().__init__("Invalid follow-up failure reason.")
+
+
+class InvalidFollowUpStatusError(FollowUpError):
+    """`status` is not one of `voiceagent.followups.lifecycle
+    .VALID_STATUSES` -- raised by `list_follow_ups_by_status()`."""
+
+    def __init__(self) -> None:
+        super().__init__("Invalid follow-up status.")
