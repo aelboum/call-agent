@@ -56,6 +56,7 @@ from voiceagent.calendars import permissions as calendars_permissions
 from voiceagent.calls import permissions as calls_permissions
 from voiceagent.contacts import permissions as contacts_permissions
 from voiceagent.conversations import permissions as conversations_permissions
+from voiceagent.followups import permissions as followups_permissions
 from voiceagent.phone_numbers import permissions as phone_numbers_permissions
 from voiceagent.tools import permissions as tools_permissions
 from voiceagent.tools.registry import TOOL_REGISTRY
@@ -99,6 +100,14 @@ PERMISSIONS: tuple[tuple[str, str], ...] = (
     (calendars_permissions.CALENDAR_EVENTS_RESOURCE, "read"),
     (calendars_permissions.CALENDAR_EVENTS_RESOURCE, "create"),
     (calendars_permissions.CALENDAR_EVENTS_RESOURCE, "cancel"),
+    # Phase 2.7: Call Outcomes and Follow-up actions.
+    (followups_permissions.CALL_OUTCOMES_RESOURCE, "read"),
+    (followups_permissions.CALL_OUTCOMES_RESOURCE, "create"),
+    (followups_permissions.CALL_OUTCOMES_RESOURCE, "update"),
+    (followups_permissions.FOLLOW_UP_ACTIONS_RESOURCE, "read"),
+    (followups_permissions.FOLLOW_UP_ACTIONS_RESOURCE, "create"),
+    (followups_permissions.FOLLOW_UP_ACTIONS_RESOURCE, "complete"),
+    (followups_permissions.FOLLOW_UP_ACTIONS_RESOURCE, "cancel"),
     # Phase 2.4: one permission per built-in Tool Gateway tool
     # (`voiceagent.tools.permissions`) -- computed from `TOOL_REGISTRY` at
     # import time, not hand-listed, so this tuple can never omit a
@@ -133,6 +142,7 @@ def register_permissions() -> None:
     phone_numbers_permissions.register()
     contacts_permissions.register()
     calendars_permissions.register()
+    followups_permissions.register()
     tools_permissions.register()
 
 

@@ -1,5 +1,5 @@
 """Phase 2.4's four built-in call-control tools, plus Phase 2.6's four
-Contact/Calendar tools.
+Contact/Calendar tools, plus Phase 2.7's two Call Outcome/Follow-up tools.
 
 Every Phase 2.4 handler is `Tool -> application capability ->
 TelephonyProvider` (brief section 13) -- none of them imports FreeSWITCH/ESL,
@@ -36,6 +36,19 @@ these two services can raise is caught here and normalized to a fixed
 `ToolExecutionError` code -- never a raw exception, and never one that echoes
 tenant-sensitive content (name/phone/email/title) into its message (brief
 §19).
+
+**Phase 2.7's two handlers, `call.set_outcome` and `call.create_follow_up`,
+follow the identical `Tool -> application service -> DatabaseBoundary`
+shape**, calling `voiceagent.followups.service` -- the appointment
+orchestration for a `type="appointment"` follow-up (calling
+`voiceagent.calendars.service` when needed) lives inside that service
+module itself, not here, so this handler stays a thin translation layer
+exactly like every other tool handler in this file. Neither new input model
+carries a `call_id`/`call_session_id` field: both tools act on *this* call
+only, taken from `ctx.call_session_id`, never from model output (ADR-0003
+point 4 -- the same rule `HangupInput`'s own docstring states for
+`call.hangup`). See `voiceagent.followups.service`'s own module docstring
+for why neither input model carries a `contact_id` field either.
 """
 
 from __future__ import annotations
@@ -54,8 +67,16 @@ from voiceagent.calendars.errors import (
     InvalidIntervalError,
     NaiveDatetimeError,
 )
+from voiceagent.calls.errors import CallSessionNotFoundError
 from voiceagent.contacts import service as contact_service
 from voiceagent.contacts.errors import ContactNotFoundError
+from voiceagent.followups import service as followup_service
+from voiceagent.followups.errors import (
+    FollowUpAppointmentRequiresCalendarEventError,
+    FollowUpInvalidRelationshipError,
+    InvalidFollowUpTypeError,
+    InvalidOutcomeValueError,
+)
 from voiceagent.telephony.contracts import HangupCause, TelephonyError
 from voiceagent.tools.definitions import (
     StrictToolModel,
@@ -79,6 +100,9 @@ __all__ = [
     "ContactRef",
     "CreateAppointmentInput",
     "CreateAppointmentOutput",
+    "CreateFollowUpInput",
+    "CreateFollowUpOutput",
+    "FollowUpRef",
     "HangupInput",
     "HangupOutput",
     "HoldInput",
@@ -87,6 +111,8 @@ __all__ = [
     "LookupContactByPhoneOutput",
     "ResumeInput",
     "ResumeOutput",
+    "SetOutcomeInput",
+    "SetOutcomeOutput",
     "TransferInput",
     "TransferOutput",
 ]
@@ -493,5 +519,161 @@ TOOL_REGISTRY.register(
         idempotent=True,
         timeout_seconds=_DB_TIMEOUT_SECONDS,
         handler=_cancel_appointment,
+    )
+)
+
+
+# -- Phase 2.7: call outcome / follow-up tools -------------------------------
+
+
+# -- call.set_outcome ---------------------------------------------------------
+
+
+class SetOutcomeInput(StrictToolModel):
+    outcome: Literal[
+        "resolved",
+        "appointment_scheduled",
+        "follow_up_required",
+        "no_answer",
+        "wrong_number",
+        "not_interested",
+    ]
+    notes: str | None = None
+
+
+class SetOutcomeOutput(StrictToolModel):
+    call_session_id: uuid.UUID
+    outcome: str
+
+
+async def _set_outcome(ctx: ToolExecutionContext, tool_input: StrictToolModel) -> dict[str, object]:
+    db, tenant_context = _require_db_context(ctx)
+    typed_input = cast(SetOutcomeInput, tool_input)
+    try:
+        outcome = await db.run(
+            followup_service.set_call_outcome,
+            tenant_context,
+            ctx.call_session_id,
+            outcome=typed_input.outcome,
+            notes=typed_input.notes,
+        )
+    except CallSessionNotFoundError as exc:
+        raise ToolExecutionError("call_not_found", "no such call session") from exc
+    except InvalidOutcomeValueError as exc:
+        raise ToolExecutionError("invalid_outcome", "invalid outcome value") from exc
+    return {"call_session_id": str(outcome.call_session_id), "outcome": outcome.outcome}
+
+
+# -- call.create_follow_up ----------------------------------------------------
+
+
+class CreateFollowUpInput(StrictToolModel):
+    type: Literal["appointment", "contact", "manual_follow_up"]
+    description: str | None = None
+    due_at: AwareDatetime | None = None
+    calendar_id: uuid.UUID | None = None
+    start_at: AwareDatetime | None = None
+    end_at: AwareDatetime | None = None
+
+
+class FollowUpRef(StrictToolModel):
+    follow_up_id: uuid.UUID
+    call_session_id: uuid.UUID
+    type: str
+    status: str
+    due_at: datetime | None
+    calendar_event_id: uuid.UUID | None
+    description: str | None
+
+
+class CreateFollowUpOutput(StrictToolModel):
+    follow_up: FollowUpRef
+
+
+async def _create_follow_up(
+    ctx: ToolExecutionContext, tool_input: StrictToolModel
+) -> dict[str, object]:
+    db, tenant_context = _require_db_context(ctx)
+    typed_input = cast(CreateFollowUpInput, tool_input)
+    try:
+        follow_up = await db.run(
+            followup_service.create_follow_up,
+            tenant_context,
+            ctx.call_session_id,
+            type=typed_input.type,
+            description=typed_input.description,
+            due_at=typed_input.due_at,
+            calendar_id=typed_input.calendar_id,
+            start_at=typed_input.start_at,
+            end_at=typed_input.end_at,
+        )
+    except CallSessionNotFoundError as exc:
+        raise ToolExecutionError("call_not_found", "no such call session") from exc
+    except InvalidFollowUpTypeError as exc:
+        raise ToolExecutionError("invalid_type", "invalid follow-up type") from exc
+    except FollowUpAppointmentRequiresCalendarEventError as exc:
+        raise ToolExecutionError(
+            "appointment_requires_calendar_event",
+            "an appointment follow-up requires calendar_id/start_at/end_at "
+            "or an existing calendar event",
+        ) from exc
+    except FollowUpInvalidRelationshipError as exc:
+        raise ToolExecutionError(
+            "invalid_relationship",
+            "calendar_event_id is only valid for an appointment follow-up",
+        ) from exc
+    except CalendarNotFoundError as exc:
+        raise ToolExecutionError("calendar_not_found", "no such calendar") from exc
+    except ContactNotFoundError as exc:
+        raise ToolExecutionError("contact_not_found", "no such contact") from exc
+    except (InvalidIntervalError, NaiveDatetimeError) as exc:
+        raise ToolExecutionError("invalid_interval", "start_at must be before end_at") from exc
+    except CalendarEventConflictError as exc:
+        raise ToolExecutionError(
+            "conflict", "requested interval conflicts with an existing appointment"
+        ) from exc
+    return {
+        "follow_up": {
+            "follow_up_id": str(follow_up.id),
+            "call_session_id": str(follow_up.call_session_id),
+            "type": follow_up.type,
+            "status": follow_up.status,
+            "due_at": follow_up.due_at,
+            "calendar_event_id": (
+                str(follow_up.calendar_event_id) if follow_up.calendar_event_id else None
+            ),
+            "description": follow_up.description,
+        }
+    }
+
+
+# -- registration ------------------------------------------------------------
+
+TOOL_REGISTRY.register(
+    ToolDefinition(
+        tool_id="call.set_outcome",
+        name="call.set_outcome",
+        description="Set the business outcome of the current phone call.",
+        input_model=SetOutcomeInput,
+        output_model=SetOutcomeOutput,
+        permission_action="call.set_outcome",
+        risk=ToolRisk.LOW,
+        idempotent=True,
+        timeout_seconds=_DB_TIMEOUT_SECONDS,
+        handler=_set_outcome,
+    )
+)
+TOOL_REGISTRY.register(
+    ToolDefinition(
+        tool_id="call.create_follow_up",
+        name="call.create_follow_up",
+        description="Create a follow-up action resulting from the current phone call.",
+        input_model=CreateFollowUpInput,
+        output_model=CreateFollowUpOutput,
+        permission_action="call.create_follow_up",
+        risk=ToolRisk.LOW,
+        idempotent=False,
+        timeout_seconds=_DB_TIMEOUT_SECONDS,
+        handler=_create_follow_up,
     )
 )

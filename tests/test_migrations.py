@@ -142,3 +142,21 @@ def test_phase_2_6_tables_have_row_level_security(offline_sql: str) -> None:
 def test_call_sessions_contact_id_column_is_added(offline_sql: str) -> None:
     assert "ADD COLUMN contact_id" in offline_sql
     assert "fk_call_sessions_contact" in offline_sql
+
+
+def test_phase_2_7_tables_are_created(offline_sql: str) -> None:
+    assert "CREATE TABLE app.call_outcomes (" in offline_sql
+    assert "CREATE TABLE app.follow_up_actions (" in offline_sql
+
+
+def test_phase_2_7_tables_have_row_level_security(offline_sql: str) -> None:
+    for table in ("call_outcomes", "follow_up_actions"):
+        assert f'ALTER TABLE "app"."{table}" ENABLE ROW LEVEL SECURITY' in offline_sql
+        assert f'ALTER TABLE "app"."{table}" FORCE ROW LEVEL SECURITY' in offline_sql
+
+
+def test_calendar_events_id_tenant_unique_constraint_is_added(offline_sql: str) -> None:
+    """The Phase 2.7 migration's own step 0 -- fixes the gap `0004` left,
+    exactly the way `0003` fixed a matching gap in `0002` for
+    `call_sessions` (see the migration's own module docstring)."""
+    assert "uq_calendar_events_id_tenant" in offline_sql

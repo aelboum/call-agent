@@ -20,9 +20,18 @@ from voiceagent.calendars.errors import (
     CalendarNotFoundError,
 )
 from voiceagent.calendars.models import CalendarEvent
+from voiceagent.calls.errors import CallSessionNotFoundError
 from voiceagent.contacts import service as contact_service
 from voiceagent.contacts.errors import ContactNotFoundError
 from voiceagent.contacts.models import Contact
+from voiceagent.followups import service as followup_service
+from voiceagent.followups.errors import (
+    FollowUpAppointmentRequiresCalendarEventError,
+    FollowUpInvalidRelationshipError,
+    InvalidFollowUpTypeError,
+    InvalidOutcomeValueError,
+)
+from voiceagent.followups.models import CallOutcome, FollowUpAction
 from voiceagent.runtime.db import DatabaseBoundary
 from voiceagent.telephony.contracts import HangupCause
 from voiceagent.telephony.fakes import FakeTelephonyProvider, UnknownCallError
@@ -33,18 +42,22 @@ from voiceagent.tools.handlers import (
     CancelAppointmentInput,
     CheckAvailabilityInput,
     CreateAppointmentInput,
+    CreateFollowUpInput,
     HangupInput,
     HoldInput,
     LookupContactByPhoneInput,
     ResumeInput,
+    SetOutcomeInput,
     TransferInput,
     _cancel_appointment,
     _check_availability,
     _create_appointment,
+    _create_follow_up,
     _hangup,
     _hold,
     _lookup_contact_by_phone,
     _resume,
+    _set_outcome,
     _transfer,
 )
 
@@ -355,3 +368,163 @@ def test_cancel_appointment_normalizes_not_found(db, monkeypatch) -> None:
     with pytest.raises(ToolExecutionError) as exc_info:
         asyncio.run(_cancel_appointment(ctx, CancelAppointmentInput(event_id=uuid.uuid4())))
     assert exc_info.value.code == "event_not_found"
+
+
+# -- Phase 2.7: call.set_outcome ----------------------------------------------
+
+
+def test_set_outcome_success(db, monkeypatch) -> None:
+    ctx = _db_ctx(db)
+    outcome_row = CallOutcome(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        call_session_id=ctx.call_session_id,
+        contact_id=None,
+        outcome="resolved",
+        notes="all good",
+    )
+    monkeypatch.setattr(followup_service, "set_call_outcome", lambda *a, **kw: outcome_row)
+    output = asyncio.run(_set_outcome(ctx, SetOutcomeInput(outcome="resolved", notes="all good")))
+    assert output == {"call_session_id": str(ctx.call_session_id), "outcome": "resolved"}
+
+
+def test_set_outcome_uses_this_calls_session_id_never_a_model_supplied_one(db, monkeypatch) -> None:
+    """`SetOutcomeInput` has no `call_id`/`call_session_id` field at all
+    (ADR-0003 point 4) -- confirmed by the handler always passing
+    `ctx.call_session_id` through to the service, never anything from the
+    validated input."""
+    ctx = _db_ctx(db)
+    captured: dict[str, object] = {}
+
+    def _capture(tenant_context, call_session_id, **kwargs):
+        captured["call_session_id"] = call_session_id
+        return CallOutcome(
+            id=uuid.uuid4(),
+            tenant_id=uuid.uuid4(),
+            call_session_id=call_session_id,
+            contact_id=None,
+            outcome="resolved",
+            notes=None,
+        )
+
+    monkeypatch.setattr(followup_service, "set_call_outcome", _capture)
+    asyncio.run(_set_outcome(ctx, SetOutcomeInput(outcome="resolved")))
+    assert captured["call_session_id"] == ctx.call_session_id
+
+
+def test_set_outcome_input_rejects_unexpected_extra_fields() -> None:
+    with pytest.raises(ValidationError):
+        SetOutcomeInput.model_validate({"outcome": "resolved", "call_id": str(uuid.uuid4())})
+
+
+def test_set_outcome_input_rejects_an_invalid_outcome_value() -> None:
+    with pytest.raises(ValidationError):
+        SetOutcomeInput.model_validate({"outcome": "not-a-real-outcome"})
+
+
+def test_set_outcome_normalizes_call_not_found(db, monkeypatch) -> None:
+    def _raise(*a, **kw):
+        raise CallSessionNotFoundError(uuid.uuid4())
+
+    monkeypatch.setattr(followup_service, "set_call_outcome", _raise)
+    ctx = _db_ctx(db)
+    with pytest.raises(ToolExecutionError) as exc_info:
+        asyncio.run(_set_outcome(ctx, SetOutcomeInput(outcome="resolved")))
+    assert exc_info.value.code == "call_not_found"
+
+
+def test_set_outcome_normalizes_invalid_outcome_from_service(db, monkeypatch) -> None:
+    def _raise(*a, **kw):
+        raise InvalidOutcomeValueError()
+
+    monkeypatch.setattr(followup_service, "set_call_outcome", _raise)
+    ctx = _db_ctx(db)
+    with pytest.raises(ToolExecutionError) as exc_info:
+        asyncio.run(_set_outcome(ctx, SetOutcomeInput(outcome="resolved")))
+    assert exc_info.value.code == "invalid_outcome"
+
+
+# -- Phase 2.7: call.create_follow_up -----------------------------------------
+
+
+def test_create_follow_up_success(db, monkeypatch) -> None:
+    ctx = _db_ctx(db)
+    follow_up = FollowUpAction(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        call_session_id=ctx.call_session_id,
+        contact_id=None,
+        type="manual_follow_up",
+        status="pending",
+        due_at=None,
+        calendar_event_id=None,
+        description="call back tomorrow",
+    )
+    monkeypatch.setattr(followup_service, "create_follow_up", lambda *a, **kw: follow_up)
+    output = asyncio.run(
+        _create_follow_up(
+            ctx, CreateFollowUpInput(type="manual_follow_up", description="call back tomorrow")
+        )
+    )
+    follow_up_out = output["follow_up"]
+    assert isinstance(follow_up_out, dict)
+    assert follow_up_out["type"] == "manual_follow_up"
+    assert follow_up_out["status"] == "pending"
+    assert follow_up_out["calendar_event_id"] is None
+
+
+def test_create_follow_up_input_has_no_contact_id_field() -> None:
+    """Brief §8/§11: `contact_id` is auto-derived from the call's own
+    association, never a tool argument -- confirmed structurally, not just
+    by docstring claim."""
+    assert "contact_id" not in CreateFollowUpInput.model_fields
+
+
+def test_create_follow_up_input_rejects_unexpected_extra_fields() -> None:
+    with pytest.raises(ValidationError):
+        CreateFollowUpInput.model_validate(
+            {"type": "manual_follow_up", "call_id": str(uuid.uuid4())}
+        )
+
+
+def test_create_follow_up_input_rejects_an_invalid_type() -> None:
+    with pytest.raises(ValidationError):
+        CreateFollowUpInput.model_validate({"type": "not-a-real-type"})
+
+
+def test_create_follow_up_input_rejects_naive_datetimes() -> None:
+    with pytest.raises(ValidationError):
+        CreateFollowUpInput.model_validate(
+            {
+                "type": "appointment",
+                "calendar_id": str(uuid.uuid4()),
+                "start_at": "2026-10-01T10:00:00",
+                "end_at": "2026-10-01T11:00:00",
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "raised, expected_code",
+    [
+        (CallSessionNotFoundError(uuid.uuid4()), "call_not_found"),
+        (InvalidFollowUpTypeError(), "invalid_type"),
+        (
+            FollowUpAppointmentRequiresCalendarEventError(),
+            "appointment_requires_calendar_event",
+        ),
+        (FollowUpInvalidRelationshipError(), "invalid_relationship"),
+        (CalendarNotFoundError(uuid.uuid4()), "calendar_not_found"),
+        (ContactNotFoundError(uuid.uuid4()), "contact_not_found"),
+        (CalendarEventConflictError(), "conflict"),
+    ],
+)
+def test_create_follow_up_normalizes_domain_errors(db, monkeypatch, raised, expected_code) -> None:
+    def _raise(*a, **kw):
+        raise raised
+
+    monkeypatch.setattr(followup_service, "create_follow_up", _raise)
+    ctx = _db_ctx(db)
+    with pytest.raises(ToolExecutionError) as exc_info:
+        asyncio.run(_create_follow_up(ctx, CreateFollowUpInput(type="manual_follow_up")))
+    assert exc_info.value.code == expected_code
