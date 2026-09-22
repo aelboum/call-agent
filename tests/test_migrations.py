@@ -225,3 +225,43 @@ def test_phase_2_10_does_not_create_a_second_workflow_definition_table(offline_s
     assert offline_sql.count("CREATE TABLE app.call_workflow_executions (") == 1
     assert "CREATE TABLE app.workflows (" not in offline_sql
     assert "CREATE TABLE app.workflow_versions (" not in offline_sql
+
+
+def test_phase_2_11_tables_are_created(offline_sql: str) -> None:
+    assert "CREATE TABLE app.knowledge_sources (" in offline_sql
+    assert "CREATE TABLE app.knowledge_items (" in offline_sql
+
+
+def test_phase_2_11_tables_have_row_level_security(offline_sql: str) -> None:
+    for table in ("knowledge_sources", "knowledge_items"):
+        assert f'ALTER TABLE "app"."{table}" ENABLE ROW LEVEL SECURITY' in offline_sql
+        assert f'ALTER TABLE "app"."{table}" FORCE ROW LEVEL SECURITY' in offline_sql
+
+
+def test_knowledge_items_content_immutability_trigger_exists(offline_sql: str) -> None:
+    assert "knowledge_items_content_immutable" in offline_sql
+    assert "app.forbid_knowledge_item_content_update" in offline_sql
+
+
+def test_knowledge_uniqueness_constraints_exist(offline_sql: str) -> None:
+    assert "uq_knowledge_sources_tenant_name" in offline_sql
+    assert "uq_knowledge_items_tenant_source_title" in offline_sql
+    assert "uq_knowledge_sources_id_tenant" in offline_sql
+    assert "uq_knowledge_items_id_tenant" in offline_sql
+
+
+def test_phase_2_11_does_not_create_a_vector_or_generic_document_table(
+    offline_sql: str,
+) -> None:
+    """Brief NON-GOALS: no vector database, no generic document/memory
+    store -- verified directly, not just by omission from
+    `test_deferred_domain_tables_are_never_created` (which only lists tables
+    a *specific earlier* phase's brief deferred)."""
+    forbidden = (
+        "CREATE TABLE app.embeddings (",
+        "CREATE TABLE app.documents (",
+        "CREATE TABLE app.knowledge_vectors (",
+        "CREATE EXTENSION",
+    )
+    for statement in forbidden:
+        assert statement not in offline_sql

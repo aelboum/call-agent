@@ -167,6 +167,12 @@ def test_row_level_security_is_enabled_and_forced_for_every_table() -> None:
         "call_outcomes": (True, True),
         "follow_up_actions": (True, True),
         "call_analysis": (True, True),
+        # Phase 2.10: previously missing from this inventory (found during
+        # Phase 2.10's own real-PostgreSQL verification pass) -- added here
+        # rather than left absent, alongside Phase 2.11's own two tables.
+        "call_workflow_executions": (True, True),
+        "knowledge_sources": (True, True),
+        "knowledge_items": (True, True),
     }
 
 

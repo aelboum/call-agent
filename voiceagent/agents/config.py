@@ -32,6 +32,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from voiceagent.knowledge.config import KnowledgeConfig
 from voiceagent.workflows.config import WorkflowDefinition
 
 # NOTE: this module deliberately does NOT import voiceagent.tools.handlers
@@ -125,6 +126,12 @@ class AgentConfig(_Strict):
     engine: EngineSelection
     tools: list[ToolBinding] = Field(default_factory=list)
     workflow: WorkflowDefinition | None = None
+    #: `None` when the agent approves no knowledge item (the common case
+    #: today). When set, `voiceagent.knowledge.config.KnowledgeConfig
+    #: .item_ids` is closed and bounded -- see that module's own docstring
+    #: for why an id reference here, rather than copied content, still keeps
+    #: a published `AgentVersion` deterministic.
+    knowledge: KnowledgeConfig | None = None
     transfer_rules: list[TransferRule] = Field(default_factory=list)
     business_hours: BusinessHours
     call_limits: CallLimits = Field(default_factory=CallLimits)

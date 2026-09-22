@@ -58,6 +58,7 @@ from voiceagent.calls import permissions as calls_permissions
 from voiceagent.contacts import permissions as contacts_permissions
 from voiceagent.conversations import permissions as conversations_permissions
 from voiceagent.followups import permissions as followups_permissions
+from voiceagent.knowledge import permissions as knowledge_permissions
 from voiceagent.phone_numbers import permissions as phone_numbers_permissions
 from voiceagent.tools import permissions as tools_permissions
 from voiceagent.tools.registry import TOOL_REGISTRY
@@ -120,6 +121,18 @@ PERMISSIONS: tuple[tuple[str, str], ...] = (
     # it is authorized the same way every other Tool Gateway tool already
     # is, through the `tools_permissions`-derived tuple below.
     (workflows_permissions.RESOURCE, "read"),
+    # Phase 2.11: knowledge management. `knowledge.search` itself needs no
+    # separate permission here -- authorized the same way `workflow.advance`
+    # already is, through the `tools_permissions`-derived tuple below.
+    (knowledge_permissions.RESOURCE_SOURCES, "read"),
+    (knowledge_permissions.RESOURCE_SOURCES, "create"),
+    (knowledge_permissions.RESOURCE_SOURCES, "update"),
+    (knowledge_permissions.RESOURCE_SOURCES, "archive"),
+    (knowledge_permissions.RESOURCE_ITEMS, "read"),
+    (knowledge_permissions.RESOURCE_ITEMS, "create"),
+    (knowledge_permissions.RESOURCE_ITEMS, "update"),
+    (knowledge_permissions.RESOURCE_ITEMS, "activate"),
+    (knowledge_permissions.RESOURCE_ITEMS, "deactivate"),
     # Phase 2.4: one permission per built-in Tool Gateway tool
     # (`voiceagent.tools.permissions`) -- computed from `TOOL_REGISTRY` at
     # import time, not hand-listed, so this tuple can never omit a
@@ -157,6 +170,7 @@ def register_permissions() -> None:
     followups_permissions.register()
     call_analysis_permissions.register()
     workflows_permissions.register()
+    knowledge_permissions.register()
     tools_permissions.register()
 
 

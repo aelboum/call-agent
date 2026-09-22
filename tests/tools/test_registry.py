@@ -81,14 +81,14 @@ def test_tool_definition_is_immutable() -> None:
         definition.tool_id = "changed"  # type: ignore[misc]
 
 
-def test_the_process_wide_registry_holds_exactly_the_eleven_built_in_tools() -> None:
+def test_the_process_wide_registry_holds_exactly_the_twelve_built_in_tools() -> None:
     """Importing `voiceagent.tools.handlers` (transitively, via
     `voiceagent.tools.permissions` or any earlier test in the same process)
     populates `TOOL_REGISTRY` with exactly Phase 2.4's four call-control
     tools, Phase 2.6's four Contact/Calendar tools, Phase 2.7's two Call
-    Outcome/Follow-up tools, and Phase 2.10's one workflow-advance tool --
-    no more, no fewer (brief section 6's "deliberately small initial tool
-    set")."""
+    Outcome/Follow-up tools, Phase 2.10's one workflow-advance tool, and
+    Phase 2.11's one knowledge-search tool -- no more, no fewer (brief
+    section 6's "deliberately small initial tool set")."""
     import voiceagent.tools.handlers  # noqa: F401 -- import for its registration side effect
 
     assert TOOL_REGISTRY.known_tool_ids() == (
@@ -102,6 +102,7 @@ def test_the_process_wide_registry_holds_exactly_the_eleven_built_in_tools() -> 
         "call.set_outcome",
         "call.transfer",
         "contact.lookup_by_phone",
+        "knowledge.search",
         "workflow.advance",
     )
 

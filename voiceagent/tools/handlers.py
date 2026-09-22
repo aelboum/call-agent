@@ -1,6 +1,7 @@
 """Phase 2.4's four built-in call-control tools, plus Phase 2.6's four
 Contact/Calendar tools, plus Phase 2.7's two Call Outcome/Follow-up tools,
-plus Phase 2.10's one controlled-workflow tool (`workflow.advance`).
+plus Phase 2.10's one controlled-workflow tool (`workflow.advance`), plus
+Phase 2.11's one knowledge tool (`knowledge.search`).
 
 Every Phase 2.4 handler is `Tool -> application capability ->
 TelephonyProvider` (brief section 13) -- none of them imports FreeSWITCH/ESL,
@@ -86,6 +87,8 @@ from voiceagent.followups.errors import (
     InvalidFollowUpTypeError,
     InvalidOutcomeValueError,
 )
+from voiceagent.knowledge.errors import InvalidKnowledgeQueryError
+from voiceagent.knowledge.retrieval import MAX_QUERY_LENGTH, MAX_RESULT_LIMIT, search_items
 from voiceagent.telephony.contracts import HangupCause, TelephonyError
 from voiceagent.tools.definitions import (
     StrictToolModel,
@@ -120,6 +123,9 @@ __all__ = [
     "HangupOutput",
     "HoldInput",
     "HoldOutput",
+    "KnowledgeSearchInput",
+    "KnowledgeSearchOutput",
+    "KnowledgeSearchResultRef",
     "LookupContactByPhoneInput",
     "LookupContactByPhoneOutput",
     "ResumeInput",
@@ -791,5 +797,87 @@ TOOL_REGISTRY.register(
         idempotent=True,
         timeout_seconds=_WORKFLOW_ADVANCE_TIMEOUT_SECONDS,
         handler=_workflow_advance,
+    )
+)
+
+
+# -- Phase 2.11: knowledge.search ---------------------------------------------
+
+_KNOWLEDGE_SEARCH_TOOL_ID = "knowledge.search"
+
+
+class KnowledgeSearchInput(StrictToolModel):
+    """The model supplies a query and nothing else. It may never supply a
+    `tenant_id`, a result limit above `voiceagent.knowledge.retrieval
+    .MAX_RESULT_LIMIT`, a source/table name, or any filter shape -- the
+    server always derives tenant and agent/version context from `ctx`, and
+    always clamps the result count itself (brief LLM CONTEXT BOUNDARY)."""
+
+    query: str = Field(min_length=1, max_length=MAX_QUERY_LENGTH)
+
+
+class KnowledgeSearchResultRef(StrictToolModel):
+    item_id: uuid.UUID
+    source_id: uuid.UUID
+    title: str
+    snippet: str
+
+
+class KnowledgeSearchOutput(StrictToolModel):
+    results: list[KnowledgeSearchResultRef]
+
+
+def _require_knowledge_context(
+    ctx: ToolExecutionContext,
+) -> tuple[DatabaseBoundary, TenantContext, AgentVersion]:
+    """Identical shape to `_require_workflow_context()` above -- `None` here
+    would be a caller bug (`knowledge.search` is only ever reachable through
+    `ToolGateway.execute()`), not a real, reachable runtime state."""
+    if ctx.db is None or ctx.tenant_context is None or ctx.agent_version is None:
+        raise ToolExecutionError("internal_error", "tool execution context is incomplete")
+    return ctx.db, ctx.tenant_context, ctx.agent_version
+
+
+async def _knowledge_search(
+    ctx: ToolExecutionContext, tool_input: StrictToolModel
+) -> dict[str, object]:
+    db, tenant_context, agent_version = _require_knowledge_context(ctx)
+    query = cast(KnowledgeSearchInput, tool_input).query
+    try:
+        results = await db.run(
+            search_items, tenant_context, agent_version, query=query, limit=MAX_RESULT_LIMIT
+        )
+    except InvalidKnowledgeQueryError as exc:
+        raise ToolExecutionError("invalid_query", "the search query is invalid") from exc
+    return {
+        "results": [
+            {
+                "item_id": str(result.item_id),
+                "source_id": str(result.source_id),
+                "title": result.title,
+                "snippet": result.snippet,
+            }
+            for result in results
+        ]
+    }
+
+
+# -- registration ------------------------------------------------------------
+
+TOOL_REGISTRY.register(
+    ToolDefinition(
+        tool_id=_KNOWLEDGE_SEARCH_TOOL_ID,
+        name=_KNOWLEDGE_SEARCH_TOOL_ID,
+        description=(
+            "Search this tenant's approved knowledge (business hours, pricing, "
+            "policies, FAQs) for content relevant to a query."
+        ),
+        input_model=KnowledgeSearchInput,
+        output_model=KnowledgeSearchOutput,
+        permission_action=_KNOWLEDGE_SEARCH_TOOL_ID,
+        risk=ToolRisk.LOW,
+        idempotent=True,
+        timeout_seconds=_DB_TIMEOUT_SECONDS,
+        handler=_knowledge_search,
     )
 )

@@ -28,6 +28,9 @@ from voiceagent.agents.errors import (
 )
 from voiceagent.agents.models import Agent, AgentVersion
 from voiceagent.db import select
+from voiceagent.knowledge.errors import UnknownKnowledgeItemError
+from voiceagent.knowledge.service import resolve_active_item_ids
+from voiceagent.knowledge.validation import validate_item_references
 from voiceagent.tenancy import TenantContext, tenant_scope
 
 # Side-effect import: populates voiceagent.tools.registry.TOOL_REGISTRY
@@ -135,11 +138,23 @@ def create_draft_version(
     must name a known, available Tool Gateway tool -- checked here, not by
     `AgentConfig`/`WorkflowDefinition`'s own pydantic validation (see
     `voiceagent.workflows.config`'s module docstring for why that check
-    cannot live there)."""
+    cannot live there).
+
+    Phase 2.11: if `config.knowledge` is set, every `item_ids` entry must
+    name an existing, tenant-owned, `status='active'` `KnowledgeItem` --
+    checked the identical two-step way (see `voiceagent.knowledge.validation`
+    's own module docstring)."""
     if config.workflow is not None:
         try:
             validate_tool_references(config.workflow)
         except UnknownWorkflowToolError as exc:
+            raise InvalidAgentConfigError(str(exc)) from exc
+
+    if config.knowledge is not None and config.knowledge.item_ids:
+        available_item_ids = resolve_active_item_ids(context, config.knowledge.item_ids)
+        try:
+            validate_item_references(config.knowledge.item_ids, available_item_ids)
+        except UnknownKnowledgeItemError as exc:
             raise InvalidAgentConfigError(str(exc)) from exc
 
     config_dict = canonical_config_dict(config)
@@ -173,6 +188,22 @@ def create_draft_version(
         agent.draft_version_id = version.id
         session.flush()
         session.refresh(version)
+
+        if config.knowledge is not None and config.knowledge.item_ids:
+            # brief AUDIT: "knowledge.association_changed" -- never the item
+            # content itself, only a count (brief: "Do not put full
+            # knowledge content into audit metadata").
+            record_audit_event(
+                tenant_id=context.tenant_id,
+                actor_type=ActorType.USER,
+                actor_user_id=context.actor_id,
+                action="knowledge.association_changed",
+                resource_type="agent_version",
+                resource_id=str(version.id),
+                outcome=AuditOutcome.SUCCESS,
+                metadata={"item_count": len(config.knowledge.item_ids)},
+            )
+
         session.expunge(version)
         return version
 
