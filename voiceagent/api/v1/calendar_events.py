@@ -1,12 +1,14 @@
-"""`/v1/calendar-events` -- create, get, cancel (Phase 2.6 brief §15/§8). No
-`DELETE`: cancellation is a state transition, never a hard delete."""
+"""`/v1/calendar-events` -- list (by required date range), create, get,
+cancel (Phase 2.6 brief §15/§8; the list route added in Phase 2.15 for the
+frontend's calendar/agenda view, brief §11). No `DELETE`: cancellation is a
+state transition, never a hard delete."""
 
 from __future__ import annotations
 
 import uuid
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 from voiceagent.api.errors import conflict, not_found
@@ -19,7 +21,7 @@ from voiceagent.calendars.errors import (
 )
 from voiceagent.calendars.models import CalendarEvent
 from voiceagent.calendars.permissions import CALENDAR_EVENTS_RESOURCE
-from voiceagent.calendars.service import cancel_event, create_event, get_event
+from voiceagent.calendars.service import cancel_event, create_event, get_event, list_events
 from voiceagent.contacts.errors import ContactNotFoundError
 from voiceagent.tenancy import TenantContext, require_tenant
 
@@ -56,6 +58,36 @@ class CalendarEventCreateRequest(BaseModel):
     start_at: AwareDatetime
     end_at: AwareDatetime
     contact_id: uuid.UUID | None = None
+
+
+@router.get("")
+def list_calendar_events_route(
+    start_at: AwareDatetime,
+    end_at: AwareDatetime,
+    calendar_id: uuid.UUID | None = Query(default=None),  # noqa: B008 -- FastAPI's own Query idiom
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    context: TenantContext = Depends(_read),  # noqa: B008
+) -> list[CalendarEventOut]:
+    """A required, bounded date range (never an unbounded full-calendar
+    listing) -- mirrors `GET /v1/calendars/{id}/availability`'s own
+    `start_at`/`end_at` query-parameter shape."""
+    try:
+        events = list_events(
+            context,
+            start_at=start_at,
+            end_at=end_at,
+            calendar_id=calendar_id,
+            limit=limit,
+            offset=offset,
+        )
+    except CalendarNotFoundError:
+        raise not_found("calendar") from None
+    except (InvalidIntervalError, NaiveDatetimeError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from None
+    return [CalendarEventOut.from_model(event) for event in events]
 
 
 @router.post("", status_code=201)

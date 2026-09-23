@@ -95,13 +95,27 @@ def get_contact(context: TenantContext, contact_id: uuid.UUID) -> Contact:
         return row
 
 
-def list_contacts(context: TenantContext) -> Sequence[Contact]:
+def list_contacts(
+    context: TenantContext, *, limit: int | None = None, offset: int = 0
+) -> Sequence[Contact]:
+    """`limit`/`offset` are optional (Phase 2.15 brief §10: "use
+    pagination/bounded requests") -- omitting both preserves this
+    function's original, unfiltered, unlimited behavior for any other
+    caller, mirroring `voiceagent.calls.service.list_call_sessions()`'s own
+    optional, keyword-only shape. Ordered newest-first (`created_at`
+    descending, `id` descending as a stable tie-break) so pagination is
+    deterministic."""
     with tenant_scope(context) as session:
-        rows = (
-            session.execute(select(Contact).where(Contact.tenant_id == context.tenant_id))
-            .scalars()
-            .all()
+        query = (
+            select(Contact)
+            .where(Contact.tenant_id == context.tenant_id)
+            .order_by(Contact.created_at.desc(), Contact.id.desc())
         )
+        if offset:
+            query = query.offset(offset)
+        if limit is not None:
+            query = query.limit(limit)
+        rows = session.execute(query).scalars().all()
         for row in rows:
             session.expunge(row)
         return rows

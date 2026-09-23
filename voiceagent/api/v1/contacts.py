@@ -1,12 +1,15 @@
-"""`/v1/contacts` -- exactly the endpoints from Phase 2.6 brief §15/§9: create,
-get, and lookup-by-phone. No delete, no search, no fuzzy matching."""
+"""`/v1/contacts` -- create, get, lookup-by-phone (Phase 2.6 brief §15/§9),
+plus list (Phase 2.15 brief §10 -- the frontend's contacts list/search
+foundation; `list_contacts()` already existed as a service function, used
+only by `voiceagent.contacts` callers outside the API, and is wired to a
+route here for the first time). No delete, no fuzzy search."""
 
 from __future__ import annotations
 
 import uuid
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from voiceagent.api.errors import conflict, not_found
@@ -17,7 +20,12 @@ from voiceagent.contacts.errors import (
 )
 from voiceagent.contacts.models import Contact
 from voiceagent.contacts.permissions import RESOURCE
-from voiceagent.contacts.service import create_contact, get_contact, lookup_contact_by_phone
+from voiceagent.contacts.service import (
+    create_contact,
+    get_contact,
+    list_contacts,
+    lookup_contact_by_phone,
+)
 from voiceagent.tenancy import TenantContext, require_tenant
 
 router = APIRouter(prefix="/contacts", tags=["contacts"])
@@ -65,6 +73,18 @@ def create_contact_route(
     except ContactPhoneConflictError:
         raise conflict("Contact with this phone number already exists.") from None
     return ContactOut.from_model(contact)
+
+
+@router.get("")
+def list_contacts_route(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    context: TenantContext = Depends(_read),  # noqa: B008
+) -> list[ContactOut]:
+    return [
+        ContactOut.from_model(contact)
+        for contact in list_contacts(context, limit=limit, offset=offset)
+    ]
 
 
 @router.get("/by-phone/{phone_e164}")

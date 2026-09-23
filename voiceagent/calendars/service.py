@@ -47,6 +47,7 @@ __all__ = [
     "get_calendar",
     "get_event",
     "list_calendars",
+    "list_events",
     "validate_timezone",
 ]
 
@@ -204,6 +205,46 @@ def create_event(
         session.refresh(event)
         session.expunge(event)
         return event
+
+
+def list_events(
+    context: TenantContext,
+    *,
+    start_at: datetime,
+    end_at: datetime,
+    calendar_id: uuid.UUID | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+) -> Sequence[CalendarEvent]:
+    """Every event in `context`'s tenant whose interval overlaps
+    `[start_at, end_at)` (the same overlap test `_conflicting_event()`
+    already uses), optionally narrowed to one `calendar_id` -- never an
+    unbounded full-calendar scan (Phase 2.15 brief §11: "calendar/agenda
+    view", never a second calendar domain model). `limit`/`offset` mirror
+    `voiceagent.calls.service.list_call_sessions()`'s own optional,
+    keyword-only shape. Ordered by `start_at` ascending (an agenda view's
+    natural order), `id` ascending as a stable tie-break."""
+    _require_valid_interval(start_at, end_at)
+    with tenant_scope(context) as session:
+        if calendar_id is not None:
+            _get_calendar_row(session, context.tenant_id, calendar_id)
+        query = (
+            select(CalendarEvent)
+            .where(CalendarEvent.tenant_id == context.tenant_id)
+            .where(CalendarEvent.start_at < end_at)
+            .where(CalendarEvent.end_at > start_at)
+        )
+        if calendar_id is not None:
+            query = query.where(CalendarEvent.calendar_id == calendar_id)
+        query = query.order_by(CalendarEvent.start_at.asc(), CalendarEvent.id.asc())
+        if offset:
+            query = query.offset(offset)
+        if limit is not None:
+            query = query.limit(limit)
+        rows = session.execute(query).scalars().all()
+        for row in rows:
+            session.expunge(row)
+        return rows
 
 
 def get_event(context: TenantContext, event_id: uuid.UUID) -> CalendarEvent:

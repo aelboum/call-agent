@@ -1,0 +1,262 @@
+/* Minimal, framework-free styling (Phase 2.15 brief §22: prioritize
+   information hierarchy, navigation, readability, consistent components --
+   not pixel-perfect marketing design). No UI library dependency added. */
+
+:root {
+  color-scheme: light dark;
+  --border: #d0d5dd;
+  --muted: #667085;
+  --accent: #2563eb;
+  --danger: #b42318;
+  --bg-subtle: rgba(120, 120, 120, 0.08);
+  font-family:
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  line-height: 1.5;
+}
+
+a {
+  color: var(--accent);
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-block: 0.5rem 1rem;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.9rem;
+}
+
+th {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+dl.detail-grid {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.35rem 1rem;
+  margin: 0.5rem 0 1rem;
+}
+
+dl.detail-grid dt {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+dl.detail-grid dd {
+  margin: 0;
+}
+
+.badge {
+  display: inline-block;
+  padding: 0.1rem 0.55rem;
+  border-radius: 999px;
+  background: var(--bg-subtle);
+  font-size: 0.8rem;
+  text-decoration: none;
+  color: inherit;
+}
+
+.badge-failed,
+.badge-cancelled,
+.badge-interrupted {
+  color: var(--danger);
+}
+
+.badge-escalation {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.state {
+  padding: 0.75rem 1rem;
+  border-radius: 0.5rem;
+  background: var(--bg-subtle);
+  margin: 0.75rem 0;
+}
+
+.state-error {
+  border: 1px solid var(--danger);
+}
+
+/* -- application shell ---------------------------------------------------- */
+
+.app-shell {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-topbar {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.6rem 1rem;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+
+.app-topbar-name {
+  font-weight: 700;
+}
+
+.app-topbar-user {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.context-selector {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+}
+
+.context-selector label {
+  color: var(--muted);
+}
+
+.context-selector-active {
+  color: var(--muted);
+  font-family: monospace;
+}
+
+.app-shell-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.app-nav ul {
+  list-style: none;
+  margin: 0;
+  padding: 1rem 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  width: 180px;
+  border-right: 1px solid var(--border);
+}
+
+.app-nav a {
+  display: block;
+  padding: 0.45rem 0.75rem;
+  border-radius: 0.4rem;
+  text-decoration: none;
+  color: inherit;
+}
+
+.app-nav a.active {
+  background: var(--bg-subtle);
+  font-weight: 600;
+}
+
+.app-content {
+  flex: 1;
+  padding: 1rem 1.5rem;
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.unauthenticated-screen {
+  max-width: 28rem;
+  margin: 4rem auto;
+  text-align: center;
+}
+
+/* -- dashboard -------------------------------------------------------------- */
+
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+  gap: 1.25rem;
+}
+
+.dashboard-list {
+  list-style: none;
+  margin: 0 0 0.5rem;
+  padding: 0;
+}
+
+.dashboard-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.3rem 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.9rem;
+}
+
+/* -- conversation transcript -------------------------------------------- */
+
+.conversation-transcript {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.conversation-transcript .turn {
+  display: flex;
+  gap: 0.6rem;
+  padding: 0.4rem 0.6rem;
+  border-radius: 0.4rem;
+  background: var(--bg-subtle);
+}
+
+.conversation-transcript .turn-role {
+  color: var(--muted);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  min-width: 5rem;
+}
+
+/* -- responsive ------------------------------------------------------------- */
+
+@media (max-width: 760px) {
+  .app-shell-body {
+    flex-direction: column;
+  }
+
+  .app-nav ul {
+    width: 100%;
+    flex-direction: row;
+    flex-wrap: wrap;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .app-topbar {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .app-topbar-user {
+    margin-left: 0;
+  }
+
+  dl.detail-grid {
+    grid-template-columns: 1fr;
+  }
+}

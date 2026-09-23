@@ -39,12 +39,13 @@ from voiceagent.calendars.service import (
     check_availability,
     create_calendar,
     create_event,
+    list_events,
 )
 from voiceagent.calls.errors import CallSessionNotFoundError
 from voiceagent.calls.service import associate_call, create_call_session, get_call_session
 from voiceagent.contacts.errors import ContactNotFoundError, ContactPhoneConflictError
 from voiceagent.contacts.models import Contact
-from voiceagent.contacts.service import create_contact, lookup_contact_by_phone
+from voiceagent.contacts.service import create_contact, list_contacts, lookup_contact_by_phone
 from voiceagent.db import IntegrityError, tenant_session_scope
 from voiceagent.providers.engines.contracts import ToolCallRequested
 from voiceagent.rbac_bootstrap import PERMISSIONS, bootstrap_tenant_rbac
@@ -119,6 +120,30 @@ def test_lookup_by_phone_never_returns_another_tenants_contact(two_tenants) -> N
     create_contact(context_a, name="Ada", phone_e164=phone)
     assert lookup_contact_by_phone(context_b, phone) is None
     assert lookup_contact_by_phone(context_a, phone) is not None
+
+
+def test_list_contacts_is_tenant_scoped(two_tenants) -> None:
+    """Phase 2.15: `list_contacts()`'s first API-wired caller
+    (`GET /v1/contacts`). Never returns another tenant's rows."""
+    context_a, context_b = two_tenants
+    contact_a = create_contact(context_a, name="List Test A", phone_e164=_phone())
+    contact_b = create_contact(context_b, name="List Test B", phone_e164=_phone())
+    ids_a = {contact.id for contact in list_contacts(context_a)}
+    ids_b = {contact.id for contact in list_contacts(context_b)}
+    assert contact_a.id in ids_a
+    assert contact_a.id not in ids_b
+    assert contact_b.id in ids_b
+    assert contact_b.id not in ids_a
+
+
+def test_list_contacts_respects_limit_and_offset(two_tenants) -> None:
+    context_a, _ = two_tenants
+    created = [create_contact(context_a, name=f"Paged {i}", phone_e164=_phone()) for i in range(3)]
+    first_page = list_contacts(context_a, limit=1)
+    assert len(first_page) == 1
+    all_rows = list_contacts(context_a, limit=100)
+    returned_ids = {row.id for row in all_rows}
+    assert all(contact.id in returned_ids for contact in created)
 
 
 # --------------------------------------------------------------------------
@@ -340,6 +365,73 @@ def test_availability_never_crosses_tenants(two_tenants) -> None:
     calendar_a = create_calendar(context_a, name="Tenant A Calendar", timezone="UTC")
     with pytest.raises(CalendarNotFoundError):
         check_availability(context_b, calendar_a.id, _aware(10, 13), _aware(11, 13))
+
+
+def test_list_events_filters_by_range(two_tenants) -> None:
+    """Phase 2.15: `list_events()`'s first caller (`GET /v1/calendar-events`,
+    the frontend's agenda view)."""
+    context_a, _ = two_tenants
+    calendar = create_calendar(context_a, name="Agenda Calendar", timezone="UTC")
+    inside = create_event(
+        context_a,
+        calendar_id=calendar.id,
+        title="Inside",
+        start_at=_aware(10, 14),
+        end_at=_aware(11, 14),
+    )
+    outside = create_event(
+        context_a,
+        calendar_id=calendar.id,
+        title="Outside",
+        start_at=_aware(10, 20),
+        end_at=_aware(11, 20),
+    )
+    results = list_events(context_a, start_at=_aware(9, 14), end_at=_aware(12, 14))
+    ids = {event.id for event in results}
+    assert inside.id in ids
+    assert outside.id not in ids
+
+
+def test_list_events_can_filter_by_calendar(two_tenants) -> None:
+    context_a, _ = two_tenants
+    calendar_1 = create_calendar(context_a, name="Agenda Calendar 1", timezone="UTC")
+    calendar_2 = create_calendar(context_a, name="Agenda Calendar 2", timezone="UTC")
+    event_1 = create_event(
+        context_a,
+        calendar_id=calendar_1.id,
+        title="On 1",
+        start_at=_aware(10, 15),
+        end_at=_aware(11, 15),
+    )
+    create_event(
+        context_a,
+        calendar_id=calendar_2.id,
+        title="On 2",
+        start_at=_aware(10, 15),
+        end_at=_aware(11, 15),
+    )
+    results = list_events(
+        context_a, start_at=_aware(9, 15), end_at=_aware(12, 15), calendar_id=calendar_1.id
+    )
+    assert {event.id for event in results} == {event_1.id}
+
+
+def test_list_events_never_crosses_tenants(two_tenants) -> None:
+    context_a, context_b = two_tenants
+    calendar_a = create_calendar(context_a, name="Tenant A Agenda", timezone="UTC")
+    create_event(
+        context_a,
+        calendar_id=calendar_a.id,
+        title="A's event",
+        start_at=_aware(10, 16),
+        end_at=_aware(11, 16),
+    )
+    results_b = list_events(context_b, start_at=_aware(0, 16), end_at=_aware(23, 16))
+    assert results_b == []
+    with pytest.raises(CalendarNotFoundError):
+        list_events(
+            context_b, start_at=_aware(0, 16), end_at=_aware(23, 16), calendar_id=calendar_a.id
+        )
 
 
 # --------------------------------------------------------------------------
