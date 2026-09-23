@@ -78,8 +78,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from collections.abc import AsyncIterator
 
+from voiceagent.metrics import Outcome, ProviderFamily, record_provider_operation
 from voiceagent.providers.engines.contracts import (
     AssistantResponse,
     AudioOut,
@@ -151,6 +153,46 @@ async def _bounded[T](
                 f"{provider_label}: no activity within {timeout_seconds}s",
             ) from exc
         yield item
+
+
+async def _timed[T](
+    aiter: AsyncIterator[T], provider_family: ProviderFamily, operation: str
+) -> AsyncIterator[T]:
+    """Wraps any provider stream (typically already `_bounded()`) so fully
+    consuming it -- yielding every item until `StopAsyncIteration`, or
+    raising -- records exactly one `voiceagent.metrics.record_provider_operation()`
+    call for the whole operation (one LLM turn's `stream_turn()`, one
+    utterance's `synthesize()`) rather than one per item. Transparent to the
+    caller: every item is yielded unchanged, and an `EngineException` is
+    re-raised unchanged after being recorded."""
+    started = time.monotonic()
+    failed: EngineException | None = None
+    try:
+        async for item in aiter:
+            yield item
+    except EngineException as exc:
+        failed = exc
+        raise
+    finally:
+        outcome: Outcome = "success" if failed is None else _provider_operation_outcome(failed)
+        record_provider_operation(
+            provider_family,
+            operation,
+            outcome,
+            time.monotonic() - started,
+            error_category=(failed.code.value if failed is not None else None),
+        )
+
+
+def _provider_operation_outcome(exc: EngineException) -> Outcome:
+    """Phase 2.14: `_bounded()`'s own idle-timeout message is the only signal
+    available here that distinguishes "provider stopped responding" from
+    every other provider-level failure -- both raise the identical
+    `EngineException` type/code, so a metric that only recorded `"failure"`
+    for both would hide a provider timing out behind a provider actually
+    erroring. A heuristic, not a second exception type (brief section 9:
+    reuse the existing taxonomy, do not add a new hierarchy)."""
+    return "timeout" if "no activity within" in str(exc) else "failure"
 
 
 def _initial_messages(config: EngineSessionConfig) -> list[dict[str, object]]:
@@ -236,6 +278,15 @@ class PipelinedEngineSession:
             yield frame
 
     async def _consume_stt(self) -> None:
+        # Phase 2.14: "STT latency" is measured per caller utterance -- the
+        # time from the first PartialTranscript of one utterance to its
+        # FinalTranscript -- since STT itself is one continuous stream for
+        # the whole call (`self._stt.stream()`, called once, never once per
+        # "operation" the way an LLM turn or a TTS synthesis is). A
+        # connection-level failure with no utterance in flight is timed
+        # against `stream_started` instead, so it is never dropped silently.
+        stream_started = time.monotonic()
+        utterance_started: float | None = None
         try:
             async for item in _bounded(
                 self._stt.stream(self._audio_iter()), self._stt_idle_timeout_seconds, "stt"
@@ -243,6 +294,7 @@ class PipelinedEngineSession:
                 if isinstance(item, PartialTranscript):
                     if not self._caller_speaking:
                         self._caller_speaking = True
+                        utterance_started = time.monotonic()
                         # Barge-in signal (§9): the runtime
                         # (`voiceagent.runtime.call_task._run_pumps()`) calls
                         # `interrupt()` when it sees this -- unconditionally
@@ -254,6 +306,14 @@ class PipelinedEngineSession:
                     if self._caller_speaking:
                         self._caller_speaking = False
                         await self._emit(SpeechEnded())
+                        if utterance_started is not None:
+                            record_provider_operation(
+                                "stt",
+                                "transcribe",
+                                "success",
+                                time.monotonic() - utterance_started,
+                            )
+                            utterance_started = None
                     if self.closed:
                         # A late result surfacing after close() already ran
                         # (§7: "STT result arrives after call termination")
@@ -263,6 +323,13 @@ class PipelinedEngineSession:
                     self._messages.append({"role": "user", "content": item.text})
                     await self._run_turn()
         except EngineException as exc:
+            record_provider_operation(
+                "stt",
+                "transcribe",
+                _provider_operation_outcome(exc),
+                time.monotonic() - (utterance_started or stream_started),
+                error_category=exc.code.value,
+            )
             # An STT-stream-level failure (the connection itself died, an
             # auth rejection, a stall past `stt_idle_timeout_seconds`, ...)
             # ends this session's ability to keep listening -- surfaced as
@@ -314,10 +381,14 @@ class PipelinedEngineSession:
 
     async def _turn(self) -> None:
         buffer = ""
-        async for item in _bounded(
-            self._llm.stream_turn(self._messages, self.config.tools),
-            self._llm_idle_timeout_seconds,
+        async for item in _timed(
+            _bounded(
+                self._llm.stream_turn(self._messages, self.config.tools),
+                self._llm_idle_timeout_seconds,
+                "llm",
+            ),
             "llm",
+            "stream_turn",
         ):
             if isinstance(item, str):
                 buffer += item
@@ -363,10 +434,14 @@ class PipelinedEngineSession:
             # (Phase 2.5) is the text the agent decided to say, independent
             # of how many AudioOut frames its synthesis produces.
             await self._emit(AssistantResponse(text=buffer))
-            async for audio in _bounded(
-                self._tts.synthesize(buffer, self.config.voice),
-                self._tts_idle_timeout_seconds,
+            async for audio in _timed(
+                _bounded(
+                    self._tts.synthesize(buffer, self.config.voice),
+                    self._tts_idle_timeout_seconds,
+                    "tts",
+                ),
                 "tts",
+                "synthesize",
             ):
                 await self._emit(audio)
         await self._emit(TurnEnded())

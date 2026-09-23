@@ -41,8 +41,15 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 import uuid
 
+from voiceagent.error_taxonomy import categorize_exception
+from voiceagent.metrics import (
+    record_runtime_call_startup_failure,
+    record_runtime_shutdown,
+    record_teardown_timeout,
+)
 from voiceagent.runtime.call_task import CallTaskDependencies, CancellationSignal, run_call_task
 from voiceagent.runtime.heartbeat import HeartbeatStore, RuntimeHeartbeat, wall_clock_now
 from voiceagent.telephony.contracts import CallRef
@@ -74,10 +81,26 @@ class CallRuntime:
         self._cancellations: dict[uuid.UUID, CancellationSignal] = {}
         self._errors: dict[uuid.UUID, BaseException] = {}
         self._heartbeat_task: asyncio.Task[None] | None = None
+        #: Set for the duration of `shutdown()` (Phase 2.14 brief section
+        #: 12): a runtime diagnostics view (`voiceagent.runtime.diagnostics`)
+        #: reads this to report "draining" rather than "healthy", without
+        #: this class exposing anything about *how* shutdown is implemented.
+        self._shutting_down = False
 
     @property
     def current_load(self) -> int:
         return len(self._tasks)
+
+    @property
+    def is_shutting_down(self) -> bool:
+        return self._shutting_down
+
+    @property
+    def owned_call_session_ids(self) -> tuple[uuid.UUID, ...]:
+        """Every call this runtime currently supervises. Identifiers only --
+        never call content -- safe for a runtime diagnostics view (brief
+        section 12)."""
+        return tuple(self._tasks.keys())
 
     def is_running(self, call_session_id: uuid.UUID) -> bool:
         task = self._tasks.get(call_session_id)
@@ -126,7 +149,16 @@ class CallRuntime:
             raise
         except Exception as exc:  # noqa: BLE001 -- the call-task error boundary; see module docstring.
             self._errors[call_session_id] = exc
-            _logger.exception("call %s failed", call_session_id)
+            category = categorize_exception(exc)
+            _logger.exception(
+                "call.task.failed",
+                extra={
+                    "call_session_id": str(call_session_id),
+                    "runtime_instance_id": self.instance_id,
+                    "error_category": category,
+                },
+            )
+            record_runtime_call_startup_failure(error_category=category)
         finally:
             self._tasks.pop(call_session_id, None)
             self._cancellations.pop(call_session_id, None)
@@ -155,12 +187,15 @@ class CallRuntime:
             await asyncio.wait_for(asyncio.shield(task), timeout=self._cancel_timeout_seconds)
         except TimeoutError:
             _logger.warning(
-                "call %s did not finish tearing down within %.1fs of cancellation (reason=%r); "
-                "no longer waiting on it, teardown continues in the background",
-                call_session_id,
-                self._cancel_timeout_seconds,
-                reason,
+                "call.teardown.timeout",
+                extra={
+                    "call_session_id": str(call_session_id),
+                    "runtime_instance_id": self.instance_id,
+                    "cancel_timeout_seconds": self._cancel_timeout_seconds,
+                    "reason": reason,
+                },
             )
+            record_teardown_timeout()
         except asyncio.CancelledError:
             pass
 
@@ -206,6 +241,8 @@ class CallRuntime:
         every exception it can raise, but shutdown must never fail to
         deregister this runtime's heartbeat because of a bug in one call's
         own cancellation path."""
+        self._shutting_down = True
+        started = time.monotonic()
         if self._heartbeat_task is not None:
             self._heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -228,3 +265,9 @@ class CallRuntime:
                 )
 
         await self._heartbeat_store.remove(self.instance_id)
+        duration = time.monotonic() - started
+        _logger.info(
+            "runtime.shutdown.complete",
+            extra={"runtime_instance_id": self.instance_id, "duration_seconds": duration},
+        )
+        record_runtime_shutdown(duration)

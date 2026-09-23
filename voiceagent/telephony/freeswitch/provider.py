@@ -33,8 +33,10 @@ second error type to handle a slow command differently from a failed one.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncIterator
 
+from voiceagent.metrics import record_provider_operation
 from voiceagent.telephony.contracts import (
     CallDirection,
     CallEvent,
@@ -124,54 +126,67 @@ class FreeSwitchTelephonyProvider:
         self._esl = esl
         self._command_timeout_seconds = command_timeout_seconds
 
-    async def _command(self, command: str) -> str:
+    async def _command(self, command: str, *, operation: str) -> str:
+        """`operation` is one of this class's own ten bounded ESL verb names
+        below (Phase 2.14, brief section 6) -- never derived from `command`
+        itself, which carries call-specific values (a `call_ref`, a phone
+        number) that must never become a metric label."""
+        started = time.monotonic()
         try:
             response = await asyncio.wait_for(
                 self._esl.send(command), timeout=self._command_timeout_seconds
             )
         except TimeoutError as exc:
+            record_provider_operation("telephony", operation, "timeout", time.monotonic() - started)
             raise TransportError(
                 f"ESL command timed out after {self._command_timeout_seconds}s: {command!r}"
             ) from exc
         if response.startswith("-ERR"):
+            record_provider_operation("telephony", operation, "failure", time.monotonic() - started)
             raise TransportError(f"ESL command failed: {command!r} -> {response!r}")
+        record_provider_operation("telephony", operation, "success", time.monotonic() - started)
         return response
 
     async def originate(self, request: OriginateRequest) -> CallRef:
         response = await self._command(
             f"bgapi originate "
             f"{{origination_caller_id_number={request.from_number}}}"
-            f"sofia/gateway/default/{request.to_number}"
+            f"sofia/gateway/default/{request.to_number}",
+            operation="originate",
         )
         return response.strip()
 
     async def answer(self, call_ref: CallRef) -> None:
-        await self._command(f"uuid_answer {call_ref}")
+        await self._command(f"uuid_answer {call_ref}", operation="answer")
 
     async def hangup(self, call_ref: CallRef, cause: HangupCause = HangupCause.NORMAL) -> None:
-        await self._command(f"uuid_kill {call_ref} {_denormalize_hangup_cause(cause)}")
+        await self._command(
+            f"uuid_kill {call_ref} {_denormalize_hangup_cause(cause)}", operation="hangup"
+        )
 
     async def bridge(self, call_ref: CallRef, other_call_ref: CallRef) -> None:
-        await self._command(f"uuid_bridge {call_ref} {other_call_ref}")
+        await self._command(f"uuid_bridge {call_ref} {other_call_ref}", operation="bridge")
 
     async def transfer(self, call_ref: CallRef, destination: str) -> CallRef:
-        response = await self._command(f"bgapi originate sofia/gateway/default/{destination}")
+        response = await self._command(
+            f"bgapi originate sofia/gateway/default/{destination}", operation="transfer"
+        )
         return response.strip()
 
     async def hold(self, call_ref: CallRef) -> None:
-        await self._command(f"uuid_hold {call_ref}")
+        await self._command(f"uuid_hold {call_ref}", operation="hold")
 
     async def unhold(self, call_ref: CallRef) -> None:
-        await self._command(f"uuid_hold off {call_ref}")
+        await self._command(f"uuid_hold off {call_ref}", operation="unhold")
 
     async def send_dtmf(self, call_ref: CallRef, digits: str) -> None:
-        await self._command(f"uuid_send_dtmf {call_ref} {digits}")
+        await self._command(f"uuid_send_dtmf {call_ref} {digits}", operation="send_dtmf")
 
     async def start_recording(self, call_ref: CallRef) -> None:
-        await self._command(f"uuid_record {call_ref} start /dev/null")
+        await self._command(f"uuid_record {call_ref} start /dev/null", operation="start_recording")
 
     async def stop_recording(self, call_ref: CallRef) -> None:
-        await self._command(f"uuid_record {call_ref} stop /dev/null")
+        await self._command(f"uuid_record {call_ref} stop /dev/null", operation="stop_recording")
 
     async def events(self) -> AsyncIterator[CallEvent]:
         async for raw in self._esl.events():

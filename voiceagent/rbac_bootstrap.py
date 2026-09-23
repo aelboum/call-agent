@@ -60,6 +60,7 @@ from voiceagent.contacts import permissions as contacts_permissions
 from voiceagent.conversations import permissions as conversations_permissions
 from voiceagent.followups import permissions as followups_permissions
 from voiceagent.knowledge import permissions as knowledge_permissions
+from voiceagent.ops import permissions as ops_permissions
 from voiceagent.phone_numbers import permissions as phone_numbers_permissions
 from voiceagent.tools import permissions as tools_permissions
 from voiceagent.tools.registry import TOOL_REGISTRY
@@ -144,6 +145,10 @@ PERMISSIONS: tuple[tuple[str, str], ...] = (
     # import time, not hand-listed, so this tuple can never omit a
     # registered tool's permission or list one that does not exist.
     *((tools_permissions.RESOURCE, tool_id) for tool_id in TOOL_REGISTRY.known_tool_ids()),
+    # Phase 2.14: `(ops_permissions.RESOURCE, "read")` is deliberately NOT
+    # listed here -- see `voiceagent.ops.permissions`'s own module docstring
+    # for why operator diagnostics must never be auto-granted to the call
+    # runtime's own service account the way every permission above is.
 )
 
 #: The role bootstrap creates/reuses -- "which role receives them" (brief
@@ -179,6 +184,7 @@ def register_permissions() -> None:
     knowledge_permissions.register()
     call_intelligence_permissions.register()
     tools_permissions.register()
+    ops_permissions.register()
 
 
 def _get_or_create_role(tenant_id: uuid.UUID, name: str) -> uuid.UUID:

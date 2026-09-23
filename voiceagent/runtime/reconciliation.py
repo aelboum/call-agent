@@ -27,15 +27,19 @@ detail, not a deviation from that diagram -- see
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 from voiceagent.calls.errors import InvalidCallSessionTransitionError
 from voiceagent.calls.models import CallSession
 from voiceagent.calls.service import list_non_terminal_call_sessions, transition_call_session
+from voiceagent.metrics import record_reconciliation
 from voiceagent.runtime.heartbeat import RuntimeHeartbeat
 from voiceagent.tenancy import TenantContext
 
 __all__ = ["ReconciliationReport", "find_stale_call_sessions", "reconcile_tenant"]
+
+_logger = logging.getLogger(__name__)
 
 
 def find_stale_call_sessions(
@@ -90,6 +94,21 @@ def reconcile_tenant(
             # if it does not contradict an already-finalized state, ignored
             # otherwise. Not a reconciliation failure.
             continue
+
+    if stale:
+        for _ in stale:
+            record_reconciliation(result="stale")
+        for _ in repaired:
+            record_reconciliation(result="repaired")
+        _logger.info(
+            "runtime.reconciliation.tenant_scan",
+            extra={
+                "tenant_id": str(context.tenant_id),
+                "scanned": len(non_terminal),
+                "stale": len(stale),
+                "repaired": len(repaired),
+            },
+        )
 
     return ReconciliationReport(
         scanned=len(non_terminal), stale=tuple(stale), repaired=tuple(repaired)

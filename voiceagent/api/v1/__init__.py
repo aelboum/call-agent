@@ -11,8 +11,10 @@ read endpoint. Phase 2.6 adds `contacts`, `calendars` and `calendar-events`
 outcome and call-scoped follow-up routes nested on `call-sessions`
 (`docs/PHASE-2.7-STATUS.md`). Phase 2.11 adds `knowledge`
 (`docs/PHASE-2.11-STATUS.md`). Phase 2.12 adds the AI post-call analysis
-routes nested on `call-sessions` (`docs/PHASE-2.12-STATUS.md`). Tool and
-workflow resources belong to later phases and must not be anticipated here.
+routes nested on `call-sessions` (`docs/PHASE-2.12-STATUS.md`). Phase 2.14
+adds `ops` -- operator-only operational diagnostics
+(`voiceagent.api.v1.ops`'s own module docstring). Tool and workflow
+resources belong to later phases and must not be anticipated here.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ from voiceagent.api.v1.conversations import router as conversations_router
 from voiceagent.api.v1.follow_ups import router as follow_ups_router
 from voiceagent.api.v1.knowledge import router as knowledge_router
 from voiceagent.api.v1.meta import router as meta_router
+from voiceagent.api.v1.ops import router as ops_router
 from voiceagent.api.v1.phone_numbers import router as phone_numbers_router
 
 router = APIRouter()
@@ -43,5 +46,6 @@ router.include_router(calendar_events_router)
 router.include_router(follow_ups_router)
 router.include_router(knowledge_router)
 router.include_router(call_ai_analysis_router)
+router.include_router(ops_router)
 
 __all__ = ["router"]

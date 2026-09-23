@@ -25,9 +25,11 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 from collections.abc import AsyncIterator
 from typing import Protocol, runtime_checkable
 
+from voiceagent.metrics import record_provider_operation
 from voiceagent.telephony.contracts import (
     AudioFormat,
     CallRef,
@@ -132,24 +134,32 @@ class FreeSwitchMediaProvider:
     async def attach(
         self, call_ref: CallRef, fmt: AudioFormat | None = None
     ) -> _FreeSwitchMediaStream:
+        started = time.monotonic()
         chosen = fmt if fmt is not None else _SUPPORTED_FORMATS[0]
         if chosen not in _SUPPORTED_FORMATS:
+            record_provider_operation("media", "attach", "failure", time.monotonic() - started)
             raise UnsupportedFormatError(f"unsupported format: {chosen}")
         if call_ref in self._streams:
+            record_provider_operation("media", "attach", "failure", time.monotonic() - started)
             raise TransportError(f"stream already attached: {call_ref}")
         socket = self._sockets.get(call_ref)
         if socket is None:
+            record_provider_operation("media", "attach", "failure", time.monotonic() - started)
             raise TransportError(f"no media socket registered for {call_ref}")
         stream = _FreeSwitchMediaStream(socket, chosen)
         self._streams[call_ref] = stream
+        record_provider_operation("media", "attach", "success", time.monotonic() - started)
         return stream
 
     async def detach(self, call_ref: CallRef) -> None:
+        started = time.monotonic()
         stream = self._streams.pop(call_ref, None)
         if stream is None:
+            record_provider_operation("media", "detach", "failure", time.monotonic() - started)
             raise TransportError(f"no attached stream: {call_ref}")
         await stream.close()
         self._sockets.pop(call_ref, None)
+        record_provider_operation("media", "detach", "success", time.monotonic() - started)
 
     def health(self, call_ref: CallRef) -> StreamHealth:
         stream = self._streams.get(call_ref)

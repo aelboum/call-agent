@@ -29,12 +29,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 from voiceagent.call_intelligence.analyzer import run_call_ai_analysis
 from voiceagent.config.settings import AiProviderSettings
+from voiceagent.metrics import record_worker_tick
 from voiceagent.providers.call_intelligence.contracts import CallIntelligenceProvider
 from voiceagent.runtime.db import DatabaseBoundary
 from voiceagent.tenancy import TenantContext
@@ -156,6 +158,7 @@ class CallAiAnalysisWorker:
         """One tick: drain every tenant `tenant_ids()` currently names, up
         to `max_concurrent_tenants` at once. Safe to call directly in a
         test without `start()`."""
+        tick_started = time.monotonic()
         tenant_ids = list(self._tenant_ids())
         semaphore = asyncio.Semaphore(self._max_concurrent_tenants)
 
@@ -168,12 +171,28 @@ class CallAiAnalysisWorker:
 
         total_executed = sum(executed for _, executed, _ in results)
         errors = tuple((tenant_id, error) for tenant_id, _, error in results if error is not None)
-        return CallAiAnalysisWorkerTickReport(
+        report = CallAiAnalysisWorkerTickReport(
             tenants_scanned=len(tenant_ids),
             executed=total_executed,
             errored=len(errors),
             per_tenant_errors=errors,
         )
+        record_worker_tick(
+            "call_intelligence",
+            claimed=report.executed,
+            failed=0,
+            tenants_errored=report.errored,
+            duration_seconds=time.monotonic() - tick_started,
+        )
+        _logger.info(
+            "call_ai_analysis_worker.tick",
+            extra={
+                "tenants_scanned": report.tenants_scanned,
+                "executed": report.executed,
+                "errored": report.errored,
+            },
+        )
+        return report
 
     async def shutdown(self) -> None:
         """Cancel the polling loop and wait for the current tick to unwind.

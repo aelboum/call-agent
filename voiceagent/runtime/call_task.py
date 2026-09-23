@@ -65,6 +65,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -74,7 +75,13 @@ from voiceagent.agents.service import get_agent_version
 from voiceagent.call_analysis.service import build_call_analysis
 from voiceagent.calls.errors import InvalidCallSessionTransitionError
 from voiceagent.calls.service import get_call_session, transition_call_session
-from voiceagent.observability import bind_correlation_context
+from voiceagent.metrics import (
+    record_call_completed,
+    record_call_setup_latency,
+    record_call_started,
+    record_call_teardown,
+)
+from voiceagent.observability import bind_correlation_context, get_tracer
 from voiceagent.providers.engines.contracts import (
     AssistantResponse,
     AudioOut,
@@ -386,12 +393,26 @@ async def run_call_task(
     mid-startup would otherwise never be picked up by reconciliation either,
     since that mechanism only reacts to a runtime whose heartbeat has
     actually expired -- ADR-0008 point 9)."""
-    with bind_correlation_context(
-        tenant_id=str(context.tenant_id), request_id=str(call_session_id)
+    with (
+        bind_correlation_context(tenant_id=str(context.tenant_id), request_id=str(call_session_id)),
+        get_tracer(__name__).start_as_current_span(
+            "call.lifecycle",
+            attributes={
+                "call_session_id": str(call_session_id),
+                "tenant_id": str(context.tenant_id),
+            },
+        ) as span,
     ):
         media_stream = None
         engine_session = None
         finalized = False
+        call_outcome = "unknown"
+        started_monotonic = time.monotonic()
+        record_call_started()
+        _logger.info(
+            "call.task.started",
+            extra={"event": "call.task.started", "call_session_id": str(call_session_id)},
+        )
         try:
             call = await deps.db.run(get_call_session, context, call_session_id)
             agent_version = await deps.db.run(get_agent_version, context, call.agent_version_id)
@@ -417,10 +438,12 @@ async def run_call_task(
                     expected_runtime_instance_id=deps.runtime_instance_id,
                 )
                 finalized = True
+                call_outcome = "authorization_denied"
                 return
 
             media_stream = await deps.media.attach(call_ref)
             engine_session = await deps.engine.start(_engine_session_config(agent_version))
+            record_call_setup_latency(time.monotonic() - started_monotonic)
             deps.conversation_persistence.start(context, call_session_id)
 
             async def _dispatch_tool_call(request: ToolCallRequested) -> ToolResult:
@@ -462,6 +485,7 @@ async def run_call_task(
                 call_session_id, media_stream, engine_session, _dispatch_tool_call, _persist_turn
             )
         finally:
+            teardown_started_monotonic = time.monotonic()
             deps.tool_gateway.forget_call(call_session_id)
             await deps.conversation_persistence.finish(call_session_id)
             if engine_session is not None:
@@ -503,6 +527,7 @@ async def run_call_task(
                     _logger.exception("media.detach() raised for CallSession %s", call_session_id)
             if not finalized:
                 status, end_reason = _final_status(cancellation.reason)
+                call_outcome = status
                 try:
                     # No `expected_runtime_instance_id` here, deliberately:
                     # finalization's one job is to always leave the row in a
@@ -524,6 +549,7 @@ async def run_call_task(
                     # before it was ever answered) -- "interrupted" is
                     # reachable from every non-terminal status, so fall back
                     # to it rather than leaving the row stuck non-terminal.
+                    call_outcome = "interrupted"
                     with contextlib.suppress(Exception):
                         await deps.db.run(
                             transition_call_session,
@@ -556,3 +582,22 @@ async def run_call_task(
                 _logger.exception(
                     "failed to build CallAnalysis for CallSession %s", call_session_id
                 )
+
+            # Phase 2.14: one call's own terminal signal, recorded exactly
+            # once regardless of which path above produced it (clean hangup,
+            # authorization denial, or an exception this function itself
+            # never catches -- `finally` still runs before it propagates).
+            now = time.monotonic()
+            record_call_teardown(
+                duration_seconds=now - teardown_started_monotonic, outcome=call_outcome
+            )
+            record_call_completed(outcome=call_outcome, duration_seconds=now - started_monotonic)
+            span.set_attribute("call.outcome", call_outcome)
+            _logger.info(
+                "call.task.completed",
+                extra={
+                    "call_session_id": str(call_session_id),
+                    "outcome": call_outcome,
+                    "duration_seconds": now - started_monotonic,
+                },
+            )

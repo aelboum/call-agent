@@ -200,6 +200,18 @@ class RuntimeSettings:
     #: behavior") -- bounds how much a slow/unavailable database can delay
     #: one call's own teardown.
     conversation_persistence_drain_timeout_seconds: float = 5.0
+    #: `voiceagent.runtime.stuck_calls` thresholds (Phase 2.14 brief section
+    #: 13/15). Conservative placeholders, like every other duration in this
+    #: dataclass (module docstring, ADR-0008 point 15) -- not a benchmarked
+    #: production value. A call still `initiated`/`ringing` past this many
+    #: seconds is reported stuck in startup.
+    stuck_call_startup_threshold_seconds: float = 60.0
+    #: A call still `answered`/`in_progress` past this many seconds is
+    #: reported stuck active. Deliberately generous: real calls can
+    #: legitimately run long, and this is a detection signal for an
+    #: operator to investigate, never an automatic cutoff (this module never
+    #: cancels a call itself).
+    stuck_call_active_threshold_seconds: float = 3600.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -446,6 +458,20 @@ def settings_from_env(platform: PlatformSettings | None = None) -> Settings:
                 )
                 is not None
                 else defaults.conversation_persistence_drain_timeout_seconds
+            ),
+            stuck_call_startup_threshold_seconds=(
+                _parse_float("VOICEAGENT_RUNTIME_STUCK_CALL_STARTUP_THRESHOLD_SECONDS", raw)
+                if (
+                    raw := os.environ.get("VOICEAGENT_RUNTIME_STUCK_CALL_STARTUP_THRESHOLD_SECONDS")
+                )
+                is not None
+                else defaults.stuck_call_startup_threshold_seconds
+            ),
+            stuck_call_active_threshold_seconds=(
+                _parse_float("VOICEAGENT_RUNTIME_STUCK_CALL_ACTIVE_THRESHOLD_SECONDS", raw)
+                if (raw := os.environ.get("VOICEAGENT_RUNTIME_STUCK_CALL_ACTIVE_THRESHOLD_SECONDS"))
+                is not None
+                else defaults.stuck_call_active_threshold_seconds
             ),
         ),
         call_intelligence=_call_intelligence_settings_from_env(),

@@ -93,6 +93,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from collections.abc import Mapping
 
@@ -104,6 +105,7 @@ from core.rbac import can as rbac_can
 from pydantic import ValidationError
 
 from voiceagent.agents.models import AgentVersion
+from voiceagent.metrics import record_tool_execution
 from voiceagent.observability import bind_correlation_context
 from voiceagent.providers.engines.contracts import ToolCallRequested, ToolResult
 from voiceagent.runtime.db import DatabaseBoundary
@@ -261,6 +263,7 @@ class ToolGateway:
                     outcome=AuditOutcome.SUCCESS,
                     actor_service_account_id=service_account_id,
                 )
+                record_tool_execution(outcome="duplicate", duration_seconds=0.0)
                 return cached
 
             try:
@@ -275,6 +278,7 @@ class ToolGateway:
                     outcome=AuditOutcome.DENIED,
                     actor_service_account_id=service_account_id,
                 )
+                record_tool_execution(outcome="denied", duration_seconds=0.0)
                 return self._remember(
                     call_session_id,
                     ToolResult(call_id=request.call_id, error_code="unknown_tool", retryable=False),
@@ -290,6 +294,7 @@ class ToolGateway:
                     outcome=AuditOutcome.DENIED,
                     actor_service_account_id=service_account_id,
                 )
+                record_tool_execution(outcome="denied", duration_seconds=0.0)
                 return self._remember(
                     call_session_id,
                     ToolResult(
@@ -309,6 +314,7 @@ class ToolGateway:
                     outcome=AuditOutcome.FAILURE,
                     actor_service_account_id=service_account_id,
                 )
+                record_tool_execution(outcome="validation_failed", duration_seconds=0.0)
                 return self._remember(
                     call_session_id,
                     ToolResult(
@@ -332,6 +338,7 @@ class ToolGateway:
                     outcome=AuditOutcome.DENIED,
                     actor_service_account_id=service_account_id,
                 )
+                record_tool_execution(outcome="denied", duration_seconds=0.0)
                 return self._remember(
                     call_session_id,
                     ToolResult(call_id=request.call_id, error_code="unauthorized", retryable=False),
@@ -385,6 +392,7 @@ class ToolGateway:
         request: ToolCallRequested,
         service_account_id: uuid.UUID | None,
     ) -> ToolResult:
+        handler_started = time.monotonic()
         try:
             raw_output = await asyncio.wait_for(
                 definition.handler(exec_context, typed_input), timeout=definition.timeout_seconds
@@ -399,6 +407,9 @@ class ToolGateway:
                 outcome=AuditOutcome.FAILURE,
                 actor_service_account_id=service_account_id,
             )
+            record_tool_execution(
+                outcome="timed_out", duration_seconds=time.monotonic() - handler_started
+            )
             return ToolResult(call_id=request.call_id, error_code="timeout", retryable=True)
         except asyncio.CancelledError:
             await db.run(
@@ -410,6 +421,9 @@ class ToolGateway:
                 outcome=AuditOutcome.FAILURE,
                 actor_service_account_id=service_account_id,
             )
+            record_tool_execution(
+                outcome="cancelled", duration_seconds=time.monotonic() - handler_started
+            )
             raise
         except ToolExecutionError as exc:
             await db.run(
@@ -420,6 +434,9 @@ class ToolGateway:
                 status="failed",
                 outcome=AuditOutcome.FAILURE,
                 actor_service_account_id=service_account_id,
+            )
+            record_tool_execution(
+                outcome="failed", duration_seconds=time.monotonic() - handler_started
             )
             return ToolResult(call_id=request.call_id, error_code=exc.code, retryable=exc.retryable)
         except Exception:  # noqa: BLE001 -- a handler bug must become a
@@ -437,6 +454,9 @@ class ToolGateway:
                 status="failed",
                 outcome=AuditOutcome.FAILURE,
                 actor_service_account_id=service_account_id,
+            )
+            record_tool_execution(
+                outcome="failed", duration_seconds=time.monotonic() - handler_started
             )
             return ToolResult(call_id=request.call_id, error_code="internal_error", retryable=False)
 
@@ -456,6 +476,9 @@ class ToolGateway:
                 outcome=AuditOutcome.FAILURE,
                 actor_service_account_id=service_account_id,
             )
+            record_tool_execution(
+                outcome="failed", duration_seconds=time.monotonic() - handler_started
+            )
             return ToolResult(call_id=request.call_id, error_code="internal_error", retryable=False)
 
         await db.run(
@@ -466,6 +489,9 @@ class ToolGateway:
             status="succeeded",
             outcome=AuditOutcome.SUCCESS,
             actor_service_account_id=service_account_id,
+        )
+        record_tool_execution(
+            outcome="succeeded", duration_seconds=time.monotonic() - handler_started
         )
         value: Mapping[str, object] = validated.model_dump(mode="json")
         return ToolResult(call_id=request.call_id, value=value)
