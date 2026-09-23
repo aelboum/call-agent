@@ -53,6 +53,30 @@ def test_there_is_exactly_one_head() -> None:
     assert result.stdout.count("(head)") == 1
 
 
+def test_every_revision_id_fits_in_the_alembic_version_column() -> None:
+    """Phase 2.17 release-validation finding: `alembic_version.version_num` is
+    `VARCHAR(32)` (Alembic/SaaS-OS default). A revision id longer than that
+    renders fine offline as SQL text -- the failure only appears as a
+    `StringDataRightTruncation` error against a real database, on the
+    `UPDATE alembic_version SET version_num=...` Alembic issues after running
+    a migration. `0011_call_sessions_tenant_status_index` (38 chars) hit
+    exactly this before being shortened to `0011_call_sessions_index`."""
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    config = Config(str(REPO_ROOT / "alembic.ini"))
+    config.set_main_option("script_location", str(REPO_ROOT / "migrations"))
+    script_dir = ScriptDirectory.from_config(config)
+
+    revisions = list(script_dir.walk_revisions())
+    assert revisions, "expected at least one migration to be discovered"
+    for rev in revisions:
+        assert len(rev.revision) <= 32, (
+            f"revision id {rev.revision!r} ({len(rev.revision)} chars) exceeds "
+            "alembic_version.version_num's VARCHAR(32) column"
+        )
+
+
 def test_migration_creates_the_product_schema(offline_sql: str) -> None:
     assert "CREATE SCHEMA IF NOT EXISTS app" in offline_sql
 

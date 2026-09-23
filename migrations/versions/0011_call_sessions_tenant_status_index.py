@@ -1,6 +1,6 @@
 """add a composite (tenant_id, status) index to app.call_sessions
 
-Revision ID: 0011_call_sessions_tenant_status_index
+Revision ID: 0011_call_sessions_index
 Revises: 0010_call_ai_analyses
 Create Date: 2026-09-23
 
@@ -37,6 +37,18 @@ participate in) -- this migration does not attempt that, matching every
 other index this product's migrations already create the same plain way
 (`0005`, `0007`, `0009`, `0010`), so introducing `CONCURRENTLY` here alone
 would be an inconsistent, one-off deviation rather than a real fix.
+
+**Phase 2.17 release-validation fix**: this migration's `revision` id was
+originally `"0011_call_sessions_tenant_status_index"` (38 chars) -- longer
+than Alembic's own `alembic_version.version_num VARCHAR(32)` column (every
+other migration's id in this repository is 29 chars or fewer). Running
+`alembic upgrade head` against a real PostgreSQL instance failed with
+`StringDataRightTruncation` on the version-table `UPDATE` -- a real defect
+this migration had never actually been applied against a database before,
+only rendered offline as SQL text (`tests/test_migrations.py`'s own
+hermetic suite never executes DDL, so it could not have caught this).
+Shortened to `"0011_call_sessions_index"` (25 chars); the index name/shape
+and every other statement are unchanged.
 """
 
 from __future__ import annotations
@@ -45,7 +57,7 @@ from collections.abc import Sequence
 
 from alembic import op
 
-revision: str = "0011_call_sessions_tenant_status_index"
+revision: str = "0011_call_sessions_index"
 down_revision: str | Sequence[str] | None = "0010_call_ai_analyses"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
