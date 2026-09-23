@@ -47,7 +47,7 @@ import {
   type ReactNode,
 } from "react";
 
-import { fetchCurrentUser, type CurrentUser } from "../lib/authApi";
+import { fetchCurrentUser, logout, type CurrentUser } from "../lib/authApi";
 import { queryClient } from "../lib/queryClient";
 
 const ACTIVE_TENANT_STORAGE_KEY = "voiceagent.activeTenantId";
@@ -62,6 +62,7 @@ interface SessionContextValue {
   activeTenantId: string | null;
   setActiveTenantId: (tenantId: string | null) => void;
   refreshIdentity: () => void;
+  signOut: () => Promise<void>;
 }
 
 // Exported (not just `SessionProvider`/`useSession`) so tests can render a
@@ -135,17 +136,39 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     setActiveTenantIdState(tenantId);
   }
 
+  async function signOut(): Promise<void> {
+    // Security-relevant, not just tidiness: a shared/kiosk browser where a
+    // second user signs in after this one must never see the first user's
+    // active tenant id or cached query results (ADR-0010 §11/§14's own
+    // required test list names exactly this case: "logout/login with a
+    // different context"). `setActiveTenantId(null)` already clears the
+    // whole React Query cache (see its own comment above) -- reused here
+    // rather than duplicated. Local state is cleared unconditionally, even
+    // if the backend call itself fails (a network error must not leave a
+    // stale "authenticated" UI showing another user's data).
+    try {
+      await logout();
+    } catch {
+      // Best-effort: the session cookie may already be expired/revoked
+      // server-side, or the network may be down. Either way, this browser
+      // tab must stop acting as this user regardless.
+    }
+    setActiveTenantId(null);
+    setAuth({ status: "unauthenticated" });
+  }
+
   const value = useMemo<SessionContextValue>(
     () => ({
       auth,
       activeTenantId,
       setActiveTenantId,
       refreshIdentity: () => setRefreshCounter((n) => n + 1),
+      signOut,
     }),
-    // `setActiveTenantId`/`refreshIdentity` close only over stable module
-    // references and state setters, so omitting them here does not risk a
-    // stale closure -- it only avoids giving every render a new context
-    // value.
+    // `setActiveTenantId`/`refreshIdentity`/`signOut` close only over stable
+    // module references and state setters, so omitting them here does not
+    // risk a stale closure -- it only avoids giving every render a new
+    // context value.
     [auth, activeTenantId],
   );
 

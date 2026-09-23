@@ -200,3 +200,70 @@ describe("SessionProvider: active context", () => {
     expect(window.sessionStorage.getItem("voiceagent.activeTenantId")).toBeNull();
   });
 });
+
+describe("SessionProvider: signOut (Phase 2.16 security audit finding)", () => {
+  it("clears the active context, the query cache, and identity -- never leaving a stale context for the next user on a shared browser", async () => {
+    fetchMock.mockReturnValueOnce(jsonResponse(200, { user_id: "user-1" })); // initial /auth/me
+    window.sessionStorage.setItem("voiceagent.activeTenantId", "tenant-a");
+
+    function Signer() {
+      const { signOut } = useSession();
+      return (
+        <button type="button" onClick={() => void signOut()}>
+          sign out
+        </button>
+      );
+    }
+
+    render(
+      <SessionProvider>
+        <Probe />
+        <Signer />
+      </SessionProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("tenant-id").textContent).toBe("tenant-a"));
+    fetchMock.mockReturnValueOnce(jsonResponse(204, undefined)); // POST /auth/logout
+
+    await act(async () => {
+      screen.getByText("sign out").click();
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(screen.getByTestId("auth-status").textContent).toBe("unauthenticated"));
+    expect(screen.getByTestId("tenant-id").textContent).toBe("none");
+    expect(window.sessionStorage.getItem("voiceagent.activeTenantId")).toBeNull();
+  });
+
+  it("still clears local context/identity even if the backend logout call fails", async () => {
+    fetchMock.mockReturnValueOnce(jsonResponse(200, { user_id: "user-1" }));
+    window.sessionStorage.setItem("voiceagent.activeTenantId", "tenant-a");
+
+    function Signer() {
+      const { signOut } = useSession();
+      return (
+        <button type="button" onClick={() => void signOut()}>
+          sign out
+        </button>
+      );
+    }
+
+    render(
+      <SessionProvider>
+        <Probe />
+        <Signer />
+      </SessionProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("tenant-id").textContent).toBe("tenant-a"));
+    fetchMock.mockRejectedValueOnce(new TypeError("Failed to fetch")); // POST /auth/logout fails
+
+    await act(async () => {
+      screen.getByText("sign out").click();
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(screen.getByTestId("auth-status").textContent).toBe("unauthenticated"));
+    expect(screen.getByTestId("tenant-id").textContent).toBe("none");
+  });
+});

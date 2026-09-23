@@ -42,3 +42,7 @@ class FakeHeartbeatStore:
 
     async def remove(self, instance_id: str) -> None:
         self._entries.pop(instance_id, None)
+
+    async def close(self) -> None:
+        """No real connection to release -- present only so this fake keeps
+        satisfying the `HeartbeatStore` protocol."""

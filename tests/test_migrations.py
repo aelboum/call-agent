@@ -300,3 +300,26 @@ def test_phase_2_12_does_not_create_a_vector_or_generic_analytics_table(offline_
     for statement in forbidden:
         assert statement not in offline_sql
     assert offline_sql.count("CREATE EXTENSION") == 0
+
+
+def test_phase_2_16_adds_the_call_sessions_tenant_status_index(offline_sql: str) -> None:
+    """Security/production-readiness audit finding: `call_sessions` had no
+    composite `(tenant_id, status)` index despite being queried that way by
+    reconciliation and stuck-call detection, once per tenant per scan."""
+    assert "ix_call_sessions_tenant_status" in offline_sql
+
+
+def test_phase_2_16_index_covers_tenant_id_and_status_in_that_order(offline_sql: str) -> None:
+    """`(tenant_id, status)`, not `(status, tenant_id)` -- `tenant_id` first
+    matches every existing composite index this product's migrations
+    already create (`0007`, `0009`, `0010`), so a query that filters by
+    `tenant_id` alone can still use this index's leading column."""
+    assert (
+        "CREATE INDEX ix_call_sessions_tenant_status ON app.call_sessions "
+        "(tenant_id, status)" in offline_sql
+    )
+
+
+def test_phase_2_16_does_not_weaken_call_sessions_row_level_security(offline_sql: str) -> None:
+    assert offline_sql.count('ALTER TABLE "app"."call_sessions" ENABLE ROW LEVEL SECURITY') == 1
+    assert offline_sql.count('ALTER TABLE "app"."call_sessions" FORCE ROW LEVEL SECURITY') == 1

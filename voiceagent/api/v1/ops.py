@@ -82,12 +82,21 @@ async def runtime_heartbeats_route(
     exception message in the response (brief section 19)."""
     store = RedisHeartbeatStore(get_jobs_config().redis_url)
     try:
-        heartbeats = await asyncio.wait_for(
-            store.read_all(), timeout=_HEARTBEAT_READ_TIMEOUT_SECONDS
-        )
-    except Exception:  # noqa: BLE001 -- an unreachable dependency is a
-        # reportable state, not a 500; see this route's own docstring.
-        return RuntimeHeartbeatsResponse(runtimes=[], redis_reachable=False)
+        try:
+            heartbeats = await asyncio.wait_for(
+                store.read_all(), timeout=_HEARTBEAT_READ_TIMEOUT_SECONDS
+            )
+        except Exception:  # noqa: BLE001 -- an unreachable dependency is a
+            # reportable state, not a 500; see this route's own docstring.
+            return RuntimeHeartbeatsResponse(runtimes=[], redis_reachable=False)
+    finally:
+        # Phase 2.16 security audit: this store is built fresh per request
+        # (never shared/pooled) -- without an explicit close, each request
+        # leaks a Redis connection, relying only on the client library's own
+        # `__del__`-based finalizer, which is not a reliable cleanup path
+        # (a documented anti-pattern in `redis-py`) and is a real
+        # connection-exhaustion risk under concurrent load to this route.
+        await store.close()
 
     now = datetime.now(UTC).timestamp()
     return RuntimeHeartbeatsResponse(
@@ -127,16 +136,21 @@ async def stuck_calls_route(
     settings = get_settings()
     store = RedisHeartbeatStore(get_jobs_config().redis_url)
     try:
-        heartbeats = await asyncio.wait_for(
-            store.read_all(), timeout=_HEARTBEAT_READ_TIMEOUT_SECONDS
-        )
-    except Exception:  # noqa: BLE001 -- see runtime_heartbeats_route().
-        # No live heartbeat data -- every runtime looks "gone" rather than
-        # falsely "alive", so this scan conservatively reports nothing
-        # stuck (a call whose runtime cannot be confirmed alive is
-        # reconciliation's concern, not this route's, once its own
-        # heartbeat genuinely expires).
-        heartbeats = {}
+        try:
+            heartbeats = await asyncio.wait_for(
+                store.read_all(), timeout=_HEARTBEAT_READ_TIMEOUT_SECONDS
+            )
+        except Exception:  # noqa: BLE001 -- see runtime_heartbeats_route().
+            # No live heartbeat data -- every runtime looks "gone" rather
+            # than falsely "alive", so this scan conservatively reports
+            # nothing stuck (a call whose runtime cannot be confirmed alive
+            # is reconciliation's concern, not this route's, once its own
+            # heartbeat genuinely expires).
+            heartbeats = {}
+    finally:
+        # See runtime_heartbeats_route()'s own comment -- same per-request
+        # connection-hygiene fix.
+        await store.close()
 
     stuck = await run_in_threadpool(
         detect_stuck_calls_for_tenant,

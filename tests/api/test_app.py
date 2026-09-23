@@ -10,12 +10,14 @@ there.
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import cast
 
 import pytest
+from core.config import Settings as PlatformSettings
 from fastapi.testclient import TestClient
 
 from voiceagent.api import build_app
-from voiceagent.config import ConfigurationError, settings_from_env
+from voiceagent.config import ConfigurationError, Settings, settings_from_env
 
 
 @pytest.fixture
@@ -115,6 +117,53 @@ def test_cors_is_added_only_for_explicit_origins(settings) -> None:
     cors = [m for m in app.user_middleware if "CORSMiddleware" in str(m.cls)]
     assert len(cors) == 1
     assert cors[0].kwargs["allow_origins"] == ["https://example.test"]
+
+
+def test_cors_allowed_methods_matches_every_verb_a_v1_route_actually_uses(settings) -> None:
+    """Phase 2.16 security audit finding: the previous list (`GET`, `POST`,
+    `PATCH`, `DELETE`) was missing `PUT` (`voiceagent.api.v1.call_sessions`'s
+    `PUT .../outcome` route) -- a cross-origin browser request to that route
+    would fail CORS preflight -- and included an unused `DELETE` (no `/v1`
+    route uses it). This test derives the expected set directly from the
+    mounted route table rather than hand-duplicating it, so it cannot drift
+    silently if a future route introduces a new verb."""
+    app = build_app(replace(settings, cors_allowed_origins=("https://example.test",)))
+    # `app.routes` represents an included router as an opaque object with no
+    # public `.methods` attribute in this FastAPI version (`_documented_paths()`
+    # above hits the identical limitation) -- the generated OpenAPI schema is
+    # the reliable source for "every verb a mounted route actually uses".
+    used_methods = {
+        method.upper()
+        for operations in app.openapi()["paths"].values()
+        for method in operations
+        if method.upper() != "HEAD"  # FastAPI adds HEAD to every GET automatically
+    }
+    cors = next(m for m in app.user_middleware if "CORSMiddleware" in str(m.cls))
+    assert set(cast("list[str]", cors.kwargs["allow_methods"])) == used_methods
+
+
+def test_security_headers_are_present_on_every_response(client) -> None:
+    """`X-Content-Type-Options: nosniff` is always safe for a JSON-only API
+    (this app serves no HTML) and costs nothing to apply unconditionally."""
+    response = client.get("/v1/meta")
+    assert response.headers["x-content-type-options"] == "nosniff"
+
+
+def test_hsts_is_absent_outside_production(client) -> None:
+    """Asserting HTTPS in development/test would break a deployment that
+    has no HTTPS to assert, rather than hardening it."""
+    response = client.get("/v1/meta")
+    assert "strict-transport-security" not in response.headers
+
+
+def test_hsts_is_present_in_production() -> None:
+    production_settings = Settings(
+        platform=PlatformSettings(environment="production", debug=False),
+        cors_allowed_origins=("https://app.test",),
+    )
+    client = TestClient(build_app(production_settings))
+    response = client.get("/v1/meta")
+    assert response.headers["strict-transport-security"] == "max-age=63072000; includeSubDomains"
 
 
 def test_wildcard_cors_is_rejected_in_production(monkeypatch) -> None:

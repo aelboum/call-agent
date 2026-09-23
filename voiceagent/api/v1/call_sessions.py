@@ -176,7 +176,12 @@ class CallOutcomeSetRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     outcome: str = Field(min_length=1, max_length=30)
-    notes: str | None = None
+    # Phase 2.16 security audit: `CallOutcome.notes` is a `Text` column (no
+    # DB-level bound) -- matches the same ceiling now applied to the
+    # `call.set_outcome` tool's identical field (`voiceagent.tools.handlers
+    # .SetOutcomeInput.notes`), so both entry points to this same column
+    # agree.
+    notes: str | None = Field(default=None, max_length=2000)
 
 
 @router.get("/{call_session_id}/outcome")
@@ -248,7 +253,10 @@ class FollowUpCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     type: str = Field(min_length=1, max_length=30)
-    description: str | None = None
+    # Phase 2.16 security audit: `FollowUpAction.description` is a `Text`
+    # column (no DB-level bound) -- matches the same ceiling now applied to
+    # the `call.create_follow_up` tool's identical field.
+    description: str | None = Field(default=None, max_length=2000)
     due_at: AwareDatetime | None = None
     calendar_id: uuid.UUID | None = None
     start_at: AwareDatetime | None = None

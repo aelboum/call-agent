@@ -85,3 +85,41 @@ def test_redis_store_construction_opens_no_connection() -> None:
     unreachable URL must not raise or block."""
     store = RedisHeartbeatStore("redis://127.0.0.1:1/0")
     assert isinstance(store, HeartbeatStore)
+
+
+def test_close_on_a_never_used_store_is_a_safe_no_op() -> None:
+    """Phase 2.16 security audit: `close()` must not require a connection to
+    have ever been opened -- a route that fails before its first Redis call
+    (e.g. the read itself times out) must still be able to close cleanly."""
+    store = RedisHeartbeatStore("redis://127.0.0.1:1/0")
+    asyncio.run(store.close())  # must not raise
+
+
+def test_close_releases_and_resets_the_underlying_client() -> None:
+    """Phase 2.16 security audit: `voiceagent.api.v1.ops` builds one of
+    these per request and must not leak a connection -- `close()` is the
+    fix; this proves it actually calls the client's own `aclose()` and
+    clears `_client`, rather than being a no-op that merely looks safe."""
+
+    class _FakeRedisClient:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    store = RedisHeartbeatStore("redis://127.0.0.1:1/0")
+    fake_client = _FakeRedisClient()
+    store._client = fake_client  # type: ignore[assignment]  -- simulating "already connected"
+
+    asyncio.run(store.close())
+
+    assert fake_client.closed is True
+    assert store._client is None
+
+    # Idempotent: closing again (no client left) must not raise.
+    asyncio.run(store.close())
+
+
+def test_fake_heartbeat_store_close_is_a_harmless_no_op() -> None:
+    asyncio.run(FakeHeartbeatStore().close())  # must not raise

@@ -211,6 +211,23 @@ def test_lookup_contact_by_phone_rejects_unexpected_extra_fields() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "phone",
+    [
+        "not-a-number",
+        "15551234567",  # missing leading +
+        "+0123456789",  # leading zero after +
+        "+1; DROP TABLE contacts;",  # injection-shaped
+        "",
+    ],
+)
+def test_lookup_contact_by_phone_input_rejects_a_malformed_phone_number(phone: str) -> None:
+    """Phase 2.16 security audit: previously unvalidated -- now the same
+    E.164 pattern `TransferInput.destination_e164` already enforces."""
+    with pytest.raises(ValidationError):
+        LookupContactByPhoneInput(phone_e164=phone)
+
+
 # -- Phase 2.6: calendar.check_availability ----------------------------------
 
 
@@ -339,6 +356,18 @@ def test_create_appointment_rejects_unexpected_extra_fields() -> None:
         )
 
 
+def test_create_appointment_input_rejects_an_oversized_title() -> None:
+    """Phase 2.16 security audit: previously unbounded -- now matches
+    `CalendarEvent.title`'s own DB column (`String(200)`)."""
+    with pytest.raises(ValidationError):
+        CreateAppointmentInput(
+            calendar_id=uuid.uuid4(),
+            title="x" * 201,
+            start_at=datetime(2026, 10, 1, 10, tzinfo=UTC),
+            end_at=datetime(2026, 10, 1, 11, tzinfo=UTC),
+        )
+
+
 # -- Phase 2.6: calendar.cancel_appointment ----------------------------------
 
 
@@ -422,6 +451,13 @@ def test_set_outcome_input_rejects_an_invalid_outcome_value() -> None:
         SetOutcomeInput.model_validate({"outcome": "not-a-real-outcome"})
 
 
+def test_set_outcome_input_rejects_oversized_notes() -> None:
+    """Phase 2.16 security audit: `CallOutcome.notes` is an unbounded `Text`
+    column -- this application-level ceiling is the only bound it has."""
+    with pytest.raises(ValidationError):
+        SetOutcomeInput(outcome="resolved", notes="x" * 2001)
+
+
 def test_set_outcome_normalizes_call_not_found(db, monkeypatch) -> None:
     def _raise(*a, **kw):
         raise CallSessionNotFoundError(uuid.uuid4())
@@ -485,6 +521,14 @@ def test_create_follow_up_input_rejects_unexpected_extra_fields() -> None:
         CreateFollowUpInput.model_validate(
             {"type": "manual_follow_up", "call_id": str(uuid.uuid4())}
         )
+
+
+def test_create_follow_up_input_rejects_oversized_description() -> None:
+    """Phase 2.16 security audit: `FollowUpAction.description` is an
+    unbounded `Text` column -- this application-level ceiling is the only
+    bound it has."""
+    with pytest.raises(ValidationError):
+        CreateFollowUpInput(type="manual_follow_up", description="x" * 2001)
 
 
 def test_create_follow_up_input_rejects_an_invalid_type() -> None:

@@ -15,6 +15,7 @@ export function makeSessionValue(overrides: Partial<SessionContextValue> = {}): 
     activeTenantId: "22222222-2222-2222-2222-222222222222",
     setActiveTenantId: vi.fn(),
     refreshIdentity: vi.fn(),
+    signOut: vi.fn().mockResolvedValue(undefined),
     ...overrides,
   };
 }

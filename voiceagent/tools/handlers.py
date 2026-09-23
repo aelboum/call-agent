@@ -333,7 +333,16 @@ class ContactRef(StrictToolModel):
 
 
 class LookupContactByPhoneInput(StrictToolModel):
-    phone_e164: str
+    # Phase 2.16 security audit: previously unbounded/unvalidated -- the
+    # same E.164 pattern `TransferInput.destination_e164` already enforces
+    # (§182), reused here rather than a second, differently-spelled check.
+    # Bounded input, not just a "nicer" one: an unvalidated, arbitrarily
+    # long string here is still only ever used in an equality-filtered
+    # `WHERE phone_e164 = ...` query (`voiceagent.contacts.service
+    # .lookup_contact_by_phone()`), never a raw command string, but a real
+    # phone number is never anything this pattern would reject, so there is
+    # no legitimate call this narrows out.
+    phone_e164: str = Field(pattern=_E164_PATTERN)
 
 
 class LookupContactByPhoneOutput(StrictToolModel):
@@ -413,7 +422,13 @@ class AppointmentRef(StrictToolModel):
 
 class CreateAppointmentInput(StrictToolModel):
     calendar_id: uuid.UUID
-    title: str
+    # Phase 2.16 security audit: bounded to match `CalendarEvent.title`'s
+    # own DB column (`voiceagent.calendars.models`, `String(200)`) -- an
+    # unbounded string here previously reached that column only to fail
+    # with a raw, uncaught database error instead of a clean, validated
+    # `ToolExecutionError` (brief §8: "unbounded request bodies";
+    # §11: "maximum argument sizes").
+    title: str = Field(min_length=1, max_length=200)
     start_at: AwareDatetime
     end_at: AwareDatetime
     contact_id: uuid.UUID | None = None
@@ -559,7 +574,10 @@ class SetOutcomeInput(StrictToolModel):
         "wrong_number",
         "not_interested",
     ]
-    notes: str | None = None
+    # Phase 2.16 security audit: `CallOutcome.notes` is a `Text` column (no
+    # DB-level bound at all) -- an application-level ceiling on a field
+    # meant to hold a short human note, not an unbounded document.
+    notes: str | None = Field(default=None, max_length=2000)
 
 
 class SetOutcomeOutput(StrictToolModel):
@@ -590,7 +608,10 @@ async def _set_outcome(ctx: ToolExecutionContext, tool_input: StrictToolModel) -
 
 class CreateFollowUpInput(StrictToolModel):
     type: Literal["appointment", "contact", "manual_follow_up"]
-    description: str | None = None
+    # Phase 2.16 security audit: `FollowUpAction.description` is a `Text`
+    # column (no DB-level bound) -- same reasoning as `SetOutcomeInput
+    # .notes` above.
+    description: str | None = Field(default=None, max_length=2000)
     due_at: AwareDatetime | None = None
     calendar_id: uuid.UUID | None = None
     start_at: AwareDatetime | None = None

@@ -105,4 +105,12 @@ class CallSession(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         Index("ix_call_sessions_status", "status"),
         Index("ix_call_sessions_runtime_instance_id", "runtime_instance_id"),
         Index("ix_call_sessions_fs_channel_uuid", "fs_channel_uuid"),
+        # Phase 2.16 security/production-readiness audit (migration 0011):
+        # the composite shape `list_non_terminal_call_sessions()`/
+        # `list_call_sessions(status=...)` actually filter by -- both
+        # single-column indexes above already existed separately, but
+        # neither covers this product's own highest-pressure recurring
+        # query pattern (reconciliation + stuck-call detection, once per
+        # tenant per scan) as efficiently as one composite index.
+        Index("ix_call_sessions_tenant_status", "tenant_id", "status"),
     )

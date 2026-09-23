@@ -30,8 +30,10 @@ Construction invariants asserted by `tests/api/`:
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
+
 from api.platform import build_platform_app
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from voiceagent import __version__
@@ -62,9 +64,42 @@ def build_app(settings: Settings | None = None) -> FastAPI:
             CORSMiddleware,
             allow_origins=list(resolved.cors_allowed_origins),
             allow_credentials=True,
-            allow_methods=["GET", "POST", "PATCH", "DELETE"],
+            # Phase 2.16 security audit: matches the verbs `voiceagent/api
+            # /v1/*.py` actually declares -- confirmed by grepping every
+            # `@router.<verb>` in that package (26 GET, 20 POST, 3 PATCH, 1
+            # PUT, 0 DELETE). The previous list included an unused `DELETE`
+            # and was missing `PUT` (`voiceagent.api.v1.call_sessions`'s
+            # `PUT .../outcome` route) -- a cross-origin browser request to
+            # that one route would have failed CORS preflight even though
+            # the route itself works. Keep this list in sync if a future
+            # route introduces a verb not yet used anywhere.
+            allow_methods=["GET", "POST", "PATCH", "PUT"],
             allow_headers=["Authorization", "Content-Type", "Idempotency-Key"],
         )
+
+    # Phase 2.16 security audit (brief §23/§25): a JSON API response should
+    # never be interpreted by a browser as anything other than what its
+    # `Content-Type` declares -- `X-Content-Type-Options: nosniff` is a
+    # zero-risk, always-safe header for a pure JSON API (this app serves no
+    # HTML/static assets at all -- confirmed no `StaticFiles` mount anywhere
+    # in this module or `api.platform`, so it cannot break a page render
+    # that does not exist). `Strict-Transport-Security` is added only in
+    # production, matching every other environment-conditional security
+    # control this product already has (`Settings._validate_production()`):
+    # asserting HSTS in development would force HTTPS a local/dev deployment
+    # may not have, breaking it outright rather than hardening it.
+    # `Content-Security-Policy`/`X-Frame-Options` are deliberately not added
+    # here -- see `docs/PHASE-2.16-SECURITY-READINESS.md` §25 for why they
+    # are a *frontend deployment* concern, not this JSON-only backend's.
+    @app.middleware("http")
+    async def _security_headers(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        if resolved.environment == "production":
+            response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
+        return response
 
     app.include_router(v1_router, prefix=resolved.api_prefix)
     return app

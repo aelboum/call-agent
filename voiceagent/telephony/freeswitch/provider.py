@@ -33,6 +33,7 @@ second error type to handle a slow command differently from a failed one.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from collections.abc import AsyncIterator
 
@@ -77,6 +78,36 @@ _HANGUP_CAUSE_MAP: dict[str, HangupCause] = {
     "NETWORK_OUT_OF_ORDER": HangupCause.NETWORK_FAILURE,
     "RECOVERY_ON_TIMER_EXPIRE": HangupCause.TIMEOUT,
 }
+
+
+#: Phase 2.16 security audit: `originate()`/`send_dtmf()` build ESL command
+#: strings by raw f-string interpolation, with no upstream validation of
+#: `OriginateRequest.to_number`/`from_number` or `send_dtmf()`'s `digits` at
+#: the contract level (`voiceagent.telephony.contracts.OriginateRequest` is a
+#: plain, unvalidated dataclass). Today, `originate()`/`send_dtmf()` have no
+#: reachable caller anywhere in this product (`transfer()`'s own
+#: `destination` is the only phone-number-shaped value the Tool Gateway ever
+#: lets a model influence, and it is already validated pre-handler by
+#: `voiceagent.tools.handlers.TransferInput`) -- but this module must not
+#: rely on that staying true. These two patterns are the same defense
+#: `TransferInput` already applies, enforced a second time, here, at the one
+#: place these values actually reach an ESL command string -- so a future
+#: caller of either method is protected regardless of whether it remembers
+#: to validate first.
+_E164_PATTERN = re.compile(r"^\+[1-9]\d{1,14}$")
+#: FreeSWITCH's own accepted DTMF alphabet: digits, `*`, `#`, and `w`/`W` for
+#: an inter-digit pause -- never a character that could appear in ESL syntax.
+_DTMF_PATTERN = re.compile(r"^[0-9*#wW]{1,32}$")
+
+
+def _require_e164(value: str, *, field: str) -> None:
+    if not _E164_PATTERN.match(value):
+        raise TransportError(f"{field} is not a valid E.164 phone number")
+
+
+def _require_dtmf_digits(value: str) -> None:
+    if not _DTMF_PATTERN.match(value):
+        raise TransportError("digits is not a valid DTMF digit string")
 
 
 def _normalize_hangup_cause(raw: str | None) -> HangupCause:
@@ -148,6 +179,8 @@ class FreeSwitchTelephonyProvider:
         return response
 
     async def originate(self, request: OriginateRequest) -> CallRef:
+        _require_e164(request.from_number, field="from_number")
+        _require_e164(request.to_number, field="to_number")
         response = await self._command(
             f"bgapi originate "
             f"{{origination_caller_id_number={request.from_number}}}"
@@ -180,6 +213,7 @@ class FreeSwitchTelephonyProvider:
         await self._command(f"uuid_hold off {call_ref}", operation="unhold")
 
     async def send_dtmf(self, call_ref: CallRef, digits: str) -> None:
+        _require_dtmf_digits(digits)
         await self._command(f"uuid_send_dtmf {call_ref} {digits}", operation="send_dtmf")
 
     async def start_recording(self, call_ref: CallRef) -> None:

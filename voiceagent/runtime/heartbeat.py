@@ -79,6 +79,13 @@ class HeartbeatStore(Protocol):
         """Explicit deregistration (graceful shutdown). Idempotent."""
         ...
 
+    async def close(self) -> None:
+        """Release any underlying connection. Idempotent, and safe to call
+        even if nothing was ever opened (Phase 2.16 security audit: a store
+        constructed and used for exactly one request -- `voiceagent.api.v1
+        .ops`'s own two routes -- must not leak a connection per request)."""
+        ...
+
 
 _KEY_PREFIX = "voiceagent:runtime:"
 
@@ -133,6 +140,15 @@ class RedisHeartbeatStore:
     async def remove(self, instance_id: str) -> None:
         client = self._get_client()
         await client.delete(self._key(instance_id))
+
+    async def close(self) -> None:
+        """Idempotent: a `_client` that was never built (nothing was ever
+        called on this store) means nothing to close, and calling this
+        twice is safe -- `redis.asyncio.Redis.aclose()` itself tolerates
+        being called on an already-closed client."""
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
 
 
 def new_instance_id() -> str:

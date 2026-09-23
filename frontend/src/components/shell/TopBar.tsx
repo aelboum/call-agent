@@ -1,17 +1,19 @@
-/** Header bar: display name, active-context selector, and user controls
- * (Phase 2.15 brief §6: "account/user controls where appropriate"). */
+/**
+ * Header bar: display name, active-context selector, and user controls
+ * (Phase 2.15 brief §6: "account/user controls where appropriate").
+ *
+ * Sign-out goes through `useSession().signOut()` -- never a bare call to
+ * `authApi.logout()` here -- specifically so a shared/kiosk browser never
+ * retains the previous user's active tenant id or cached query results
+ * after they sign out (Phase 2.16 security audit finding: see
+ * `SessionContext.tsx`'s own `signOut()` docstring).
+ */
 import { config } from "../../config";
 import { useSession } from "../../context/SessionContext";
-import { logout } from "../../lib/authApi";
 import { ContextSelector } from "./ContextSelector";
 
 export function TopBar({ displayName }: { displayName: string | null }) {
-  const { auth, refreshIdentity } = useSession();
-
-  async function handleSignOut(): Promise<void> {
-    await logout();
-    refreshIdentity();
-  }
+  const { auth, signOut } = useSession();
 
   return (
     <header className="app-topbar">
@@ -23,7 +25,7 @@ export function TopBar({ displayName }: { displayName: string | null }) {
             <span className="app-topbar-user-id" title={auth.user.user_id}>
               {auth.user.user_id.slice(0, 8)}…
             </span>
-            <button type="button" onClick={() => void handleSignOut()}>
+            <button type="button" onClick={() => void signOut()}>
               Sign out
             </button>
           </>
