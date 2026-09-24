@@ -165,6 +165,68 @@ def test_invalid_runtime_integer_is_rejected(monkeypatch) -> None:
         settings_from_env(_platform())
 
 
+def test_deployment_stage_defaults_to_development(settings: Settings) -> None:
+    """Unconfigured (test environment): no staging/production posture is
+    silently assumed."""
+    assert settings.deployment_stage == "development"
+
+
+def test_deployment_stage_defaults_from_production_environment(monkeypatch) -> None:
+    """Phase 2.18's own Compose stack sets `ENVIRONMENT=production` and knows
+    nothing of `VOICEAGENT_DEPLOYMENT_STAGE` -- it must keep getting the
+    hardened validation path, not silently fall back to 'development'."""
+    monkeypatch.delenv("VOICEAGENT_DEPLOYMENT_STAGE", raising=False)
+    resolved = settings_from_env(_platform(environment="production"))
+    assert resolved.deployment_stage == "production"
+
+
+def test_deployment_stage_reads_explicit_env_override(monkeypatch) -> None:
+    monkeypatch.setenv("VOICEAGENT_DEPLOYMENT_STAGE", "staging")
+    resolved = settings_from_env(_platform(environment="production"))
+    assert resolved.deployment_stage == "staging"
+
+
+def test_invalid_deployment_stage_is_rejected() -> None:
+    with pytest.raises(ConfigurationError):
+        Settings(platform=_platform(environment="production"), deployment_stage="prod")
+
+
+def test_staging_deployment_stage_requires_production_environment() -> None:
+    """SaaS-OS's `ENVIRONMENT` has no 'staging' value (ADR-0001: SaaS-OS is
+    never modified) -- staging must run underneath `ENVIRONMENT=production`."""
+    with pytest.raises(ConfigurationError):
+        Settings(platform=_platform(environment="test"), deployment_stage="staging")
+
+
+def test_staging_deployment_stage_is_accepted_under_production_environment() -> None:
+    config = Settings(platform=_platform(environment="production"), deployment_stage="staging")
+    assert config.deployment_stage == "staging"
+
+
+def test_freeswitch_command_timeout_parses_from_env(monkeypatch) -> None:
+    monkeypatch.setenv("VOICEAGENT_FREESWITCH_COMMAND_TIMEOUT_SECONDS", "2.5")
+    assert settings_from_env(_platform()).freeswitch.command_timeout_seconds == 2.5
+
+
+def test_freeswitch_command_timeout_has_a_conservative_default(settings: Settings) -> None:
+    assert settings.freeswitch.command_timeout_seconds == 10.0
+
+
+def test_invalid_freeswitch_command_timeout_is_rejected(monkeypatch) -> None:
+    monkeypatch.setenv("VOICEAGENT_FREESWITCH_COMMAND_TIMEOUT_SECONDS", "not-a-number")
+    with pytest.raises(ConfigurationError):
+        settings_from_env(_platform())
+
+
+def test_call_intelligence_endpoint_defaults_to_none(settings: Settings) -> None:
+    assert settings.call_intelligence.endpoint is None
+
+
+def test_call_intelligence_endpoint_parses_from_env(monkeypatch) -> None:
+    monkeypatch.setenv("VOICEAGENT_CALL_INTELLIGENCE_ENDPOINT", "https://proxy.internal/v1")
+    assert settings_from_env(_platform()).call_intelligence.endpoint == "https://proxy.internal/v1"
+
+
 def test_ai_provider_policy_lists_parse_from_env(monkeypatch) -> None:
     monkeypatch.setenv("VOICEAGENT_AI_ELIGIBLE_PROVIDERS", "fake, deepgram-shaped")
     monkeypatch.setenv("VOICEAGENT_AI_ALLOWED_DATA_CLASSIFICATIONS", "tenant_data, pii")

@@ -30,7 +30,8 @@ Construction invariants asserted by `tests/api/`:
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 
 from api.platform import build_platform_app
 from fastapi import FastAPI, Request, Response
@@ -38,7 +39,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from voiceagent import __version__
 from voiceagent.api.v1 import router as v1_router
-from voiceagent.config import Settings, get_settings
+from voiceagent.config import Settings, get_settings, validate_deployment_readiness
 
 __all__ = ["build_app"]
 
@@ -54,6 +55,27 @@ def build_app(settings: Settings | None = None) -> FastAPI:
 
     app = build_platform_app(title=resolved.app_display_name, version=__version__)
     app.state.settings = resolved
+
+    # Phase 2.19: wrapping the platform's own lifespan is not I/O -- entering
+    # it is, and that happens only when the app's lifespan actually starts (a
+    # real server run, never `build_app()` itself, never import). This is
+    # where a staging/production deployment first fails fast on a missing
+    # OIDC/vendor secret, rather than discovering it lazily at the first
+    # request or call (`voiceagent.config.validation`'s own module docstring
+    # explains why this check cannot live in `Settings` itself). Starlette
+    # dropped `add_event_handler`/`on_event` in favor of exactly one lifespan
+    # per app (`api.platform.build_platform_app()` already owns the real
+    # one -- structured logging, tracing, the RLS guard, `/healthz`/`/readyz`
+    # wiring), so this composes with it rather than replacing it.
+    platform_lifespan = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def _lifespan_with_readiness_check(app: FastAPI) -> AsyncIterator[None]:
+        validate_deployment_readiness(resolved)
+        async with platform_lifespan(app):
+            yield
+
+    app.router.lifespan_context = _lifespan_with_readiness_check
 
     # CORS is off unless origins are configured explicitly. There is no
     # wildcard path: `Settings` rejects "*" in production, and an empty

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from voiceagent.config.settings import (
+    DEPLOYMENT_STAGES,
     AiProviderSettings,
     ConfigurationError,
     FreeSwitchSettings,
@@ -12,8 +13,10 @@ from voiceagent.config.settings import (
     get_settings,
     settings_from_env,
 )
+from voiceagent.config.validation import validate_deployment_readiness
 
 __all__ = [
+    "DEPLOYMENT_STAGES",
     "AiProviderSettings",
     "ConfigurationError",
     "FreeSwitchSettings",
@@ -22,4 +25,5 @@ __all__ = [
     "Settings",
     "get_settings",
     "settings_from_env",
+    "validate_deployment_readiness",
 ]

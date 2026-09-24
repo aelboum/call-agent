@@ -37,6 +37,7 @@ __all__ = [
     "AiProviderSettings",
     "CallIntelligenceSettings",
     "ConfigurationError",
+    "DEPLOYMENT_STAGES",
     "FreeSwitchSettings",
     "ObjectStorageSettings",
     "RuntimeSettings",
@@ -89,6 +90,14 @@ class FreeSwitchSettings:
     esl_host: str | None = None
     esl_port: int = 8021
     media_public_url: str | None = None
+    #: Bound on every ESL command (`FreeSwitchTelephonyProvider._command()`),
+    #: mirroring that class's own constructor default (Phase 2.19). No ESL
+    #: password field exists here, deliberately: there is still no real TCP
+    #: transport to `mod_event_socket` in this repository (`esl.py`'s own
+    #: module docstring), and an ESL credential is a secret in any case --
+    #: read through `infra.secrets` by a future real transport, never by
+    #: this module.
+    command_timeout_seconds: float = 10.0
 
     @property
     def is_configured(self) -> bool:
@@ -237,11 +246,31 @@ class CallIntelligenceSettings:
 
     provider: str = "fake"
     model: str = "fake-model"
+    #: Vendor API endpoint override (Phase 2.19). `None` means "the
+    #: provider's own documented default" (e.g.
+    #: `GroqCallIntelligenceConfig.endpoint`'s `https://api.groq.com/openai/v1`)
+    #: -- staging only needs this when pointing at something other than a
+    #: vendor's public endpoint (a proxy, a regional endpoint).
+    endpoint: str | None = None
     timeout_seconds: float = 30.0
     system_actor_user_id: uuid.UUID | None = None
     poll_interval_seconds: float = 30.0
     max_claims_per_tenant_per_tick: int = 5
     max_concurrent_tenants: int = 4
+
+
+#: Every `deployment_stage` value this product understands. `core.config
+#: .Settings.environment` (SaaS-OS) is hard-locked to exactly
+#: `{"development", "test", "production"}` -- there is no `"staging"`
+#: `ENVIRONMENT` value anywhere in the platform, and it cannot be added
+#: (ADR-0001). `deployment_stage` is therefore a second, voiceagent-owned,
+#: additive axis: a staging deployment runs with `ENVIRONMENT=production`
+#: underneath (the correct posture -- it gets the platform's strict
+#: `EnvironmentSecretsProvider` and every other production hardening for
+#: free) and layers `VOICEAGENT_DEPLOYMENT_STAGE=staging` on top so this
+#: product's own validation (`voiceagent.config.validation`) can tell "real
+#: production" and "staging" apart without weakening either.
+DEPLOYMENT_STAGES: tuple[str, ...] = ("development", "staging", "production")
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,6 +281,11 @@ class Settings:
     """
 
     platform: PlatformSettings
+    #: See `DEPLOYMENT_STAGES`. Defaults to `"development"` when constructed
+    #: directly (e.g. by a test); `settings_from_env()` derives a
+    #: production-safe default from `platform.environment` when the operator
+    #: has not set `VOICEAGENT_DEPLOYMENT_STAGE` explicitly.
+    deployment_stage: str = "development"
     app_display_name: str = "AI Call Agent"
     cors_allowed_origins: tuple[str, ...] = ()
     telemetry_service_name: str = "voiceagent"
@@ -274,6 +308,17 @@ class Settings:
         return self.platform.api_v1_prefix
 
     def __post_init__(self) -> None:
+        if self.deployment_stage not in DEPLOYMENT_STAGES:
+            raise ConfigurationError(
+                f"VOICEAGENT_DEPLOYMENT_STAGE must be one of {DEPLOYMENT_STAGES}, "
+                f"got: {self.deployment_stage!r}"
+            )
+        if self.deployment_stage in ("staging", "production") and self.environment != "production":
+            raise ConfigurationError(
+                f"VOICEAGENT_DEPLOYMENT_STAGE={self.deployment_stage!r} requires "
+                "ENVIRONMENT=production (SaaS-OS has no separate 'staging' ENVIRONMENT "
+                f"value); got ENVIRONMENT={self.environment!r}"
+            )
         if not self.app_display_name.strip():
             raise ConfigurationError("VOICEAGENT_APP_DISPLAY_NAME must not be empty")
         if "*" in self.cors_allowed_origins and self.environment == "production":
@@ -286,7 +331,18 @@ class Settings:
     def _validate_production(self) -> None:
         """Fail closed on configuration that is merely inconvenient in
         development but unsafe in production. Called from `__post_init__`, so
-        a misconfigured production process cannot start."""
+        a misconfigured production process cannot start.
+
+        This is *structural* validation only -- it reads nothing but this
+        object's own already-parsed, non-secret fields (module docstring
+        rule 2: `Settings` never reads a secret). Operational readiness
+        checks that need to confirm a secret's *presence* (an OIDC client
+        id, a vendor API key) without ever reading its value live in
+        `voiceagent.config.validation.validate_deployment_readiness`
+        instead, called explicitly by each process entrypoint -- not from
+        here, so that constructing a `Settings` value (as every test in
+        this package does) never touches `infra.secrets`.
+        """
         if self.platform.debug:
             raise ConfigurationError("DEBUG must be false when ENVIRONMENT=production")
         for origin in self.cors_allowed_origins:
@@ -342,15 +398,35 @@ def _parse_uuid(name: str, raw: str | None) -> uuid.UUID | None:
         raise ConfigurationError(f"{name} must be a UUID, got: {raw!r}") from exc
 
 
+def _resolve_deployment_stage(platform: PlatformSettings) -> str:
+    """`VOICEAGENT_DEPLOYMENT_STAGE`, explicit or derived.
+
+    Unset is the common case for every deployment that predates Phase 2.19
+    (including the Phase 2.18 Docker Compose stack, which sets
+    `ENVIRONMENT=production` and knows nothing of this variable) -- it must
+    keep working unchanged, so an unset value derives `"production"` from
+    `ENVIRONMENT=production` rather than defaulting to `"development"` and
+    silently skipping every staging/production-only check in
+    `voiceagent.config.validation`.
+    """
+    raw = os.environ.get("VOICEAGENT_DEPLOYMENT_STAGE")
+    if raw is not None:
+        return raw
+    return "production" if platform.environment == "production" else "development"
+
+
 def settings_from_env(platform: PlatformSettings | None = None) -> Settings:
     """Build `Settings` from the environment. Pure apart from `os.environ`:
     no database, no network, no secret store. Tests call it directly with
     `monkeypatch.setenv(...)` instead of clearing a cache."""
     esl_port_raw = os.environ.get("VOICEAGENT_FREESWITCH_ESL_PORT")
     defaults = RuntimeSettings()
+    freeswitch_defaults = FreeSwitchSettings()
+    resolved_platform = platform if platform is not None else get_platform_settings()
 
     return Settings(
-        platform=platform if platform is not None else get_platform_settings(),
+        platform=resolved_platform,
+        deployment_stage=_resolve_deployment_stage(resolved_platform),
         app_display_name=os.environ.get("VOICEAGENT_APP_DISPLAY_NAME", "AI Call Agent"),
         cors_allowed_origins=_parse_origins(os.environ.get("VOICEAGENT_CORS_ALLOWED_ORIGINS")),
         telemetry_service_name=os.environ.get("VOICEAGENT_TELEMETRY_SERVICE_NAME", "voiceagent"),
@@ -369,6 +445,12 @@ def settings_from_env(platform: PlatformSettings | None = None) -> Settings:
                 else 8021
             ),
             media_public_url=os.environ.get("VOICEAGENT_FREESWITCH_MEDIA_PUBLIC_URL"),
+            command_timeout_seconds=(
+                _parse_float("VOICEAGENT_FREESWITCH_COMMAND_TIMEOUT_SECONDS", raw)
+                if (raw := os.environ.get("VOICEAGENT_FREESWITCH_COMMAND_TIMEOUT_SECONDS"))
+                is not None
+                else freeswitch_defaults.command_timeout_seconds
+            ),
         ),
         ai_providers=AiProviderSettings(
             default_engine=os.environ.get("VOICEAGENT_DEFAULT_ENGINE", "fake"),
@@ -483,6 +565,7 @@ def _call_intelligence_settings_from_env() -> CallIntelligenceSettings:
     return CallIntelligenceSettings(
         provider=os.environ.get("VOICEAGENT_CALL_INTELLIGENCE_PROVIDER", defaults.provider),
         model=os.environ.get("VOICEAGENT_CALL_INTELLIGENCE_MODEL", defaults.model),
+        endpoint=os.environ.get("VOICEAGENT_CALL_INTELLIGENCE_ENDPOINT", defaults.endpoint),
         timeout_seconds=(
             _parse_float("VOICEAGENT_CALL_INTELLIGENCE_TIMEOUT_SECONDS", raw)
             if (raw := os.environ.get("VOICEAGENT_CALL_INTELLIGENCE_TIMEOUT_SECONDS")) is not None

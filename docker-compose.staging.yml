@@ -1,0 +1,212 @@
+# Staging deployment (Phase 2.19). A standalone file, not a merge override
+# of docker-compose.yml (Phase 2.18's own local/dev stack) -- staging's
+# PostgreSQL, Redis and OIDC provider are real, externally-provisioned
+# infrastructure (see docs/PHASE-2.19-STAGING-INTEGRATION.md, "Deployment
+# sequence", step 1), never the throwaway `postgres:16-alpine`/
+# `redis:7-alpine` containers docker-compose.yml brings up for itself. This
+# file reuses the identical production Dockerfile and per-process commands;
+# it only changes what points outward.
+#
+# No cloud provisioning, no Kubernetes, no Terraform (Phase 2.19 brief
+# section 11/17) -- this is Compose, exactly like Phase 2.18, aimed at
+# infrastructure the operator already has.
+#
+# Every value below is either a literal staging-appropriate default or an
+# `${...}` reference read from the operator's own environment/`.env` file.
+# NONE of these are real secrets and none may become one:
+#
+#   cp .env.staging.example .env.staging   # fill in real values; NEVER commit it
+#   docker compose -f docker-compose.staging.yml --env-file .env.staging \
+#     build
+#   docker compose -f docker-compose.staging.yml --env-file .env.staging \
+#     up migrate                                   # wait for it to exit 0
+#   docker compose -f docker-compose.staging.yml --env-file .env.staging \
+#     up -d api call-runtime
+#   docker compose -f docker-compose.staging.yml --env-file .env.staging \
+#     --profile workers up -d follow-up-worker call-intelligence-worker
+#   docker compose -f docker-compose.staging.yml --env-file .env.staging \
+#     up -d frontend
+#
+# See docs/PHASE-2.19-STAGING-INTEGRATION.md for the full sequence,
+# including every manual, external step this file cannot automate (OIDC app
+# registration with the identity provider, tenant/RBAC bootstrap,
+# provisioning PostgreSQL/Redis themselves).
+#
+# `VOICEAGENT_DEPLOYMENT_STAGE=staging` on every product process
+# (`voiceagent.config.settings.Settings.deployment_stage`) is what makes
+# `voiceagent.config.validation.validate_deployment_readiness` actually run
+# at startup -- it is what turns "forgot to set GROQ_API_KEY" or "forgot to
+# register the OIDC redirect URI" into a startup failure with a clear
+# message instead of a lazily-discovered one. `ENVIRONMENT=production`
+# underneath is required, not a typo: SaaS-OS's own `ENVIRONMENT` has no
+# `"staging"` value (ADR-0001 forbids modifying SaaS-OS to add one), so
+# staging gets the platform's real production posture (its strict
+# `EnvironmentSecretsProvider`, `DB_REQUIRE_TLS`/`REDIS_REQUIRE_TLS`
+# defaults, cookie security) and voiceagent's own stage flag layered on top.
+
+services:
+  migrate:
+    build: .
+    environment:
+      ENVIRONMENT: production
+      VOICEAGENT_DEPLOYMENT_STAGE: staging
+      DB_REQUIRE_TLS: "true"
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env.staging}
+      MIGRATIONS_DATABASE_URL: ${MIGRATIONS_DATABASE_URL:?set MIGRATIONS_DATABASE_URL in .env.staging}
+      APP_DB_USER: ${APP_DB_USER:?set APP_DB_USER in .env.staging}
+    command: sh -c "saas-os-migrate upgrade && alembic upgrade head"
+
+  api:
+    build: .
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      ENVIRONMENT: production
+      VOICEAGENT_DEPLOYMENT_STAGE: staging
+      DEBUG: "false"
+      LOG_LEVEL: INFO
+      HOST: 0.0.0.0
+      PORT: "8000"
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env.staging}
+      APP_DB_USER: ${APP_DB_USER:?set APP_DB_USER in .env.staging}
+      DB_REQUIRE_TLS: "true"
+      REDIS_URL: ${REDIS_URL:?set REDIS_URL in .env.staging}
+      REDIS_REQUIRE_TLS: "true"
+      VOICEAGENT_CORS_ALLOWED_ORIGINS: ${VOICEAGENT_CORS_ALLOWED_ORIGINS}
+      # OIDC (docs/PHASE-2.19-STAGING-INTEGRATION.md "OIDC"): OIDC_REDIRECT_URI
+      # and the cookie settings are plain, non-secret configuration
+      # (`api/auth/config.py:AuthHttpConfig`); ZITADEL_* are read through
+      # `infra.secrets` by SaaS-OS itself (`core/identity/provider.py`) --
+      # they are provided here the same way every other secret is, as a
+      # real environment variable at runtime, never committed.
+      OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:?set OIDC_REDIRECT_URI in .env.staging}
+      AUTH_COOKIE_SECURE: "true"
+      AUTH_POST_LOGIN_PATH: ${AUTH_POST_LOGIN_PATH:-/}
+      TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-false}
+      ZITADEL_ISSUER_URL: ${ZITADEL_ISSUER_URL:?set ZITADEL_ISSUER_URL in .env.staging}
+      ZITADEL_CLIENT_ID: ${ZITADEL_CLIENT_ID:?set ZITADEL_CLIENT_ID in .env.staging}
+      ZITADEL_CLIENT_SECRET: ${ZITADEL_CLIENT_SECRET:-}
+      # AI provider selection/policy (non-secret) -- the vendor API keys
+      # below are read directly by each adapter through `infra.secrets`
+      # (voiceagent never stores or logs one); leave unused ones empty.
+      VOICEAGENT_AI_ELIGIBLE_PROVIDERS: ${VOICEAGENT_AI_ELIGIBLE_PROVIDERS:?set to real provider(s), e.g. groq}
+      VOICEAGENT_CALL_INTELLIGENCE_PROVIDER: ${VOICEAGENT_CALL_INTELLIGENCE_PROVIDER:-fake}
+      VOICEAGENT_CALL_INTELLIGENCE_MODEL: ${VOICEAGENT_CALL_INTELLIGENCE_MODEL:-fake-model}
+      VOICEAGENT_CALL_INTELLIGENCE_ENDPOINT: ${VOICEAGENT_CALL_INTELLIGENCE_ENDPOINT:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:-}
+      ASSEMBLYAI_API_KEY: ${ASSEMBLYAI_API_KEY:-}
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
+    command: uvicorn voiceagent.api.asgi:app --host 0.0.0.0 --port 8000
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "8000:8000"
+
+  call-runtime:
+    build: .
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      ENVIRONMENT: production
+      VOICEAGENT_DEPLOYMENT_STAGE: staging
+      DEBUG: "false"
+      LOG_LEVEL: INFO
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env.staging}
+      APP_DB_USER: ${APP_DB_USER:?set APP_DB_USER in .env.staging}
+      DB_REQUIRE_TLS: "true"
+      REDIS_URL: ${REDIS_URL:?set REDIS_URL in .env.staging}
+      REDIS_REQUIRE_TLS: "true"
+      VOICEAGENT_RUNTIME_ADDRESS: ${VOICEAGENT_RUNTIME_ADDRESS:-call-runtime:0}
+      VOICEAGENT_RUNTIME_SYSTEM_ACTOR_USER_ID: ${VOICEAGENT_RUNTIME_SYSTEM_ACTOR_USER_ID:-}
+      VOICEAGENT_RUNTIME_SYSTEM_SERVICE_ACCOUNT_NAME: ${VOICEAGENT_RUNTIME_SYSTEM_SERVICE_ACCOUNT_NAME:-voiceagent-runtime}
+      # FreeSWITCH is genuinely optional here (docs/PHASE-2.19-STAGING-INTEGRATION.md
+      # "Telephony", "Known limitations"): there is still no real TCP ESL
+      # transport in this repository, so leaving these unset is honest, not
+      # a shortcut. Fill them in only once a real transport exists.
+      VOICEAGENT_FREESWITCH_ESL_HOST: ${VOICEAGENT_FREESWITCH_ESL_HOST:-}
+      VOICEAGENT_FREESWITCH_ESL_PORT: ${VOICEAGENT_FREESWITCH_ESL_PORT:-8021}
+      VOICEAGENT_FREESWITCH_COMMAND_TIMEOUT_SECONDS: ${VOICEAGENT_FREESWITCH_COMMAND_TIMEOUT_SECONDS:-10}
+      VOICEAGENT_FREESWITCH_MEDIA_PUBLIC_URL: ${VOICEAGENT_FREESWITCH_MEDIA_PUBLIC_URL:-}
+      VOICEAGENT_AI_ELIGIBLE_PROVIDERS: ${VOICEAGENT_AI_ELIGIBLE_PROVIDERS:?set to real provider(s), e.g. groq}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:-}
+      ASSEMBLYAI_API_KEY: ${ASSEMBLYAI_API_KEY:-}
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
+      OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:?set OIDC_REDIRECT_URI in .env.staging}
+      ZITADEL_ISSUER_URL: ${ZITADEL_ISSUER_URL:?set ZITADEL_ISSUER_URL in .env.staging}
+      ZITADEL_CLIENT_ID: ${ZITADEL_CLIENT_ID:?set ZITADEL_CLIENT_ID in .env.staging}
+    stop_grace_period: 30s
+
+  follow-up-worker:
+    build: .
+    profiles: ["workers"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      ENVIRONMENT: production
+      VOICEAGENT_DEPLOYMENT_STAGE: staging
+      DEBUG: "false"
+      LOG_LEVEL: INFO
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env.staging}
+      APP_DB_USER: ${APP_DB_USER:?set APP_DB_USER in .env.staging}
+      DB_REQUIRE_TLS: "true"
+      REDIS_URL: ${REDIS_URL:?set REDIS_URL in .env.staging}
+      REDIS_REQUIRE_TLS: "true"
+      VOICEAGENT_FOLLOWUP_WORKER_TENANT_IDS: ${VOICEAGENT_FOLLOWUP_WORKER_TENANT_IDS:?set after bootstrapping a staging tenant}
+      VOICEAGENT_FOLLOWUP_WORKER_SYSTEM_ACTOR_USER_ID: ${VOICEAGENT_FOLLOWUP_WORKER_SYSTEM_ACTOR_USER_ID:?set after bootstrapping a staging tenant}
+      VOICEAGENT_AI_ELIGIBLE_PROVIDERS: ${VOICEAGENT_AI_ELIGIBLE_PROVIDERS:?set to real provider(s), e.g. groq}
+      OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:?set OIDC_REDIRECT_URI in .env.staging}
+      ZITADEL_ISSUER_URL: ${ZITADEL_ISSUER_URL:?set ZITADEL_ISSUER_URL in .env.staging}
+      ZITADEL_CLIENT_ID: ${ZITADEL_CLIENT_ID:?set ZITADEL_CLIENT_ID in .env.staging}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+    command: python scripts/run_followup_worker.py
+    stop_grace_period: 15s
+
+  call-intelligence-worker:
+    build: .
+    profiles: ["workers"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      ENVIRONMENT: production
+      VOICEAGENT_DEPLOYMENT_STAGE: staging
+      DEBUG: "false"
+      LOG_LEVEL: INFO
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env.staging}
+      APP_DB_USER: ${APP_DB_USER:?set APP_DB_USER in .env.staging}
+      DB_REQUIRE_TLS: "true"
+      REDIS_URL: ${REDIS_URL:?set REDIS_URL in .env.staging}
+      REDIS_REQUIRE_TLS: "true"
+      VOICEAGENT_CALL_INTELLIGENCE_WORKER_TENANT_IDS: ${VOICEAGENT_CALL_INTELLIGENCE_WORKER_TENANT_IDS:?set after bootstrapping a staging tenant}
+      VOICEAGENT_CALL_INTELLIGENCE_SYSTEM_ACTOR_USER_ID: ${VOICEAGENT_CALL_INTELLIGENCE_SYSTEM_ACTOR_USER_ID:?set after bootstrapping a staging tenant}
+      VOICEAGENT_CALL_INTELLIGENCE_PROVIDER: ${VOICEAGENT_CALL_INTELLIGENCE_PROVIDER:?set to a real provider, e.g. groq}
+      VOICEAGENT_CALL_INTELLIGENCE_MODEL: ${VOICEAGENT_CALL_INTELLIGENCE_MODEL:?set a real model name}
+      VOICEAGENT_CALL_INTELLIGENCE_ENDPOINT: ${VOICEAGENT_CALL_INTELLIGENCE_ENDPOINT:-}
+      VOICEAGENT_AI_ELIGIBLE_PROVIDERS: ${VOICEAGENT_AI_ELIGIBLE_PROVIDERS:?set to real provider(s), e.g. groq}
+      OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:?set OIDC_REDIRECT_URI in .env.staging}
+      ZITADEL_ISSUER_URL: ${ZITADEL_ISSUER_URL:?set ZITADEL_ISSUER_URL in .env.staging}
+      ZITADEL_CLIENT_ID: ${ZITADEL_CLIENT_ID:?set ZITADEL_CLIENT_ID in .env.staging}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+    command: python scripts/run_call_intelligence_worker.py
+    stop_grace_period: 15s
+
+  frontend:
+    build: ./frontend
+    depends_on:
+      - api
+    environment:
+      API_UPSTREAM: ${FRONTEND_API_UPSTREAM:-http://api:8000}
+    ports:
+      - "8080:8080"

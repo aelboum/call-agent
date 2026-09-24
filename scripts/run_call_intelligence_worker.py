@@ -49,7 +49,7 @@ import uuid
 from collections.abc import Sequence
 
 from voiceagent.call_intelligence.worker import CallAiAnalysisWorker
-from voiceagent.config import settings_from_env
+from voiceagent.config import settings_from_env, validate_deployment_readiness
 from voiceagent.providers.call_intelligence.registry import create_call_intelligence_provider
 from voiceagent.runtime.db import DatabaseBoundary
 
@@ -86,14 +86,27 @@ def _parse_tenant_ids(raw: str) -> tuple[uuid.UUID, ...]:
 async def _run() -> None:
     logging.basicConfig(level=logging.INFO)
     settings = settings_from_env()
+    validate_deployment_readiness(settings)
 
     tenant_ids = _parse_tenant_ids(_required_env("VOICEAGENT_CALL_INTELLIGENCE_WORKER_TENANT_IDS"))
 
     def _tenant_ids() -> Sequence[uuid.UUID]:
         return tenant_ids
 
+    # Phase 2.19: `endpoint`/`timeout_seconds` were already read from the
+    # environment (`VOICEAGENT_CALL_INTELLIGENCE_ENDPOINT`/`_TIMEOUT_SECONDS`)
+    # but never reached the provider's own config -- an empty `{}` always
+    # took every vendor default. Both keys are already validated by every
+    # real adapter's own pydantic config (e.g. `GroqCallIntelligenceConfig`);
+    # `None` is omitted rather than passed, so a provider's own documented
+    # default still applies when the operator hasn't overridden it.
+    provider_config: dict[str, object] = {
+        "timeout_seconds": settings.call_intelligence.timeout_seconds
+    }
+    if settings.call_intelligence.endpoint is not None:
+        provider_config["endpoint"] = settings.call_intelligence.endpoint
     provider = create_call_intelligence_provider(
-        settings.call_intelligence.provider, settings.call_intelligence.model, {}
+        settings.call_intelligence.provider, settings.call_intelligence.model, provider_config
     )
 
     db = DatabaseBoundary(max_workers=_DB_POOL_SIZE)

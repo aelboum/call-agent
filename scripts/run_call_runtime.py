@@ -59,7 +59,7 @@ import socket
 
 from infra.jobs.config import get_jobs_config
 
-from voiceagent.config import settings_from_env
+from voiceagent.config import settings_from_env, validate_deployment_readiness
 from voiceagent.runtime.heartbeat import RedisHeartbeatStore, new_instance_id
 from voiceagent.runtime.supervisor import CallRuntime
 
@@ -69,6 +69,7 @@ _logger = logging.getLogger("voiceagent.scripts.run_call_runtime")
 async def _run() -> None:
     logging.basicConfig(level=logging.INFO)
     settings = settings_from_env()
+    validate_deployment_readiness(settings)
     address = _env("VOICEAGENT_RUNTIME_ADDRESS", socket.gethostname())
 
     heartbeat_store = RedisHeartbeatStore(get_jobs_config().redis_url)

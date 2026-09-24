@@ -55,6 +55,7 @@ import signal
 import uuid
 from collections.abc import Sequence
 
+from voiceagent.config import settings_from_env, validate_deployment_readiness
 from voiceagent.followups.worker import FollowUpWorker
 from voiceagent.runtime.db import DatabaseBoundary
 
@@ -95,6 +96,7 @@ def _optional_int(name: str, default: int) -> int:
 
 async def _run() -> None:
     logging.basicConfig(level=logging.INFO)
+    validate_deployment_readiness(settings_from_env())
 
     tenant_ids = _parse_tenant_ids(_required_env("VOICEAGENT_FOLLOWUP_WORKER_TENANT_IDS"))
     system_actor_user_id = uuid.UUID(
