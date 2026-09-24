@@ -64,12 +64,20 @@ packages = [
     "voiceagent.agents",
     "voiceagent.api",
     "voiceagent.api.v1",
+    "voiceagent.calendars",
+    "voiceagent.call_analysis",
+    "voiceagent.call_intelligence",
     "voiceagent.calls",
     "voiceagent.config",
+    "voiceagent.contacts",
     "voiceagent.conversations",
     "voiceagent.db",
+    "voiceagent.followups",
+    "voiceagent.knowledge",
+    "voiceagent.ops",
     "voiceagent.phone_numbers",
     "voiceagent.providers",
+    "voiceagent.providers.call_intelligence",
     "voiceagent.providers.engines",
     "voiceagent.providers.stt",
     "voiceagent.providers.llm",
@@ -79,6 +87,7 @@ packages = [
     "voiceagent.telephony.freeswitch",
     "voiceagent.tenancy",
     "voiceagent.tools",
+    "voiceagent.workflows",
 ]
 
 [tool.ruff]

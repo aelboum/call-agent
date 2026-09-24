@@ -1,0 +1,28 @@
+# Backend production image build context (Dockerfile at repo root).
+# Keeps the build context small and keeps development-only material,
+# secrets, and generated artifacts out of the image entirely.
+
+.git
+.github
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+.mypy_cache
+
+# Frontend has its own image (frontend/Dockerfile, frontend/.dockerignore) --
+# the backend image never needs the frontend source or its node_modules.
+frontend/node_modules
+frontend/dist
+frontend/src
+
+# Never bake a real environment file into an image.
+.env
+.env.*
+!.env.example
+
+docs
+# README.md is NOT excluded: pyproject.toml's `readme = "README.md"` makes
+# it a required build input for `pip install .` (setuptools reads it while
+# building package metadata) -- excluding it would break the image build.

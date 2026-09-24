@@ -1,0 +1,65 @@
+# Production-serving boundary for the built frontend (Phase 2.18,
+# Workstream I): serves the static assets `vite build` produces and proxies
+# exactly the four path prefixes the frontend's own dev server already
+# proxies (`frontend/vite.config.ts`) -- `/v1`, `/healthz`, `/readyz`,
+# `/auth` -- to the API, so the browser only ever talks to one origin and no
+# CORS configuration is needed in production either.
+#
+# `${API_UPSTREAM}` is substituted at container start by the base image's
+# own `docker-entrypoint.d/20-envsubst-on-templates.sh` (any `*.template`
+# file under `/etc/nginx/templates/` is rendered into `/etc/nginx/conf.d/`
+# before nginx starts) -- set via `docker-compose.yml`'s `API_UPSTREAM`
+# environment variable, defaulting to the compose network's own `api`
+# service.
+
+server {
+    listen 8080;
+    server_name _;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # Phase 2.16 security-readiness property, re-applied here for the
+    # static-serving boundary itself (the API sets its own copy on every
+    # response it originates; this covers the HTML/JS/CSS this server
+    # originates).
+    add_header X-Content-Type-Options "nosniff" always;
+
+    # No source maps are produced by the production build (`vite build`
+    # default, re-verified Phase 2.17) -- nothing to explicitly deny here
+    # that isn't already simply absent from `dist/`.
+
+    location /v1/ {
+        proxy_pass ${API_UPSTREAM};
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location = /healthz {
+        proxy_pass ${API_UPSTREAM};
+        proxy_set_header Host $host;
+    }
+
+    location = /readyz {
+        proxy_pass ${API_UPSTREAM};
+        proxy_set_header Host $host;
+    }
+
+    location /auth/ {
+        proxy_pass ${API_UPSTREAM};
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # The OIDC session cookie is HttpOnly/Secure/SameSite=Lax
+        # (`docs/PHASE-2.16-SECURITY-READINESS.md` §2) and must reach the
+        # browser exactly as the API set it -- nginx does not rewrite
+        # Set-Cookie here.
+    }
+
+    # SPA fallback: any path not matched above (client-side routing) serves
+    # `index.html`, exactly like `vite dev`'s own default history-mode
+    # fallback -- never a 404 for a deep link the router itself will resolve.
+    location / {
+        try_files $uri /index.html;
+    }
+}

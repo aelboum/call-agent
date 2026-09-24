@@ -1,0 +1,206 @@
+# Local, production-like staging deployment (Phase 2.18, Workstream M).
+#
+# This is deliberately distinct from `tests/integration/README.md`'s
+# manually-started containers: those exist to give the *test suite* a real
+# PostgreSQL/Redis to run integration tests against, and Phase 2.1's brief
+# explicitly kept a `docker-compose.yml` out of the repository's ordinary
+# *developer/test* workflow for that reason (`tests/integration/README.md`,
+# "Why no permanent local/CI harness exists yet"). This file answers a
+# different question -- "how would this product actually run as separated
+# processes" -- which is Phase 2.18's own, explicitly requested scope; it
+# does not reopen or reverse that earlier, narrower decision.
+#
+# Every credential below is a local-only default for this compose stack,
+# never a real secret (Phase 2.18 brief, Workstream P: "never add default
+# production passwords"). A real deployment injects its own values for every
+# variable below at deploy time and never reuses these.
+#
+# `DB_REQUIRE_TLS=false`: SaaS-OS's own `infra.db` (S-05) enforces
+# `sslmode=require` on every DB connection whenever `ENVIRONMENT=production`,
+# unless this variable explicitly overrides that default -- and this local
+# `postgres:16-alpine` container has no TLS configured, exactly the case its
+# own error message names ("explicitly set DB_REQUIRE_TLS=false if this
+# connection is [not crossing an untrusted network]"). All of `postgres`,
+# `migrate`, `api`, `call-runtime` and the two workers stay on this one
+# compose network, never leaving the Docker host. A real production
+# deployment must either terminate real TLS on its PostgreSQL server and
+# leave this unset (so `ENVIRONMENT=production`'s own default applies), or
+# make the identical "private, trusted network" judgment call explicitly and
+# knowingly -- this repository does not make that call for the operator.
+#
+# `REDIS_REQUIRE_TLS=false`: the identical S-05 pattern, enforced by
+# `infra.jobs.config` for Redis instead of PostgreSQL (`rediss://` required
+# under `ENVIRONMENT=production` unless overridden) -- this local
+# `redis:7-alpine` container has no TLS configured either, and stays on the
+# same private compose network as everything that talks to it. The same
+# real-production caveat applies.
+#
+# `follow-up-worker` and `call-intelligence-worker` are in the `workers`
+# profile, not started by a plain `docker compose up`: both require at least
+# one real tenant to already exist and be bootstrapped
+# (`scripts/bootstrap_rbac.py`) before `*_TENANT_IDS` names anything real --
+# see `docs/PHASE-2.18-DEPLOYMENT-FOUNDATION.md` for the exact sequence.
+# Start them explicitly once that tenant exists:
+#   docker compose --profile workers up -d
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: saas_os
+      POSTGRES_PASSWORD: devpassword  # pragma: allowlist secret -- local-only compose default, see top-of-file note
+      POSTGRES_DB: voiceagent
+      POSTGRES_APP_PASSWORD: devpassword  # pragma: allowlist secret -- local-only compose default, see top-of-file note
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U saas_os -d voiceagent"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # No host port published by default -- only services on this compose
+    # network need to reach it. Uncomment to inspect it directly:
+    # ports: ["15432:5432"]
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-shot migration step (Phase 2.18 Workstream F): runs both histories in
+  # the required order (SaaS-OS's own, ADR-0016, then this product's) and
+  # exits. `api`/the workers depend on this exiting 0, not merely running --
+  # `condition: service_completed_successfully` -- so a migration failure
+  # blocks every application process from starting against an unverified
+  # schema, and migrations never run concurrently from multiple replicas
+  # because this is the one place they run at all.
+  migrate:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ENVIRONMENT: production
+      DB_REQUIRE_TLS: "false"  # see the top-of-file note
+      DATABASE_URL: postgresql+psycopg://saas_os_app:devpassword@postgres:5432/voiceagent  # pragma: allowlist secret
+      MIGRATIONS_DATABASE_URL: postgresql+psycopg://saas_os:devpassword@postgres:5432/voiceagent  # pragma: allowlist secret
+      APP_DB_USER: saas_os_app
+    command: sh -c "saas-os-migrate upgrade && alembic upgrade head"
+
+  api:
+    build: .
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    environment:
+      ENVIRONMENT: production
+      DB_REQUIRE_TLS: "false"  # see the top-of-file note
+      DEBUG: "false"
+      LOG_LEVEL: INFO
+      HOST: 0.0.0.0
+      PORT: "8000"
+      DATABASE_URL: postgresql+psycopg://saas_os_app:devpassword@postgres:5432/voiceagent  # pragma: allowlist secret
+      APP_DB_USER: saas_os_app
+      REDIS_URL: redis://redis:6379/0
+      REDIS_REQUIRE_TLS: "false"  # see the top-of-file note
+      # Left unset: the frontend reaches the API through its own nginx proxy
+      # at the same browser-visible origin (`frontend/nginx/default.conf.template`),
+      # so no cross-origin browser request, and therefore no CORS
+      # configuration, is needed for this stack. Production `Settings`
+      # rejects a non-`https://` CORS origin outright
+      # (`voiceagent/config/settings.py::_validate_production`) -- setting
+      # one here for a plain local `http://` stack would only fail closed.
+    command: uvicorn voiceagent.api.asgi:app --host 0.0.0.0 --port 8000
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "8000:8000"
+
+  call-runtime:
+    build: .
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    environment:
+      ENVIRONMENT: production
+      DB_REQUIRE_TLS: "false"  # see the top-of-file note
+      DEBUG: "false"
+      LOG_LEVEL: INFO
+      DATABASE_URL: postgresql+psycopg://saas_os_app:devpassword@postgres:5432/voiceagent  # pragma: allowlist secret
+      APP_DB_USER: saas_os_app
+      REDIS_URL: redis://redis:6379/0
+      REDIS_REQUIRE_TLS: "false"  # see the top-of-file note
+      VOICEAGENT_RUNTIME_ADDRESS: call-runtime:0
+    command: python scripts/run_call_runtime.py
+    stop_grace_period: 30s
+
+  follow-up-worker:
+    build: .
+    profiles: ["workers"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    environment:
+      ENVIRONMENT: production
+      DB_REQUIRE_TLS: "false"  # see the top-of-file note
+      DEBUG: "false"
+      LOG_LEVEL: INFO
+      DATABASE_URL: postgresql+psycopg://saas_os_app:devpassword@postgres:5432/voiceagent  # pragma: allowlist secret
+      APP_DB_USER: saas_os_app
+      REDIS_URL: redis://redis:6379/0
+      REDIS_REQUIRE_TLS: "false"  # see the top-of-file note
+      # Fill in after bootstrapping at least one tenant
+      # (scripts/bootstrap_rbac.py) -- see the deployment runbook.
+      VOICEAGENT_FOLLOWUP_WORKER_TENANT_IDS: ""
+      VOICEAGENT_FOLLOWUP_WORKER_SYSTEM_ACTOR_USER_ID: ""
+    command: python scripts/run_followup_worker.py
+    stop_grace_period: 15s
+
+  call-intelligence-worker:
+    build: .
+    profiles: ["workers"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    environment:
+      ENVIRONMENT: production
+      DB_REQUIRE_TLS: "false"  # see the top-of-file note
+      DEBUG: "false"
+      LOG_LEVEL: INFO
+      DATABASE_URL: postgresql+psycopg://saas_os_app:devpassword@postgres:5432/voiceagent  # pragma: allowlist secret
+      APP_DB_USER: saas_os_app
+      REDIS_URL: redis://redis:6379/0
+      REDIS_REQUIRE_TLS: "false"  # see the top-of-file note
+      # Fill in after bootstrapping at least one tenant
+      # (scripts/bootstrap_rbac.py) -- see the deployment runbook.
+      VOICEAGENT_CALL_INTELLIGENCE_WORKER_TENANT_IDS: ""
+      VOICEAGENT_CALL_INTELLIGENCE_SYSTEM_ACTOR_USER_ID: ""
+    command: python scripts/run_call_intelligence_worker.py
+    stop_grace_period: 15s
+
+  frontend:
+    build: ./frontend
+    depends_on:
+      - api
+    environment:
+      API_UPSTREAM: http://api:8000
+    ports:
+      - "8080:8080"
+
+volumes:
+  postgres_data:
