@@ -198,3 +198,45 @@ def test_end_to_end_rejects_an_invalid_ticket_and_closes_the_connection() -> Non
             await server.wait_closed()
 
     assert asyncio.run(scenario()) is False
+
+
+def test_end_to_end_client_disconnect_during_active_media_ends_the_stream_cleanly() -> None:
+    """Phase 2.24 brief section 5: "disconnect during active media" -- a
+    real client (standing in for FreeSWITCH itself hanging up mid-stream)
+    closing its own connection must end `receive_binary()`'s iteration
+    cleanly (a graceful stop, not an unhandled exception propagating out of
+    `voiceagent.runtime.call_task`'s own audio pump)."""
+
+    async def scenario() -> list[bytes]:
+        provider = FreeSwitchMediaProvider()
+        listener = FreeSwitchMediaListener(provider, ticket_secret=_SECRET)
+        server = await serve_freeswitch_media(listener, host="127.0.0.1", port=0)
+        host, port = server.sockets[0].getsockname()[:2]
+        ticket = mint_media_ticket("call-1", _SECRET, ttl_seconds=60)
+
+        try:
+            client = await websockets.connect(f"ws://{host}:{port}/media/{ticket}")
+            for _ in range(50):
+                if "call-1" in provider._sockets:  # noqa: SLF001
+                    break
+                await asyncio.sleep(0.02)
+            else:
+                raise AssertionError("server never registered the socket")
+
+            stream = await provider.attach("call-1")
+            await client.send(b"\x01\x02")
+            first = await asyncio.wait_for(stream.receive().__anext__(), timeout=2.0)
+
+            await client.close()
+
+            frames = [first]
+            async with asyncio.timeout(2.0):
+                async for frame in stream.receive():
+                    frames.append(frame)
+            return frames
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    frames = asyncio.run(scenario())
+    assert frames == [b"\x01\x02"]

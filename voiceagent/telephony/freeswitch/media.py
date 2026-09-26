@@ -29,7 +29,7 @@ import time
 from collections.abc import AsyncIterator
 from typing import Protocol, runtime_checkable
 
-from voiceagent.metrics import record_provider_operation
+from voiceagent.metrics import record_media_session_duration, record_provider_operation
 from voiceagent.telephony.contracts import (
     AudioFormat,
     CallRef,
@@ -122,6 +122,7 @@ class FreeSwitchMediaProvider:
     def __init__(self) -> None:
         self._streams: dict[CallRef, _FreeSwitchMediaStream] = {}
         self._sockets: dict[CallRef, MediaSocket] = {}
+        self._attached_at: dict[CallRef, float] = {}
 
     def register_socket(self, call_ref: CallRef, socket: MediaSocket) -> None:
         """Called once a call leg's media WebSocket has actually connected
@@ -148,6 +149,7 @@ class FreeSwitchMediaProvider:
             raise TransportError(f"no media socket registered for {call_ref}")
         stream = _FreeSwitchMediaStream(socket, chosen)
         self._streams[call_ref] = stream
+        self._attached_at[call_ref] = time.monotonic()
         record_provider_operation("media", "attach", "success", time.monotonic() - started)
         return stream
 
@@ -159,6 +161,9 @@ class FreeSwitchMediaProvider:
             raise TransportError(f"no attached stream: {call_ref}")
         await stream.close()
         self._sockets.pop(call_ref, None)
+        attached_at = self._attached_at.pop(call_ref, None)
+        if attached_at is not None:
+            record_media_session_duration(time.monotonic() - attached_at)
         record_provider_operation("media", "detach", "success", time.monotonic() - started)
 
     def health(self, call_ref: CallRef) -> StreamHealth:

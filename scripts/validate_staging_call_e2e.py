@@ -12,18 +12,21 @@ resolution, `CallSession` creation, authorization, runtime-ownership
 claim, the exactly-once activation gate, and a real `uuid_answer` against
 the live server.
 
-**Expected outcome in this environment**: `start_media_stream()` will
-genuinely fail -- the stock FreeSWITCH image this validates against has no
-`mod_audio_stream` loaded (a third-party module, not part of core
-FreeSWITCH), so `api uuid_audio_stream ...` gets a real `-ERR command not
-found` from the live server. This script treats that as the *expected*
-terminal outcome, not a bug: it proves the orchestrator's own bounded
+**Expected outcome against a FreeSWITCH image with no `mod_audio_stream`**
+(Phase 2.23's own `safarov/freeswitch`): `start_media_stream()` genuinely
+fails -- `api uuid_audio_stream ...` gets a real `-ERR command not found`
+from the live server. This script treats that as an *expected* terminal
+outcome, not a bug: it proves the orchestrator's own bounded
 `media_unavailable` failure path (real `CallSession` transition to
 `failed`, real channel hangup, real terminal cleanup) end to end against a
-real server, which is a real, valuable validation in its own right (Phase
-2.23 brief section 8, "Media failure: verify bounded failure and terminal
-cleanup"). A deployment with `mod_audio_stream` actually installed would
-instead proceed to a real `answered` call.
+real server (Phase 2.23 brief section 8, "Media failure: verify bounded
+failure and terminal cleanup").
+
+**Against a FreeSWITCH image that does have `mod_audio_stream`** (Phase
+2.24's own finding: `rasonyang/freeswitch-aicc`, run with a real,
+container-reachable `--media-public-base-url` instead of the default
+placeholder), the call instead proceeds to a real `answered` state -- see
+`docs/PHASE-2.24-REAL-MEDIA-CALL-E2E.md` for that result.
 
 Prerequisites:
 
@@ -72,6 +75,10 @@ from voiceagent.runtime.supervisor import CallRuntime
 from voiceagent.runtime.telephony_events import TelephonyEventRouter
 from voiceagent.telephony.freeswitch.esl_transport import ManagedEslConnection
 from voiceagent.telephony.freeswitch.media import FreeSwitchMediaProvider
+from voiceagent.telephony.freeswitch.media_transport import (
+    FreeSwitchMediaListener,
+    serve_freeswitch_media,
+)
 from voiceagent.telephony.freeswitch.provider import FreeSwitchTelephonyProvider
 from voiceagent.tenancy import TenantContext
 from voiceagent.tools.gateway import ToolGateway
@@ -109,7 +116,14 @@ async def _wait_until(predicate, *, timeout_seconds: float = 15.0) -> bool:
     return False
 
 
-async def _run(fs_host: str, fs_port: int, fs_password: str) -> int:
+async def _run(
+    fs_host: str,
+    fs_port: int,
+    fs_password: str,
+    media_public_base_url: str,
+    media_listen_host: str,
+    media_listen_port: int,
+) -> int:
     print("[1/7] provisioning a real tenant/agent/phone-number in real PostgreSQL ...")
     tenant = create_tenant(f"phase223-{uuid.uuid4().hex[:8]}")
     user = create_user()
@@ -130,12 +144,18 @@ async def _run(fs_host: str, fs_port: int, fs_password: str) -> int:
         return 1
     print("      connected and authenticated")
 
+    media_ticket_secret = "phase223-validation-secret"  # noqa: S105 -- disposable, this run only.  # pragma: allowlist secret
     telephony = FreeSwitchTelephonyProvider(
         esl,
-        media_public_base_url="wss://staging.invalid.example",
-        media_ticket_secret_provider=lambda: "phase223-validation-secret",
+        media_public_base_url=media_public_base_url,
+        media_ticket_secret_provider=lambda: media_ticket_secret,
     )
     media = FreeSwitchMediaProvider()
+    media_listener = FreeSwitchMediaListener(media, ticket_secret=media_ticket_secret)
+    media_server = await serve_freeswitch_media(
+        media_listener, host=media_listen_host, port=media_listen_port
+    )
+    print(f"      real wss:// media listener started on {media_listen_host}:{media_listen_port}")
     db = DatabaseBoundary(max_workers=4)
     heartbeats = FakeHeartbeatStore()
     await heartbeats.write(
@@ -188,7 +208,7 @@ async def _run(fs_host: str, fs_port: int, fs_password: str) -> int:
     )
     if reply.startswith("-ERR"):
         print(f"FAIL: originate rejected: {reply!r}")
-        await _shutdown(router_task, esl, db)
+        await _shutdown(router_task, esl, db, media_server)
         return 1
     print("      real OFFERED event should now reach the orchestrator via TelephonyEventRouter")
 
@@ -199,12 +219,12 @@ async def _run(fs_host: str, fs_port: int, fs_password: str) -> int:
     )
     if not ok:
         print("FAIL: no CallSession was ever created for this real call_ref")
-        await _shutdown(router_task, esl, db)
+        await _shutdown(router_task, esl, db, media_server)
         return 1
     call = get_call_session_by_fs_channel_uuid(context, call_ref)
     if call is None:
         print("FAIL: CallSession vanished immediately after being observed")
-        await _shutdown(router_task, esl, db)
+        await _shutdown(router_task, esl, db, media_server)
         return 1
     print(f"      real CallSession created: id={call.id} status={call.status!r}")
 
@@ -224,7 +244,7 @@ async def _run(fs_host: str, fs_port: int, fs_password: str) -> int:
     call = get_call_session_by_fs_channel_uuid(context, call_ref)
     if call is None:
         print("FAIL: CallSession vanished before reaching a settled state")
-        await _shutdown(router_task, esl, db)
+        await _shutdown(router_task, esl, db, media_server)
         return 1
     print(f"      final observed status: {call.status!r}, end_reason={call.end_reason!r}")
     print(f"      runtime_instance_id={call.runtime_instance_id!r}")
@@ -246,19 +266,24 @@ async def _run(fs_host: str, fs_port: int, fs_password: str) -> int:
         result = 1
 
     print("[7/7] cleaning up ...")
-    await _shutdown(router_task, esl, db)
+    await _shutdown(router_task, esl, db, media_server)
     print("PASS" if result == 0 else "FAIL")
     return result
 
 
 async def _shutdown(
-    router_task: asyncio.Task[None], esl: ManagedEslConnection, db: DatabaseBoundary
+    router_task: asyncio.Task[None],
+    esl: ManagedEslConnection,
+    db: DatabaseBoundary,
+    media_server,
 ) -> None:
     router_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await router_task
     await esl.close()
     db.close()
+    media_server.close()
+    await media_server.wait_closed()
 
 
 def main() -> int:
@@ -266,8 +291,30 @@ def main() -> int:
     parser.add_argument("--fs-host", default="127.0.0.1")
     parser.add_argument("--fs-port", type=int, default=18021)
     parser.add_argument("--fs-password", default="ClueCon")
+    parser.add_argument(
+        "--media-public-base-url",
+        default="wss://staging.invalid.example",
+        help=(
+            "Base wss:// URL FreeSWITCH will try to reach for media -- pass a real, "
+            "container-reachable ws:// URL (a raw IP; see scripts/validate_staging_media_e2e.py's "
+            "own docstring) to exercise the real answered path against an image with "
+            "mod_audio_stream. The default placeholder reproduces Phase 2.23's own "
+            "media_unavailable-path validation unchanged."
+        ),
+    )
+    parser.add_argument("--media-listen-host", default="0.0.0.0")  # noqa: S104
+    parser.add_argument("--media-listen-port", type=int, default=8300)
     args = parser.parse_args()
-    return asyncio.run(_run(args.fs_host, args.fs_port, args.fs_password))
+    return asyncio.run(
+        _run(
+            args.fs_host,
+            args.fs_port,
+            args.fs_password,
+            args.media_public_base_url,
+            args.media_listen_host,
+            args.media_listen_port,
+        )
+    )
 
 
 if __name__ == "__main__":

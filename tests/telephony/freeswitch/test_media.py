@@ -104,6 +104,55 @@ def test_detach_unknown_call_raises() -> None:
         asyncio.run(provider.detach("nonexistent"))
 
 
+def test_no_cross_call_frame_leakage() -> None:
+    """Phase 2.24 brief section 5: "no cross-call frame leakage"/"no
+    cross-tenant frame leakage" -- this layer has no concept of tenant at
+    all (by design: it only ever sees `call_ref` strings), so the only
+    thing that could leak frames between tenants is frames leaking between
+    *calls* at all. Two independently registered sockets for two different
+    `call_ref`s must never cross-deliver: each attached stream yields only
+    its own socket's own pushed frames."""
+    provider = FreeSwitchMediaProvider()
+    socket_a = FakeMediaSocket()
+    socket_b = FakeMediaSocket()
+    provider.register_socket("call-a", socket_a)
+    provider.register_socket("call-b", socket_b)
+    socket_a.push_binary(b"frame-for-a")
+    socket_a.end_inbound()
+    socket_b.push_binary(b"frame-for-b")
+    socket_b.end_inbound()
+
+    async def scenario() -> tuple[list[bytes], list[bytes]]:
+        stream_a = await provider.attach("call-a")
+        stream_b = await provider.attach("call-b")
+        frames_a = [frame async for frame in stream_a.receive()]
+        frames_b = [frame async for frame in stream_b.receive()]
+        return frames_a, frames_b
+
+    frames_a, frames_b = asyncio.run(scenario())
+    assert frames_a == [b"frame-for-a"]
+    assert frames_b == [b"frame-for-b"]
+
+
+def test_sending_on_one_call_never_reaches_another_calls_socket() -> None:
+    """The outbound half of the same isolation property: `stream.send()`
+    for one call must only ever write to that call's own registered
+    socket."""
+    provider = FreeSwitchMediaProvider()
+    socket_a = FakeMediaSocket()
+    socket_b = FakeMediaSocket()
+    provider.register_socket("call-a", socket_a)
+    provider.register_socket("call-b", socket_b)
+
+    async def scenario() -> None:
+        stream_a = await provider.attach("call-a")
+        await stream_a.send(b"only-for-a")
+
+    asyncio.run(scenario())
+    assert len(socket_a.sent_text) == 1
+    assert socket_b.sent_text == []
+
+
 def test_health_before_attach_reports_unattached() -> None:
     provider = FreeSwitchMediaProvider()
     health = provider.health("never-attached")

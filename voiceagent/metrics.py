@@ -79,6 +79,8 @@ __all__ = [
     "record_call_setup_latency",
     "record_call_started",
     "record_call_teardown",
+    "record_media_session_duration",
+    "record_media_ticket_rejected",
     "record_orchestration_event",
     "record_provider_operation",
     "record_reconciliation",
@@ -232,6 +234,27 @@ _provider_operation_latency: Final = _meter.create_histogram(
     "voiceagent.provider.operation_latency", unit="s", description="Provider operation latency."
 )
 
+#: Phase 2.24: a media connection rejected before `MediaProvider.attach()`
+#: is ever reached (`FreeSwitchMediaListener.handle_connection()`'s own
+#: ticket-verification gate) -- a distinct failure mode from `attach()`'s
+#: own "no socket registered"/"already attached" outcomes (already covered
+#: by `_provider_operations` above), and from `voiceagent.telephony
+#: .freeswitch.media_transport.TicketVerificationError`'s own bounded
+#: message set (never the connecting path or any header value).
+_media_tickets_rejected: Final = _meter.create_counter(
+    "voiceagent.media.tickets_rejected",
+    unit="1",
+    description="Media WebSocket connections rejected at ticket verification, by reason.",
+)
+
+#: Phase 2.24: how long a media stream stayed attached, start (`attach()`)
+#: to end (`detach()`) -- distinct from `_provider_operation_latency`'s own
+#: per-call *attach*/*detach* latency (how long the operation itself took),
+#: this is the *session's* own duration.
+_media_session_duration: Final = _meter.create_histogram(
+    "voiceagent.media.session_duration", unit="s", description="Attached media session duration."
+)
+
 _tool_executions: Final = _meter.create_counter(
     "voiceagent.tools.executions", unit="1", description="Tool Gateway executions, by outcome."
 )
@@ -347,6 +370,23 @@ def record_stuck_call_cancellation() -> None:
 
 def record_reconciliation(*, result: Literal["stale", "repaired"]) -> None:
     _safe("runtime.reconciliation", lambda: _runtime_reconciliation.add(1, {"result": result}))
+
+
+def record_media_ticket_rejected(
+    *, reason: Literal["malformed", "expired", "invalid_signature", "missing_path"]
+) -> None:
+    """`reason` is `voiceagent.telephony.freeswitch.media_transport`'s own
+    bounded, fixed vocabulary of why `verify_media_ticket()`/
+    `extract_call_ref()` rejected a connection -- never the ticket, the
+    path, or any header value."""
+    _safe("media.ticket_rejected", lambda: _media_tickets_rejected.add(1, {"reason": reason}))
+
+
+def record_media_session_duration(duration_seconds: float) -> None:
+    _safe(
+        "media.session_duration",
+        lambda: _media_session_duration.record(max(duration_seconds, 0.0)),
+    )
 
 
 def record_provider_operation(

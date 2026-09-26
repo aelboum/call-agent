@@ -38,13 +38,21 @@ import hmac
 import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import Literal
 
 import websockets
 from websockets.asyncio.server import Server, ServerConnection
 from websockets.exceptions import ConnectionClosed
 
+from voiceagent.metrics import record_media_ticket_rejected
 from voiceagent.telephony.contracts import CallRef, TransportError
 from voiceagent.telephony.freeswitch.media import FreeSwitchMediaProvider
+
+#: `TicketVerificationError.reason`'s own bounded vocabulary -- mirrors
+#: `voiceagent.metrics.record_media_ticket_rejected()`'s own parameter type
+#: exactly, so passing one to the other is a plain, statically-checked value,
+#: never a free-form string.
+_RejectReason = Literal["malformed", "expired", "invalid_signature", "missing_path"]
 
 __all__ = [
     "FreeSwitchMediaListener",
@@ -60,7 +68,17 @@ _logger = logging.getLogger(__name__)
 
 class TicketVerificationError(TransportError):
     """A media ticket was missing, malformed, expired, or failed signature
-    verification. Never carries the raw ticket or the signing secret."""
+    verification. Never carries the raw ticket or the signing secret.
+
+    `reason` (Phase 2.24) is `voiceagent.metrics.record_media_ticket_rejected()`'s
+    own bounded vocabulary, set once at each raise site below -- read by
+    `FreeSwitchMediaListener.handle_connection()` so a rejection is recorded
+    by *kind* without parsing this exception's own human-readable message.
+    """
+
+    def __init__(self, message: str, *, reason: _RejectReason) -> None:
+        super().__init__(message)
+        self.reason: _RejectReason = reason
 
 
 def mint_media_ticket(call_ref: CallRef, secret: str, *, ttl_seconds: float = 60.0) -> str:
@@ -83,17 +101,19 @@ def verify_media_ticket(ticket: str, secret: str) -> CallRef:
     computed signature."""
     parts = ticket.rsplit(".", 2)
     if len(parts) != 3:
-        raise TicketVerificationError("malformed media ticket")
+        raise TicketVerificationError("malformed media ticket", reason="malformed")
     call_ref, expiry_raw, signature = parts
     try:
         expiry = int(expiry_raw)
     except ValueError as exc:
-        raise TicketVerificationError("malformed media ticket") from exc
+        raise TicketVerificationError("malformed media ticket", reason="malformed") from exc
     expected = _sign(call_ref, expiry, secret)
     if not hmac.compare_digest(expected, signature):
-        raise TicketVerificationError("media ticket signature is invalid")
+        raise TicketVerificationError(
+            "media ticket signature is invalid", reason="invalid_signature"
+        )
     if time.time() > expiry:
-        raise TicketVerificationError("media ticket has expired")
+        raise TicketVerificationError("media ticket has expired", reason="expired")
     return call_ref
 
 
@@ -179,7 +199,9 @@ class FreeSwitchMediaListener:
         "this connection cannot prove which call it is for"."""
         prefix = "/media/"
         if not path.startswith(prefix):
-            raise TicketVerificationError("media path is missing the ticket segment")
+            raise TicketVerificationError(
+                "media path is missing the ticket segment", reason="missing_path"
+            )
         ticket = path[len(prefix) :]
         return verify_media_ticket(ticket, self._ticket_secret)
 
@@ -202,8 +224,9 @@ class FreeSwitchMediaListener:
         caller; a test can call this directly with fakes."""
         try:
             call_ref = self.extract_call_ref(path)
-        except TicketVerificationError:
+        except TicketVerificationError as exc:
             _logger.warning("media.ticket_rejected")
+            record_media_ticket_rejected(reason=exc.reason)
             await close()
             return
         socket = WebSocketMediaSocket(send=send, recv=recv, close=close)
