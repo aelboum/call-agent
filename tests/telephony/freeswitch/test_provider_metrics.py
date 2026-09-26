@@ -37,7 +37,7 @@ def test_successful_command_records_success_with_bounded_operation_name(
 
 def test_esl_error_response_records_failure(monkeypatch) -> None:
     esl = FakeEslConnection()
-    esl.responses["uuid_answer call-1"] = "-ERR no such channel"
+    esl.responses["api uuid_answer call-1"] = "-ERR no such channel"
     provider = FreeSwitchTelephonyProvider(esl)
 
     calls: list[tuple[str, str]] = []

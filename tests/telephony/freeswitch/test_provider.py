@@ -37,14 +37,14 @@ def test_answer_issues_the_expected_esl_command() -> None:
     esl = FakeEslConnection()
     provider = FreeSwitchTelephonyProvider(esl)
     asyncio.run(provider.answer("call-1"))
-    assert esl.commands == ["uuid_answer call-1"]
+    assert esl.commands == ["api uuid_answer call-1"]
 
 
 def test_hangup_denormalizes_the_cause() -> None:
     esl = FakeEslConnection()
     provider = FreeSwitchTelephonyProvider(esl)
     asyncio.run(provider.hangup("call-1", HangupCause.BUSY))
-    assert esl.commands == ["uuid_kill call-1 USER_BUSY"]
+    assert esl.commands == ["api uuid_kill call-1 USER_BUSY"]
 
 
 def test_hold_and_unhold() -> None:
@@ -52,7 +52,7 @@ def test_hold_and_unhold() -> None:
     provider = FreeSwitchTelephonyProvider(esl)
     asyncio.run(provider.hold("call-1"))
     asyncio.run(provider.unhold("call-1"))
-    assert esl.commands == ["uuid_hold call-1", "uuid_hold off call-1"]
+    assert esl.commands == ["api uuid_hold call-1", "api uuid_hold off call-1"]
 
 
 def test_send_dtmf_and_recording_commands() -> None:
@@ -62,9 +62,9 @@ def test_send_dtmf_and_recording_commands() -> None:
     asyncio.run(provider.start_recording("call-1"))
     asyncio.run(provider.stop_recording("call-1"))
     assert esl.commands == [
-        "uuid_send_dtmf call-1 123#",
-        "uuid_record call-1 start /dev/null",
-        "uuid_record call-1 stop /dev/null",
+        "api uuid_send_dtmf call-1 123#",
+        "api uuid_record call-1 start /dev/null",
+        "api uuid_record call-1 stop /dev/null",
     ]
 
 
@@ -72,12 +72,12 @@ def test_bridge() -> None:
     esl = FakeEslConnection()
     provider = FreeSwitchTelephonyProvider(esl)
     asyncio.run(provider.bridge("call-1", "call-2"))
-    assert esl.commands == ["uuid_bridge call-1 call-2"]
+    assert esl.commands == ["api uuid_bridge call-1 call-2"]
 
 
 def test_an_error_response_raises_transport_error() -> None:
     esl = FakeEslConnection()
-    esl.responses["uuid_answer call-1"] = "-ERR no such channel"
+    esl.responses["api uuid_answer call-1"] = "-ERR no such channel"
     provider = FreeSwitchTelephonyProvider(esl)
     with pytest.raises(TransportError):
         asyncio.run(provider.answer("call-1"))
@@ -100,14 +100,14 @@ def test_a_wedged_command_times_out_as_a_transport_error() -> None:
     provider = FreeSwitchTelephonyProvider(esl, command_timeout_seconds=0.05)
     with pytest.raises(TransportError):
         asyncio.run(provider.answer("call-1"))
-    assert esl.commands == ["uuid_answer call-1"]
+    assert esl.commands == ["api uuid_answer call-1"]
 
 
 def test_command_timeout_defaults_do_not_affect_a_normal_response() -> None:
     esl = FakeEslConnection()
     provider = FreeSwitchTelephonyProvider(esl, command_timeout_seconds=0.05)
     asyncio.run(provider.answer("call-1"))
-    assert esl.commands == ["uuid_answer call-1"]
+    assert esl.commands == ["api uuid_answer call-1"]
 
 
 def test_events_are_normalized_and_unmapped_events_are_dropped() -> None:
@@ -207,7 +207,9 @@ def test_start_media_stream_issues_the_expected_esl_command() -> None:
     asyncio.run(provider.start_media_stream("call-1"))
     assert len(esl.commands) == 1
     command = esl.commands[0]
-    assert command.startswith("uuid_audio_stream call-1 start wss://runtime.example.test/media/")
+    assert command.startswith(
+        "api uuid_audio_stream call-1 start wss://runtime.example.test/media/"
+    )
     assert command.endswith(" mono 8k")
 
 
@@ -223,4 +225,4 @@ def test_stop_media_stream_issues_the_expected_esl_command() -> None:
     esl = FakeEslConnection()
     provider = FreeSwitchTelephonyProvider(esl)
     asyncio.run(provider.stop_media_stream("call-1"))
-    assert esl.commands == ["uuid_audio_stream call-1 stop"]
+    assert esl.commands == ["api uuid_audio_stream call-1 stop"]

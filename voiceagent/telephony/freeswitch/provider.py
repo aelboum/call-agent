@@ -238,15 +238,15 @@ class FreeSwitchTelephonyProvider:
         return call_ref
 
     async def answer(self, call_ref: CallRef) -> None:
-        await self._command(f"uuid_answer {call_ref}", operation="answer")
+        await self._command(f"api uuid_answer {call_ref}", operation="answer")
 
     async def hangup(self, call_ref: CallRef, cause: HangupCause = HangupCause.NORMAL) -> None:
         await self._command(
-            f"uuid_kill {call_ref} {_denormalize_hangup_cause(cause)}", operation="hangup"
+            f"api uuid_kill {call_ref} {_denormalize_hangup_cause(cause)}", operation="hangup"
         )
 
     async def bridge(self, call_ref: CallRef, other_call_ref: CallRef) -> None:
-        await self._command(f"uuid_bridge {call_ref} {other_call_ref}", operation="bridge")
+        await self._command(f"api uuid_bridge {call_ref} {other_call_ref}", operation="bridge")
 
     async def transfer(self, call_ref: CallRef, destination: str) -> CallRef:
         """Same correction as `originate()`: the new leg's `CallRef` is
@@ -261,20 +261,24 @@ class FreeSwitchTelephonyProvider:
         return new_call_ref
 
     async def hold(self, call_ref: CallRef) -> None:
-        await self._command(f"uuid_hold {call_ref}", operation="hold")
+        await self._command(f"api uuid_hold {call_ref}", operation="hold")
 
     async def unhold(self, call_ref: CallRef) -> None:
-        await self._command(f"uuid_hold off {call_ref}", operation="unhold")
+        await self._command(f"api uuid_hold off {call_ref}", operation="unhold")
 
     async def send_dtmf(self, call_ref: CallRef, digits: str) -> None:
         _require_dtmf_digits(digits)
-        await self._command(f"uuid_send_dtmf {call_ref} {digits}", operation="send_dtmf")
+        await self._command(f"api uuid_send_dtmf {call_ref} {digits}", operation="send_dtmf")
 
     async def start_recording(self, call_ref: CallRef) -> None:
-        await self._command(f"uuid_record {call_ref} start /dev/null", operation="start_recording")
+        await self._command(
+            f"api uuid_record {call_ref} start /dev/null", operation="start_recording"
+        )
 
     async def stop_recording(self, call_ref: CallRef) -> None:
-        await self._command(f"uuid_record {call_ref} stop /dev/null", operation="stop_recording")
+        await self._command(
+            f"api uuid_record {call_ref} stop /dev/null", operation="stop_recording"
+        )
 
     async def start_media_stream(self, call_ref: CallRef) -> None:
         """Command FreeSWITCH's `mod_audio_stream` to open the product's own
@@ -303,12 +307,12 @@ class FreeSwitchTelephonyProvider:
         )
         media_url = f"{self._media_public_base_url}/media/{ticket}"
         await self._command(
-            f"uuid_audio_stream {call_ref} start {media_url} mono 8k",
+            f"api uuid_audio_stream {call_ref} start {media_url} mono 8k",
             operation="start_media_stream",
         )
 
     async def stop_media_stream(self, call_ref: CallRef) -> None:
-        await self._command(f"uuid_audio_stream {call_ref} stop", operation="stop_media_stream")
+        await self._command(f"api uuid_audio_stream {call_ref} stop", operation="stop_media_stream")
 
     async def events(self) -> AsyncIterator[CallEvent]:
         async for raw in self._esl.events():

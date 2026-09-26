@@ -17,12 +17,21 @@ distinguishes what a frame *is*:
 
 * `auth/request` -- FreeSWITCH's greeting, sent once, no body. The one
   packet `_authenticate()` waits for before it ever sends a byte.
-* `command/reply` -- the reply to a plain command (`auth`, `event plain
-  ...`, `uuid_answer ...`, `bgapi ...`); the reply text lives in a
-  `Reply-Text` header, not a body.
-* `api/response` -- the reply to a synchronous `api` command; its result
-  lives in the body (this product never sends a plain `api` command today,
-  only `bgapi`, but `send()` handles either shape uniformly).
+* `command/reply` -- the reply to a plain command recognized directly by
+  `mod_event_socket` itself (`auth`, `event plain ...`, `bgapi ...`); the
+  reply text lives in a `Reply-Text` header, not a body. **`uuid_answer`,
+  `uuid_kill`, and every other `mod_commands` API are not in this set** --
+  a bare `uuid_answer <uuid>` line gets `-ERR command not found` from a
+  real server (found during Phase 2.23's own real-FreeSWITCH validation;
+  every pre-2.23 test used `FakeEslConnection`, which never enforced this
+  distinction). `voiceagent.telephony.freeswitch.provider
+  .FreeSwitchTelephonyProvider` sends these prefixed with `api ` for
+  exactly this reason -- see `api/response` below.
+* `api/response` -- the reply to a synchronous `api` command (`api
+  uuid_answer ...`, `api uuid_kill ...`, ...); its result lives in the
+  body, not a header. `send()` handles either shape (`command/reply`'s
+  `Reply-Text` header or `api/response`'s body) uniformly, so callers
+  never need to know which one a given command produces.
 * `text/event-plain` -- an event. Its OWN fields are a second, nested
   `Name: Value` block inside the frame's *body* (parsed by `_parse_kv_block`),
   never in the outer frame's headers.
@@ -70,6 +79,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import AsyncIterator, Callable, Mapping
+from urllib.parse import unquote
 
 from voiceagent.telephony.contracts import TransportError
 from voiceagent.telephony.freeswitch.esl import EslEvent
@@ -130,12 +140,25 @@ async def _read_frame(reader: asyncio.StreamReader) -> _RawFrame | None:
 def _parse_kv_block(text: str) -> dict[str, str]:
     """An event's own fields, one `Name: Value` pair per line -- the exact
     same flat shape `EslEvent` already is, just arriving one level deeper
-    (inside a `text/event-plain` frame's body) than a frame's own headers."""
+    (inside a `text/event-plain` frame's body) than a frame's own headers.
+
+    **Every value is URL-decoded** (found during Phase 2.23's own real-
+    FreeSWITCH validation): `event plain` is FreeSWITCH's own
+    percent-encoded event format -- a real server sends
+    `Caller-Destination-Number: %2B15551234567` for a caller id/destination
+    of `+15551234567`, not the literal `+`. Before this fix, every real
+    E.164 phone number (every one of them starts with `+`) would have
+    reached `voiceagent.calls.routing.resolve_inbound_route()` and
+    `CallSession.from_e164`/`to_e164` corrupted as `%2B...`, breaking
+    inbound routing entirely -- masked until now because
+    `FakeEslConnection`/`FakeTelephonyProvider` never encode anything.
+    `urllib.parse.unquote` is a safe no-op on a value with no `%` escape in
+    it, so this changes nothing for a field that was never encoded."""
     fields: dict[str, str] = {}
     for line in text.splitlines():
         name, sep, value = line.partition(":")
         if sep:
-            fields[name.strip()] = value.strip()
+            fields[name.strip()] = unquote(value.strip())
     return fields
 
 

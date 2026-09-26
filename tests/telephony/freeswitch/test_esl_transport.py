@@ -234,6 +234,43 @@ def test_events_are_delivered_as_flat_string_maps() -> None:
     assert event["Unique-ID"] == "call-1"
 
 
+def test_event_field_values_are_url_decoded() -> None:
+    """Phase 2.23 regression: a real FreeSWITCH server percent-encodes
+    `event plain` field values (`Caller-Destination-Number: %2B15551234567`
+    for `+15551234567`) -- found by validating against a real instance,
+    where every E.164 phone number (every one starts with `+`) arrived
+    corrupted, silently breaking `voiceagent.calls.routing
+    .resolve_inbound_route()`'s exact-match lookup for every real call.
+    `FakeEslConnection`/`FakeTelephonyProvider` never encode anything, so no
+    prior test caught this; `_FakeFreeSwitchServer` here is a real local TCP
+    server exercising the real frame-parsing code path end to end."""
+
+    async def scenario() -> dict[str, str]:
+        server = _FakeFreeSwitchServer()
+        host, port = await server.start()
+        try:
+            connection = await EslTcpConnection.connect(host, port, "secret")
+            try:
+                await server.push_event(
+                    {
+                        "Event-Name": "CHANNEL_PARK",
+                        "Unique-ID": "call-1",
+                        "Caller-Caller-ID-Number": "%2B15550100",
+                        "Caller-Destination-Number": "%2B15551234567",
+                    }
+                )
+                event = await asyncio.wait_for(connection.events().__anext__(), timeout=2.0)
+                return dict(event)
+            finally:
+                await connection.close()
+        finally:
+            await server.close()
+
+    event = asyncio.run(scenario())
+    assert event["Caller-Caller-ID-Number"] == "+15550100"
+    assert event["Caller-Destination-Number"] == "+15551234567"
+
+
 def test_events_and_command_replies_do_not_cross_streams() -> None:
     """A command reply must never be mistaken for an event, and vice versa,
     even when they're interleaved on the wire."""

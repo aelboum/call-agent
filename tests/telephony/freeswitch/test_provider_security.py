@@ -80,7 +80,7 @@ def test_send_dtmf_accepts_valid_digit_strings() -> None:
     esl = FakeEslConnection()
     provider = FreeSwitchTelephonyProvider(esl)
     asyncio.run(provider.send_dtmf("call-1", "123*#w4"))
-    assert esl.commands == ["uuid_send_dtmf call-1 123*#w4"]
+    assert esl.commands == ["api uuid_send_dtmf call-1 123*#w4"]
 
 
 @pytest.mark.parametrize(
