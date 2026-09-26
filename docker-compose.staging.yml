@@ -128,14 +128,22 @@ services:
       VOICEAGENT_RUNTIME_ADDRESS: ${VOICEAGENT_RUNTIME_ADDRESS:-call-runtime:0}
       VOICEAGENT_RUNTIME_SYSTEM_ACTOR_USER_ID: ${VOICEAGENT_RUNTIME_SYSTEM_ACTOR_USER_ID:-}
       VOICEAGENT_RUNTIME_SYSTEM_SERVICE_ACCOUNT_NAME: ${VOICEAGENT_RUNTIME_SYSTEM_SERVICE_ACCOUNT_NAME:-voiceagent-runtime}
-      # FreeSWITCH is genuinely optional here (docs/PHASE-2.19-STAGING-INTEGRATION.md
-      # "Telephony", "Known limitations"): there is still no real TCP ESL
-      # transport in this repository, so leaving these unset is honest, not
-      # a shortcut. Fill them in only once a real transport exists.
+      # FreeSWITCH is genuinely optional here (docs/PHASE-2.21-FREESWITCH
+      # -TELEPHONY-INTEGRATION.md "Known limitations"): leave
+      # VOICEAGENT_FREESWITCH_ESL_HOST unset if this deployment has no
+      # FreeSWITCH box yet -- validate_deployment_readiness() only requires
+      # the rest of this block once it is set.
       VOICEAGENT_FREESWITCH_ESL_HOST: ${VOICEAGENT_FREESWITCH_ESL_HOST:-}
       VOICEAGENT_FREESWITCH_ESL_PORT: ${VOICEAGENT_FREESWITCH_ESL_PORT:-8021}
       VOICEAGENT_FREESWITCH_COMMAND_TIMEOUT_SECONDS: ${VOICEAGENT_FREESWITCH_COMMAND_TIMEOUT_SECONDS:-10}
       VOICEAGENT_FREESWITCH_MEDIA_PUBLIC_URL: ${VOICEAGENT_FREESWITCH_MEDIA_PUBLIC_URL:-}
+      VOICEAGENT_FREESWITCH_MEDIA_LISTEN_HOST: ${VOICEAGENT_FREESWITCH_MEDIA_LISTEN_HOST:-0.0.0.0}
+      VOICEAGENT_FREESWITCH_MEDIA_LISTEN_PORT: ${VOICEAGENT_FREESWITCH_MEDIA_LISTEN_PORT:-8100}
+      # Real secrets, read through infra.secrets by voiceagent.telephony
+      # .freeswitch.esl_transport/.media_transport -- only required once
+      # VOICEAGENT_FREESWITCH_ESL_HOST is actually set.
+      FREESWITCH_ESL_PASSWORD: ${FREESWITCH_ESL_PASSWORD:-}
+      FREESWITCH_MEDIA_TICKET_SECRET: ${FREESWITCH_MEDIA_TICKET_SECRET:-}
       VOICEAGENT_AI_ELIGIBLE_PROVIDERS: ${VOICEAGENT_AI_ELIGIBLE_PROVIDERS:?set to real provider(s), e.g. openai}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
@@ -147,6 +155,12 @@ services:
       OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:?set OIDC_REDIRECT_URI in .env.staging}
       ZITADEL_ISSUER_URL: ${ZITADEL_ISSUER_URL:?set ZITADEL_ISSUER_URL in .env.staging}
       ZITADEL_CLIENT_ID: ${ZITADEL_CLIENT_ID:?set ZITADEL_CLIENT_ID in .env.staging}
+    # Only meaningful once VOICEAGENT_FREESWITCH_ESL_HOST is set -- the port
+    # FreeSWITCH's mod_audio_stream connects to (fronted, in a real
+    # deployment, by whatever reverse proxy/load balancer terminates the
+    # public wss:// origin named in VOICEAGENT_FREESWITCH_MEDIA_PUBLIC_URL).
+    ports:
+      - "8100:8100"
     stop_grace_period: 30s
 
   follow-up-worker:

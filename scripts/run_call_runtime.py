@@ -12,22 +12,23 @@ real `CallRuntime` to a real Redis-backed heartbeat store
 reads from) and gives it bounded, signal-driven startup and shutdown.
 
 **What this does NOT close, and does not attempt to**: this process has no
-call to run until something calls `runtime.start_call()`. That call is
-supposed to come from consuming a real FreeSWITCH ESL event stream
-(`voiceagent.telephony.freeswitch.esl.EslConnection`), and that protocol has
-only ever had a `Protocol` definition and a test fake
-(`voiceagent.telephony.freeswitch.fakes.FakeEslConnection`) -- no real TCP
-transport to `mod_event_socket` exists anywhere in this repository
-(`esl.py`'s own module docstring: "an actual TCP connection ... is a real
-implementation's own concern and is explicitly out of this phase's scope").
-Building that transport now would be adding a telephony provider, which
-Phase 2.18's own brief explicitly forbids. This process is therefore
-deployable, observable (it heartbeats, and deregisters cleanly on shutdown,
-exactly like every other `CallRuntime` instance `voiceagent.runtime
-.reconciliation` already knows how to reason about) and correctly wired --
-but it will carry zero real calls until a future phase adds the real ESL
-transport and calls `runtime.start_call()` from its own event loop. This is
-stated here, once, rather than left implicit.
+call to run until something calls `runtime.start_call()`. Phase 2.21 built
+the real FreeSWITCH transport (`voiceagent.telephony.freeswitch
+.esl_transport.ManagedEslConnection`, `.media_transport
+.FreeSwitchMediaListener`) and this script starts it -- real ESL
+authentication, real event subscription, a real `wss://` media listener --
+whenever `VOICEAGENT_FREESWITCH_ESL_HOST` is configured. What still does
+not exist anywhere in this repository is the "Call Orchestrator"
+(`voiceagent/runtime/errors.py`'s own long-standing comment names it):
+inbound-call tenant/DID resolution, outbound-call origination requests, and
+`CallSession` creation are a separate, larger feature this phase
+deliberately does not build (see
+`docs/PHASE-2.21-FREESWITCH-TELEPHONY-INTEGRATION.md`'s "Known
+limitations"). This process is therefore deployable, observable, and -- once
+FreeSWITCH is configured -- genuinely connected to it (heartbeats,
+authenticates, subscribes to events, accepts media connections, reconnects
+on disconnect), but it will carry zero real calls until that future
+orchestrator exists and calls `runtime.start_call()`.
 
 Usage::
 
@@ -41,29 +42,101 @@ defaults to the local hostname). `VOICEAGENT_RUNTIME_MAX_CONCURRENT_CALLS`,
 `VOICEAGENT_RUNTIME_HEARTBEAT_INTERVAL_SECONDS` and
 `VOICEAGENT_RUNTIME_HEARTBEAT_TTL_SECONDS` (already read by
 `voiceagent.config.settings_from_env()`) tune capacity and heartbeat timing.
+`VOICEAGENT_FREESWITCH_ESL_HOST` (plus `_ESL_PORT`, `_MEDIA_LISTEN_HOST`,
+`_MEDIA_LISTEN_PORT`) and the `FREESWITCH_ESL_PASSWORD`/
+`FREESWITCH_MEDIA_TICKET_SECRET` secrets (`infra.secrets`, never `Settings`)
+enable the real telephony transport; leaving `_ESL_HOST` unset keeps this
+process exactly as it was before Phase 2.21 (heartbeat only).
 
-Shutdown: SIGTERM or SIGINT stops accepting new work conceptually (there is
-none to stop accepting yet) and calls `CallRuntime.shutdown()`, which
-cancels every owned call concurrently (bounded per-call) and deregisters
-this instance's heartbeat before the process exits -- a clean stop is never
-mistaken for a crash by the reconciler.
+Shutdown: SIGTERM or SIGINT calls `CallRuntime.shutdown()` (cancels every
+owned call concurrently, bounded per-call), closes the FreeSWITCH transport
+if it was started (`ManagedEslConnection.close()`, the media listener), and
+deregisters this instance's heartbeat before the process exits -- a clean
+stop is never mistaken for a crash by the reconciler.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import signal
 import socket
 
 from infra.jobs.config import get_jobs_config
+from infra.secrets import get_secrets_provider
 
-from voiceagent.config import settings_from_env, validate_deployment_readiness
+from voiceagent.config import Settings, settings_from_env, validate_deployment_readiness
 from voiceagent.runtime.heartbeat import RedisHeartbeatStore, new_instance_id
 from voiceagent.runtime.supervisor import CallRuntime
+from voiceagent.runtime.telephony_events import TelephonyEventRouter
+from voiceagent.telephony.freeswitch.esl_transport import ManagedEslConnection
+from voiceagent.telephony.freeswitch.media import FreeSwitchMediaProvider
+from voiceagent.telephony.freeswitch.media_transport import (
+    FreeSwitchMediaListener,
+    serve_freeswitch_media,
+)
+from voiceagent.telephony.freeswitch.provider import FreeSwitchTelephonyProvider
 
 _logger = logging.getLogger("voiceagent.scripts.run_call_runtime")
+
+
+class _FreeSwitchTransport:
+    """Everything Phase 2.21's real FreeSWITCH transport needs started and
+    stopped together -- constructed only when `settings.freeswitch
+    .is_configured`. Not itself wired into any `CallTaskDependencies`: no
+    Call Orchestrator exists yet to create the calls that would need one
+    (this module's own docstring)."""
+
+    def __init__(self, settings: Settings) -> None:
+        self.esl = ManagedEslConnection(
+            host=settings.freeswitch.esl_host,  # type: ignore[arg-type] -- only constructed when set.
+            port=settings.freeswitch.esl_port,
+            password_provider=lambda: get_secrets_provider().get_required(
+                "FREESWITCH_ESL_PASSWORD"
+            ),
+        )
+        self.telephony = FreeSwitchTelephonyProvider(
+            self.esl, command_timeout_seconds=settings.freeswitch.command_timeout_seconds
+        )
+        self.media = FreeSwitchMediaProvider()
+        self.media_listener = FreeSwitchMediaListener(
+            self.media,
+            ticket_secret=get_secrets_provider().get_required("FREESWITCH_MEDIA_TICKET_SECRET"),
+        )
+        self.events = TelephonyEventRouter(self.telephony)
+        self._listen_host = settings.freeswitch.media_listen_host
+        self._listen_port = settings.freeswitch.media_listen_port
+        self._media_server = None
+        self._events_task: asyncio.Task[None] | None = None
+
+    async def start(self) -> None:
+        # Bounded, single attempt (brief section 5: "bounded connection
+        # establishment") -- a failure here is a real deployment problem
+        # (FreeSWITCH unreachable, wrong credentials) and this process
+        # fails closed rather than starting half-connected; `ManagedEslConnection`
+        # itself reconnects with backoff for every disconnect *after* this
+        # first success.
+        await self.esl.start()
+        self._media_server = await serve_freeswitch_media(
+            self.media_listener, host=self._listen_host, port=self._listen_port
+        )
+        self._events_task = asyncio.create_task(self.events.run())
+        _logger.info(
+            "call_runtime.freeswitch_transport.started",
+            extra={"media_listen_host": self._listen_host, "media_listen_port": self._listen_port},
+        )
+
+    async def stop(self) -> None:
+        if self._events_task is not None:
+            self._events_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._events_task
+        if self._media_server is not None:
+            self._media_server.close()
+            await self._media_server.wait_closed()
+        await self.esl.close()
 
 
 async def _run() -> None:
@@ -83,12 +156,20 @@ async def _run() -> None:
         interval_seconds=settings.runtime.heartbeat_interval_seconds,
         ttl_seconds=settings.runtime.heartbeat_ttl_seconds,
     )
+
+    freeswitch_transport = (
+        _FreeSwitchTransport(settings) if settings.freeswitch.is_configured else None
+    )
+    if freeswitch_transport is not None:
+        await freeswitch_transport.start()
+
     _logger.info(
         "call_runtime.started",
         extra={
             "instance_id": runtime.instance_id,
             "address": address,
             "capacity": runtime.capacity,
+            "freeswitch_configured": freeswitch_transport is not None,
         },
     )
 
@@ -104,6 +185,8 @@ async def _run() -> None:
     await stop_event.wait()
     _logger.info("call_runtime.shutdown.begin", extra={"instance_id": runtime.instance_id})
     await runtime.shutdown()
+    if freeswitch_transport is not None:
+        await freeswitch_transport.stop()
     await heartbeat_store.close()
     _logger.info("call_runtime.shutdown.complete", extra={"instance_id": runtime.instance_id})
 

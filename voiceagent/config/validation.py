@@ -70,6 +70,7 @@ def validate_deployment_readiness(settings: Settings) -> None:
 
     _validate_ai_provider_selection(settings)
     _validate_telephony_consistency(settings)
+    _validate_telephony_secrets_present(settings)
     _validate_provider_secrets_present(settings)
     _validate_oidc_configured(settings)
 
@@ -96,11 +97,11 @@ def _validate_ai_provider_selection(settings: Settings) -> None:
 
 def _validate_telephony_consistency(settings: Settings) -> None:
     """Section 7/9: FreeSWITCH is optional (most staging deployments will not
-    yet have a live one -- there is still no real ESL transport in this
-    repository, see `voiceagent/telephony/freeswitch/esl.py`). But a
-    deployment that *has* pointed this product at one must also give it a
-    reachable, non-plaintext public media URL -- half-configured telephony
-    is worse than none."""
+    yet have a live one). But a deployment that *has* pointed this product
+    at one (`VOICEAGENT_FREESWITCH_ESL_HOST` set -- Phase 2.21's real ESL/
+    media transport, `voiceagent.telephony.freeswitch.esl_transport
+    /.media_transport`) must also give it a reachable, non-plaintext public
+    media URL -- half-configured telephony is worse than none."""
     freeswitch = settings.freeswitch
     if not freeswitch.is_configured:
         return
@@ -115,6 +116,31 @@ def _validate_telephony_consistency(settings: Settings) -> None:
             "VOICEAGENT_FREESWITCH_MEDIA_PUBLIC_URL must be an https:// or wss:// URL "
             f"in staging/production, got: {freeswitch.media_public_url!r}"
         )
+
+
+def _validate_telephony_secrets_present(settings: Settings) -> None:
+    """Phase 2.21: the two real secrets a live FreeSWITCH integration needs
+    -- `FREESWITCH_ESL_PASSWORD` (`voiceagent.telephony.freeswitch
+    .esl_transport.ManagedEslConnection`'s `password_provider`) and
+    `FREESWITCH_MEDIA_TICKET_SECRET` (`voiceagent.telephony.freeswitch
+    .media_transport.mint_media_ticket()`/`verify_media_ticket()`) -- are
+    never `Settings` fields (Phase 2.19's own established rule: a
+    deployment-level secret is read through `infra.secrets`, never carried
+    on a settings dataclass) and so cannot be checked by
+    `Settings.__post_init__`. Checked here, by presence only, for the
+    identical reason every AI-provider secret already is."""
+    if not settings.freeswitch.is_configured:
+        return
+    from infra.secrets import get_secrets_provider
+
+    provider = get_secrets_provider()
+    for secret_name in ("FREESWITCH_ESL_PASSWORD", "FREESWITCH_MEDIA_TICKET_SECRET"):
+        if not provider.get(secret_name):
+            raise ConfigurationError(
+                f"{secret_name} is required when VOICEAGENT_FREESWITCH_ESL_HOST is set "
+                f"(VOICEAGENT_DEPLOYMENT_STAGE={settings.deployment_stage!r}) but is not "
+                "configured in this deployment's secret store."
+            )
 
 
 def _validate_provider_secrets_present(settings: Settings) -> None:

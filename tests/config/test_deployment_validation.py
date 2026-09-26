@@ -164,11 +164,40 @@ def test_freeswitch_with_insecure_media_public_url_is_rejected(monkeypatch) -> N
 
 def test_freeswitch_with_secure_media_public_url_passes(monkeypatch) -> None:
     _set_ready_environment(monkeypatch)
+    monkeypatch.setenv("FREESWITCH_ESL_PASSWORD", "esl-secret")
+    monkeypatch.setenv("FREESWITCH_MEDIA_TICKET_SECRET", "ticket-secret")
     validate_deployment_readiness(
         _ready_settings_with_freeswitch(
             FreeSwitchSettings(esl_host="fs.internal", media_public_url="wss://fs.example.test")
         )
     )
+
+
+def test_freeswitch_without_esl_password_is_rejected(monkeypatch) -> None:
+    """Phase 2.21: a live FreeSWITCH integration needs the ESL password
+    secret -- checked here (not `Settings`) because it is a secret, never a
+    `Settings` field (Phase 2.19's own rule, unchanged)."""
+    _set_ready_environment(monkeypatch)
+    monkeypatch.setenv("FREESWITCH_MEDIA_TICKET_SECRET", "ticket-secret")
+    monkeypatch.delenv("FREESWITCH_ESL_PASSWORD", raising=False)
+    with pytest.raises(ConfigurationError, match="FREESWITCH_ESL_PASSWORD"):
+        validate_deployment_readiness(
+            _ready_settings_with_freeswitch(
+                FreeSwitchSettings(esl_host="fs.internal", media_public_url="wss://fs.example.test")
+            )
+        )
+
+
+def test_freeswitch_without_media_ticket_secret_is_rejected(monkeypatch) -> None:
+    _set_ready_environment(monkeypatch)
+    monkeypatch.setenv("FREESWITCH_ESL_PASSWORD", "esl-secret")
+    monkeypatch.delenv("FREESWITCH_MEDIA_TICKET_SECRET", raising=False)
+    with pytest.raises(ConfigurationError, match="FREESWITCH_MEDIA_TICKET_SECRET"):
+        validate_deployment_readiness(
+            _ready_settings_with_freeswitch(
+                FreeSwitchSettings(esl_host="fs.internal", media_public_url="wss://fs.example.test")
+            )
+        )
 
 
 def _ready_settings_with_freeswitch(freeswitch: FreeSwitchSettings) -> Settings:

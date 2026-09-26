@@ -14,6 +14,7 @@ from voiceagent.telephony.contracts import (
     CallEvent,
     CallEventType,
     HangupCause,
+    OriginateRequest,
     TransportError,
 )
 from voiceagent.telephony.freeswitch.esl import EslConnection
@@ -142,3 +143,66 @@ def test_events_are_normalized_and_unmapped_events_are_dropped() -> None:
     assert events[0].to_number == "+15550199"
     assert events[1].type is CallEventType.HUNGUP
     assert events[1].hangup_cause is HangupCause.BUSY
+
+
+def test_originate_mints_its_own_call_ref_and_never_parses_the_esl_reply() -> None:
+    """Phase 2.21: the product mints `origination_uuid` itself and stamps it
+    into the dial string -- `bgapi`'s own immediate reply (a Job-UUID, not a
+    channel UUID) is only ever consulted for its `-ERR`/non-`-ERR` prefix by
+    `_command()`, never parsed for a correlation id."""
+    esl = FakeEslConnection()
+    esl.responses[
+        "bgapi originate {origination_uuid=call-abc,origination_caller_id_number=+15557654321}"  # noqa: E501
+        "sofia/gateway/default/+15551234567"
+    ] = "+OK Job-UUID: some-unrelated-job-id"
+    provider = FreeSwitchTelephonyProvider(esl, uuid_factory=lambda: "call-abc")
+
+    call_ref = asyncio.run(
+        provider.originate(OriginateRequest(to_number="+15551234567", from_number="+15557654321"))
+    )
+
+    assert call_ref == "call-abc"
+
+
+def test_originate_raises_on_a_rejected_dial_attempt() -> None:
+    esl = FakeEslConnection()
+    esl.responses[
+        "bgapi originate {origination_uuid=call-abc,origination_caller_id_number=+15557654321}"  # noqa: E501
+        "sofia/gateway/default/+15551234567"
+    ] = "-ERR NORMAL_TEMPORARY_FAILURE"
+    provider = FreeSwitchTelephonyProvider(esl, uuid_factory=lambda: "call-abc")
+
+    with pytest.raises(TransportError):
+        asyncio.run(
+            provider.originate(
+                OriginateRequest(to_number="+15551234567", from_number="+15557654321")
+            )
+        )
+
+
+def test_transfer_mints_a_new_call_ref_for_the_second_leg() -> None:
+    esl = FakeEslConnection()
+    provider = FreeSwitchTelephonyProvider(esl, uuid_factory=lambda: "leg-2")
+
+    new_call_ref = asyncio.run(provider.transfer("call-1", "+15551234567"))
+
+    assert new_call_ref == "leg-2"
+    assert esl.commands == [
+        "bgapi originate {origination_uuid=leg-2}sofia/gateway/default/+15551234567"
+    ]
+
+
+def test_start_media_stream_issues_the_expected_esl_command() -> None:
+    esl = FakeEslConnection()
+    provider = FreeSwitchTelephonyProvider(esl)
+    asyncio.run(provider.start_media_stream("call-1", "wss://runtime.example.test/media/ticket-1"))
+    assert esl.commands == [
+        "uuid_audio_stream call-1 start wss://runtime.example.test/media/ticket-1 mono 8k"
+    ]
+
+
+def test_stop_media_stream_issues_the_expected_esl_command() -> None:
+    esl = FakeEslConnection()
+    provider = FreeSwitchTelephonyProvider(esl)
+    asyncio.run(provider.stop_media_stream("call-1"))
+    assert esl.commands == ["uuid_audio_stream call-1 stop"]

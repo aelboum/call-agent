@@ -18,12 +18,14 @@ from voiceagent.telephony.freeswitch.provider import FreeSwitchTelephonyProvider
 
 def test_originate_accepts_valid_e164_numbers() -> None:
     esl = FakeEslConnection()
-    provider = FreeSwitchTelephonyProvider(esl)
-    asyncio.run(
+    provider = FreeSwitchTelephonyProvider(esl, uuid_factory=lambda: "fixed-uuid")
+    call_ref = asyncio.run(
         provider.originate(OriginateRequest(to_number="+15551234567", from_number="+15557654321"))
     )
+    assert call_ref == "fixed-uuid"
     assert esl.commands == [
-        "bgapi originate {origination_caller_id_number=+15557654321}sofia/gateway/default/+15551234567"  # noqa: E501
+        "bgapi originate {origination_uuid=fixed-uuid,"
+        "origination_caller_id_number=+15557654321}sofia/gateway/default/+15551234567"
     ]
 
 
@@ -60,6 +62,17 @@ def test_originate_rejects_a_malformed_from_number() -> None:
                 OriginateRequest(to_number="+15551234567", from_number="+1555} bgapi reload {")
             )
         )
+    assert esl.commands == []
+
+
+def test_transfer_rejects_a_malformed_destination_before_touching_the_esl_connection() -> None:
+    """Phase 2.21: `transfer()` gained the identical E.164 defense-in-depth
+    `originate()` already had -- it builds an ESL command string from
+    `destination` too."""
+    esl = FakeEslConnection()
+    provider = FreeSwitchTelephonyProvider(esl)
+    with pytest.raises(TransportError):
+        asyncio.run(provider.transfer("call-1", "+1555} bgapi reload {"))
     assert esl.commands == []
 
 

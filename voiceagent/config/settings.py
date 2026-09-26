@@ -82,22 +82,29 @@ class ObjectStorageSettings:
 class FreeSwitchSettings:
     """Telephony core endpoint configuration (ADR-0002).
 
-    Phase 1 carries configuration only: nothing connects to FreeSWITCH, and
-    no ESL client exists. There is deliberately no ESL password field -- that
-    is a secret, read through `infra.secrets` by the adapter in Phase 2.
+    Phase 2.21 built the real ESL TCP transport and `wss://` media listener
+    (`voiceagent.telephony.freeswitch.esl_transport`/`.media_transport`).
+    There is still deliberately no ESL password or media-ticket-signing
+    field here -- both are secrets, read through `infra.secrets` by those
+    two modules directly, never carried on this dataclass (Phase 0 report
+    section 2.4 G-3, the same rule every AI vendor API key already follows).
     """
 
     esl_host: str | None = None
     esl_port: int = 8021
     media_public_url: str | None = None
     #: Bound on every ESL command (`FreeSwitchTelephonyProvider._command()`),
-    #: mirroring that class's own constructor default (Phase 2.19). No ESL
-    #: password field exists here, deliberately: there is still no real TCP
-    #: transport to `mod_event_socket` in this repository (`esl.py`'s own
-    #: module docstring), and an ESL credential is a secret in any case --
-    #: read through `infra.secrets` by a future real transport, never by
-    #: this module.
+    #: mirroring that class's own constructor default.
     command_timeout_seconds: float = 10.0
+    #: Phase 2.21: the interface/port `voiceagent.telephony.freeswitch
+    #: .media_transport.serve_freeswitch_media()` itself binds to -- distinct
+    #: from `media_public_url`, which is the externally-reachable origin a
+    #: reverse proxy/load balancer fronts this listener with (they are
+    #: rarely the same value: this process typically binds `0.0.0.0` on a
+    #: private port, while `media_public_url` names the public `wss://`
+    #: hostname FreeSWITCH itself is told to connect to).
+    media_listen_host: str = "0.0.0.0"  # noqa: S104 -- container-internal bind, matches HOST's own default.
+    media_listen_port: int = 8100
 
     @property
     def is_configured(self) -> bool:
@@ -450,6 +457,14 @@ def settings_from_env(platform: PlatformSettings | None = None) -> Settings:
                 if (raw := os.environ.get("VOICEAGENT_FREESWITCH_COMMAND_TIMEOUT_SECONDS"))
                 is not None
                 else freeswitch_defaults.command_timeout_seconds
+            ),
+            media_listen_host=os.environ.get(
+                "VOICEAGENT_FREESWITCH_MEDIA_LISTEN_HOST", freeswitch_defaults.media_listen_host
+            ),
+            media_listen_port=(
+                _parse_port("VOICEAGENT_FREESWITCH_MEDIA_LISTEN_PORT", raw)
+                if (raw := os.environ.get("VOICEAGENT_FREESWITCH_MEDIA_LISTEN_PORT")) is not None
+                else freeswitch_defaults.media_listen_port
             ),
         ),
         ai_providers=AiProviderSettings(

@@ -35,7 +35,8 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from collections.abc import AsyncIterator
+import uuid as uuid_module
+from collections.abc import AsyncIterator, Callable
 
 from voiceagent.metrics import record_provider_operation
 from voiceagent.telephony.contracts import (
@@ -153,9 +154,22 @@ class FreeSwitchTelephonyProvider:
     FreeSWITCH-specific code path any command or event in this product ever
     passes through."""
 
-    def __init__(self, esl: EslConnection, *, command_timeout_seconds: float = 10.0) -> None:
+    def __init__(
+        self,
+        esl: EslConnection,
+        *,
+        command_timeout_seconds: float = 10.0,
+        uuid_factory: Callable[[], str] = lambda: str(uuid_module.uuid4()),
+    ) -> None:
         self._esl = esl
         self._command_timeout_seconds = command_timeout_seconds
+        # Phase 2.21: the *product* mints the correlation id for a new call
+        # leg, never FreeSWITCH (`docs/PHASE-0-ARCHITECTURE.md` §10.5's
+        # documented design: "a product-generated `origination_uuid`,
+        # stamped as a channel variable" -- see `originate()`/`transfer()`
+        # below for why). Injectable so a test can assert an exact,
+        # deterministic ESL command string.
+        self._uuid_factory = uuid_factory
 
     async def _command(self, command: str, *, operation: str) -> str:
         """`operation` is one of this class's own ten bounded ESL verb names
@@ -179,15 +193,28 @@ class FreeSwitchTelephonyProvider:
         return response
 
     async def originate(self, request: OriginateRequest) -> CallRef:
+        """Phase 2.21 correction: `bgapi originate`'s own immediate reply is
+        a Job-UUID (the background job that *attempts* the origination), not
+        the resulting channel's UUID -- treating it as `CallRef` (the
+        pre-Phase-2.21 behavior) was never verified against a live server
+        and does not match documented ESL semantics. This method instead
+        mints the `CallRef` itself and stamps it into the dial string as
+        `origination_uuid`, which forces FreeSWITCH to use exactly that
+        value as the new channel's own `Unique-ID` -- so every later event
+        for this call (`ANSWER`, `HANGUP`, ...) already carries the same
+        `call_ref` this method returns, with no reply-parsing and no
+        dependency on `BACKGROUND_JOB` correlation at all."""
         _require_e164(request.from_number, field="from_number")
         _require_e164(request.to_number, field="to_number")
-        response = await self._command(
+        call_ref = self._uuid_factory()
+        await self._command(
             f"bgapi originate "
-            f"{{origination_caller_id_number={request.from_number}}}"
+            f"{{origination_uuid={call_ref},"
+            f"origination_caller_id_number={request.from_number}}}"
             f"sofia/gateway/default/{request.to_number}",
             operation="originate",
         )
-        return response.strip()
+        return call_ref
 
     async def answer(self, call_ref: CallRef) -> None:
         await self._command(f"uuid_answer {call_ref}", operation="answer")
@@ -201,10 +228,16 @@ class FreeSwitchTelephonyProvider:
         await self._command(f"uuid_bridge {call_ref} {other_call_ref}", operation="bridge")
 
     async def transfer(self, call_ref: CallRef, destination: str) -> CallRef:
-        response = await self._command(
-            f"bgapi originate sofia/gateway/default/{destination}", operation="transfer"
+        """Same correction as `originate()`: the new leg's `CallRef` is
+        minted here, not parsed from FreeSWITCH's job-dispatch reply."""
+        _require_e164(destination, field="destination")
+        new_call_ref = self._uuid_factory()
+        await self._command(
+            f"bgapi originate {{origination_uuid={new_call_ref}}}"
+            f"sofia/gateway/default/{destination}",
+            operation="transfer",
         )
-        return response.strip()
+        return new_call_ref
 
     async def hold(self, call_ref: CallRef) -> None:
         await self._command(f"uuid_hold {call_ref}", operation="hold")
@@ -221,6 +254,27 @@ class FreeSwitchTelephonyProvider:
 
     async def stop_recording(self, call_ref: CallRef) -> None:
         await self._command(f"uuid_record {call_ref} stop /dev/null", operation="stop_recording")
+
+    async def start_media_stream(self, call_ref: CallRef, media_url: str) -> None:
+        """Command FreeSWITCH's `mod_audio_stream` to open the product's own
+        `wss://` media listener for this call leg (`uuid_audio_stream <uuid>
+        start <url> mono 8k`, PSTN default per `voiceagent.telephony
+        .contracts.AudioFormat`'s own default). Deliberately **not** part of
+        `voiceagent.telephony.contracts.TelephonyProvider`: which command
+        starts media (if any -- a different vendor's mechanism could differ
+        completely) is FreeSWITCH-specific, not something the vendor-neutral
+        contract should assume. The caller (an inbound/outbound call
+        orchestrator, not yet built -- see this module's own docs) is
+        responsible for minting `media_url`'s one-call short-lived ticket
+        (`voiceagent.telephony.freeswitch.media_transport
+        .mint_media_ticket()`) before calling this."""
+        await self._command(
+            f"uuid_audio_stream {call_ref} start {media_url} mono 8k",
+            operation="start_media_stream",
+        )
+
+    async def stop_media_stream(self, call_ref: CallRef) -> None:
+        await self._command(f"uuid_audio_stream {call_ref} stop", operation="stop_media_stream")
 
     async def events(self) -> AsyncIterator[CallEvent]:
         async for raw in self._esl.events():

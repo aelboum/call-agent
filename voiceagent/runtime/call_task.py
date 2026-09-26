@@ -99,7 +99,8 @@ from voiceagent.runtime.conversation_persistence import ConversationPersistence,
 from voiceagent.runtime.db import DatabaseBoundary
 from voiceagent.runtime.errors import DataAuthorizationDeniedError
 from voiceagent.runtime.privacy import AiDataPolicySource, authorize_call_data_access
-from voiceagent.telephony.contracts import CallRef, MediaProvider, TelephonyProvider
+from voiceagent.runtime.telephony_events import TelephonyEventRouter
+from voiceagent.telephony.contracts import CallEventType, CallRef, MediaProvider, TelephonyProvider
 from voiceagent.tenancy import TenantContext
 from voiceagent.tools.gateway import ToolGateway
 from voiceagent.tools.registry import TOOL_REGISTRY, ToolRegistry
@@ -178,6 +179,17 @@ class CallTaskDependencies:
     #: call's teardown at all (each call is its own `asyncio.Task`).
     engine_close_timeout_seconds: float = 5.0
     media_detach_timeout_seconds: float = 5.0
+    #: Phase 2.21: when set, `run_call_task()` subscribes to this call's own
+    #: `call_ref` and stops the audio pump as soon as a real remote `HUNGUP`
+    #: event arrives, finalizing the `CallSession` as `completed` -- the
+    #: first real (non-synthetic) lifecycle-event consumption this product
+    #: has (see this module's own docstring for what remains a documented,
+    #: deliberate stand-in). `None` -- the default -- preserves every
+    #: pre-Phase-2.21 caller's exact existing behavior unchanged (no
+    #: existing test constructs one): the pump then only ever stops when the
+    #: media stream/engine session end on their own, or the task is
+    #: cancelled from outside, exactly as before.
+    telephony_events: TelephonyEventRouter | None = None
 
 
 def _engine_provider_name(agent_version: AgentVersion) -> str:
@@ -363,6 +375,72 @@ async def _run_pumps(
         await asyncio.gather(*pending, return_exceptions=True)
 
 
+async def _run_pumps_with_remote_hangup_detection(
+    call_session_id: uuid.UUID,
+    media_stream,
+    engine_session,
+    dispatch_tool_call: ToolDispatch,
+    persist_turn: ConversationPersist | None,
+    *,
+    telephony_events: TelephonyEventRouter | None,
+    call_ref: CallRef,
+    cancellation: CancellationSignal,
+) -> None:
+    """Phase 2.21: real remote-hangup detection, layered on top of
+    `_run_pumps()` without changing it. When `telephony_events` is `None`
+    (every pre-Phase-2.21 caller, and every existing test), this is exactly
+    `await _run_pumps(...)` -- zero behavior change.
+
+    When it is set, a second task races `_run_pumps()`: it subscribes to
+    this call's own `call_ref` and, on the first `CallEventType.HUNGUP`
+    event, sets `cancellation.reason = "hangup"` (the exact field/value
+    `CancellationSignal`'s own docstring already documents the *supervisor*
+    setting before an externally-initiated cancellation -- reused here
+    verbatim so `run_call_task()`'s own `finally` block's `_final_status()`
+    call needs no new case) and cancels the pump task directly. Distinguishing
+    "we stopped it on purpose" from "someone else cancelled `run_call_task`
+    itself" (`hangup_triggered`, below) matters because outer cancellation
+    must still propagate exactly as it always has -- this function must
+    never accidentally swallow it."""
+    if telephony_events is None:
+        await _run_pumps(
+            call_session_id, media_stream, engine_session, dispatch_tool_call, persist_turn
+        )
+        return
+
+    event_queue = telephony_events.subscribe(call_ref)
+    try:
+        pumps_task = asyncio.create_task(
+            _run_pumps(
+                call_session_id, media_stream, engine_session, dispatch_tool_call, persist_turn
+            )
+        )
+        hangup_triggered = False
+
+        async def _watch_for_remote_hangup() -> None:
+            nonlocal hangup_triggered
+            while True:
+                event = await event_queue.get()
+                if event.type is CallEventType.HUNGUP:
+                    hangup_triggered = True
+                    cancellation.reason = "hangup"
+                    pumps_task.cancel()
+                    return
+
+        hangup_watch_task = asyncio.create_task(_watch_for_remote_hangup())
+        try:
+            await pumps_task
+        except asyncio.CancelledError:
+            if not hangup_triggered:
+                raise
+        finally:
+            hangup_watch_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await hangup_watch_task
+    finally:
+        telephony_events.unsubscribe(call_ref)
+
+
 async def run_call_task(
     *,
     context: TenantContext,
@@ -464,8 +542,12 @@ async def run_call_task(
             # initiated -> answered -> in_progress
             # (voiceagent.calls.lifecycle's own transition table has no
             # initiated -> in_progress edge; media attachment/engine start
-            # is this phase's stand-in for "answered", since no real
-            # FreeSWITCH ANSWERED event is wired up yet).
+            # is still this phase's stand-in for "answered" -- Phase 2.21
+            # wires up real *remote hangup* detection below, but gating
+            # this pair of transitions on a real FreeSWITCH ANSWERED event
+            # is a separate, larger change deferred to a later phase; see
+            # docs/PHASE-2.21-FREESWITCH-TELEPHONY-INTEGRATION.md's "Known
+            # limitations").
             await deps.db.run(
                 transition_call_session,
                 context,
@@ -481,8 +563,15 @@ async def run_call_task(
                 expected_runtime_instance_id=deps.runtime_instance_id,
             )
 
-            await _run_pumps(
-                call_session_id, media_stream, engine_session, _dispatch_tool_call, _persist_turn
+            await _run_pumps_with_remote_hangup_detection(
+                call_session_id,
+                media_stream,
+                engine_session,
+                _dispatch_tool_call,
+                _persist_turn,
+                telephony_events=deps.telephony_events,
+                call_ref=call_ref,
+                cancellation=cancellation,
             )
         finally:
             teardown_started_monotonic = time.monotonic()

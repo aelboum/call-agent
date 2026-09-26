@@ -222,6 +222,25 @@ def test_call_intelligence_endpoint_defaults_to_none(settings: Settings) -> None
     assert settings.call_intelligence.endpoint is None
 
 
+def test_freeswitch_media_listen_defaults(settings: Settings) -> None:
+    assert settings.freeswitch.media_listen_host == "0.0.0.0"  # noqa: S104
+    assert settings.freeswitch.media_listen_port == 8100
+
+
+def test_freeswitch_media_listen_parses_from_env(monkeypatch) -> None:
+    monkeypatch.setenv("VOICEAGENT_FREESWITCH_MEDIA_LISTEN_HOST", "127.0.0.1")
+    monkeypatch.setenv("VOICEAGENT_FREESWITCH_MEDIA_LISTEN_PORT", "9100")
+    freeswitch = settings_from_env(_platform()).freeswitch
+    assert freeswitch.media_listen_host == "127.0.0.1"
+    assert freeswitch.media_listen_port == 9100
+
+
+def test_invalid_freeswitch_media_listen_port_is_rejected(monkeypatch) -> None:
+    monkeypatch.setenv("VOICEAGENT_FREESWITCH_MEDIA_LISTEN_PORT", "not-a-port")
+    with pytest.raises(ConfigurationError):
+        settings_from_env(_platform())
+
+
 def test_call_intelligence_endpoint_parses_from_env(monkeypatch) -> None:
     monkeypatch.setenv("VOICEAGENT_CALL_INTELLIGENCE_ENDPOINT", "https://proxy.internal/v1")
     assert settings_from_env(_platform()).call_intelligence.endpoint == "https://proxy.internal/v1"
