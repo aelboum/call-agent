@@ -82,6 +82,31 @@ def test_fake_call_intelligence_provider_is_rejected() -> None:
         )
 
 
+def test_missing_openai_secret_is_rejected(monkeypatch) -> None:
+    """Phase 2.20: OpenAI is a real, selectable provider now -- staging
+    must fail closed on it exactly like every other real vendor."""
+    _set_ready_environment(monkeypatch)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    with pytest.raises(ConfigurationError, match="OPENAI_API_KEY"):
+        validate_deployment_readiness(
+            _staging(
+                ai_providers=AiProviderSettings(eligible_providers=("openai",)),
+                call_intelligence=CallIntelligenceSettings(provider="groq", model="llama-3.3-70b"),
+            )
+        )
+
+
+def test_openai_is_accepted_once_its_secret_is_present(monkeypatch) -> None:
+    _set_ready_environment(monkeypatch)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")  # pragma: allowlist secret -- fake, test-only
+    validate_deployment_readiness(
+        _staging(
+            ai_providers=AiProviderSettings(eligible_providers=("openai",)),
+            call_intelligence=CallIntelligenceSettings(provider="groq", model="llama-3.3-70b"),
+        )
+    )
+
+
 def test_missing_ai_provider_secret_is_rejected(monkeypatch) -> None:
     _set_ready_environment(monkeypatch)
     monkeypatch.delenv("GROQ_API_KEY", raising=False)

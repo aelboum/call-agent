@@ -95,12 +95,21 @@ class OpenAiCompatibleLlmProvider:
         api_key: str,
         provider_label: str,
         timeout_seconds: float,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._api_key = api_key
         self._label = provider_label
         self._timeout = timeout_seconds
+        # Phase 2.20: bounded generation settings. Both `None` by default
+        # (the wire request omits the key entirely, exactly as it always
+        # did before this phase -- no behavior change for an existing
+        # agent that never set either), so this stays additive for every
+        # vendor already using this class (Groq, Mistral), not just OpenAI.
+        self._temperature = temperature
+        self._max_tokens = max_tokens
 
     async def stream_turn(
         self, messages: Sequence[Mapping[str, object]], tools: Sequence[ToolSpec]
@@ -112,6 +121,10 @@ class OpenAiCompatibleLlmProvider:
         }
         if tools:
             body["tools"] = _to_wire_tools(tools)
+        if self._temperature is not None:
+            body["temperature"] = self._temperature
+        if self._max_tokens is not None:
+            body["max_tokens"] = self._max_tokens
         headers = {"Authorization": f"Bearer {self._api_key}"}
 
         # Assembled across chunks, keyed by the wire's own `index` -- an

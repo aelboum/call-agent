@@ -41,7 +41,7 @@ from voiceagent.config.settings import ConfigurationError, Settings
 __all__ = ["validate_deployment_readiness"]
 
 #: Provider name -> the `infra.secrets` name its adapter reads at
-#: construction time (`voiceagent.providers.llm.groq/gemini/mistral`,
+#: construction time (`voiceagent.providers.llm.groq/gemini/mistral/openai`,
 #: `voiceagent.providers.stt.deepgram/assemblyai`,
 #: `voiceagent.providers.tts.elevenlabs/deepgram_aura`,
 #: `voiceagent.providers.call_intelligence.groq`). `"fake"` deliberately has
@@ -50,6 +50,7 @@ _PROVIDER_SECRET_NAMES: dict[str, str] = {
     "gemini": "GEMINI_API_KEY",
     "mistral": "MISTRAL_API_KEY",
     "groq": "GROQ_API_KEY",
+    "openai": "OPENAI_API_KEY",
     "deepgram": "DEEPGRAM_API_KEY",
     "assemblyai": "ASSEMBLYAI_API_KEY",
     "elevenlabs": "ELEVENLABS_API_KEY",

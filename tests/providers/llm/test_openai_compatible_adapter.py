@@ -160,6 +160,98 @@ def test_http_error_statuses_map_to_the_engine_error_taxonomy(
     assert exc_info.value.code is expected_code
 
 
+def test_request_timeout_maps_to_transient(mock_httpx_client) -> None:
+    """Phase 2.20 brief section 8/13: an explicit provider timeout must be
+    classified, not left to surface as an opaque transport error."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    provider = _provider(mock_httpx_client, handler)
+
+    async def scenario() -> None:
+        async for _ in provider.stream_turn([], []):
+            pass
+
+    with pytest.raises(EngineException) as exc_info:
+        asyncio.run(scenario())
+    assert exc_info.value.code is EngineErrorCode.TRANSIENT
+
+
+def test_cancellation_during_the_request_propagates_and_is_not_swallowed(
+    mock_httpx_client,
+) -> None:
+    """Phase 2.20 brief section 10: a call platform must be able to cancel
+    an in-flight LLM request (barge-in, caller hangup, runtime shutdown)
+    without it turning into an ordinary provider failure or hanging
+    forever. Mirrors `tests/providers/stt/test_deepgram_adapter.py
+    ::test_stream_can_be_cancelled_mid_iteration`'s identical pattern for
+    the STT leg."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(3600)
+        return httpx.Response(200, content=_sse("[DONE]"))  # pragma: no cover -- unreachable.
+
+    provider = _provider(mock_httpx_client, handler)
+
+    async def scenario() -> None:
+        async def consume() -> None:
+            async for _ in provider.stream_turn([], []):
+                pass
+
+        task = asyncio.create_task(consume())
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+
+def test_temperature_and_max_tokens_are_included_only_when_set(mock_httpx_client) -> None:
+    """Phase 2.20 brief section 5/8: bounded generation settings, additive
+    -- an agent that never sets either gets the exact wire body this
+    adapter always sent (no regression for Groq/Mistral, both already
+    using this shared class)."""
+    captured: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, content=_sse("[DONE]"))
+
+    async def scenario(provider: OpenAiCompatibleLlmProvider) -> None:
+        async for _ in provider.stream_turn([], []):
+            pass
+
+    mock_httpx_client(oac_module, handler)
+    bounded = OpenAiCompatibleLlmProvider(
+        base_url="https://example.test/v1",
+        model="test-model",
+        api_key="k",
+        provider_label="testvendor",
+        timeout_seconds=5.0,
+        temperature=0.2,
+        max_tokens=256,
+    )
+    asyncio.run(scenario(bounded))
+    sent = json.loads(captured[0].content)
+    assert sent["temperature"] == 0.2
+    assert sent["max_tokens"] == 256
+
+    captured.clear()
+    unbounded = OpenAiCompatibleLlmProvider(
+        base_url="https://example.test/v1",
+        model="test-model",
+        api_key="k",
+        provider_label="testvendor",
+        timeout_seconds=5.0,
+    )
+    asyncio.run(scenario(unbounded))
+    sent = json.loads(captured[0].content)
+    assert "temperature" not in sent
+    assert "max_tokens" not in sent
+
+
 def test_transport_failure_maps_to_transient(mock_httpx_client) -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused", request=request)

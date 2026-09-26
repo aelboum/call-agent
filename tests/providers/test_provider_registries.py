@@ -50,7 +50,7 @@ def test_stt_registry_knows_every_provider_this_phase_ships() -> None:
 
 
 def test_llm_registry_knows_every_provider_this_phase_ships() -> None:
-    assert set(LLM_PROVIDERS.known_providers()) == {"fake", "gemini", "groq", "mistral"}
+    assert set(LLM_PROVIDERS.known_providers()) == {"fake", "gemini", "groq", "mistral", "openai"}
 
 
 def test_tts_registry_knows_every_provider_this_phase_ships() -> None:

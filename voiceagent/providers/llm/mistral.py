@@ -13,7 +13,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from infra.secrets import SecretNotFoundError, get_secrets_provider
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from voiceagent.providers.engines.contracts import EngineErrorCode, EngineException
 from voiceagent.providers.llm._openai_compatible import OpenAiCompatibleLlmProvider
@@ -21,7 +21,7 @@ from voiceagent.providers.llm._openai_compatible import OpenAiCompatibleLlmProvi
 __all__ = ["MistralLlmConfig", "create_mistral_llm_provider"]
 
 _DEFAULT_ENDPOINT = "https://api.mistral.ai/v1"
-_SECRET_NAME = "MISTRAL_API_KEY"  # noqa: S105 -- a secret *name*, not a secret value.
+_SECRET_NAME = "MISTRAL_API_KEY"  # noqa: S105 -- a secret *name*, not a secret value.  # pragma: allowlist secret
 
 
 class MistralLlmConfig(BaseModel):
@@ -39,6 +39,11 @@ class MistralLlmConfig(BaseModel):
     model: str
     endpoint: str = _DEFAULT_ENDPOINT
     timeout_seconds: float = 30.0
+    #: Bounded generation settings (Phase 2.20). Both optional -- `None`
+    #: (the default) omits the wire field entirely, matching this
+    #: adapter's behavior before either existed.
+    temperature: float | None = None
+    max_tokens: int | None = Field(default=None, gt=0)
 
 
 def create_mistral_llm_provider(config: Mapping[str, object]) -> OpenAiCompatibleLlmProvider:
@@ -55,4 +60,6 @@ def create_mistral_llm_provider(config: Mapping[str, object]) -> OpenAiCompatibl
         api_key=api_key,
         provider_label="mistral",
         timeout_seconds=parsed.timeout_seconds,
+        temperature=parsed.temperature,
+        max_tokens=parsed.max_tokens,
     )
