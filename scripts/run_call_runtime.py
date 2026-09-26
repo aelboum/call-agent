@@ -11,24 +11,15 @@ real `CallRuntime` to a real Redis-backed heartbeat store
 (`RedisHeartbeatStore`, the same class `voiceagent/api/v1/ops.py` already
 reads from) and gives it bounded, signal-driven startup and shutdown.
 
-**What this does NOT close, and does not attempt to**: this process has no
-call to run until something calls `runtime.start_call()`. Phase 2.21 built
-the real FreeSWITCH transport (`voiceagent.telephony.freeswitch
-.esl_transport.ManagedEslConnection`, `.media_transport
-.FreeSwitchMediaListener`) and this script starts it -- real ESL
-authentication, real event subscription, a real `wss://` media listener --
-whenever `VOICEAGENT_FREESWITCH_ESL_HOST` is configured. What still does
-not exist anywhere in this repository is the "Call Orchestrator"
-(`voiceagent/runtime/errors.py`'s own long-standing comment names it):
-inbound-call tenant/DID resolution, outbound-call origination requests, and
-`CallSession` creation are a separate, larger feature this phase
-deliberately does not build (see
-`docs/PHASE-2.21-FREESWITCH-TELEPHONY-INTEGRATION.md`'s "Known
-limitations"). This process is therefore deployable, observable, and -- once
-FreeSWITCH is configured -- genuinely connected to it (heartbeats,
-authenticates, subscribes to events, accepts media connections, reconnects
-on disconnect), but it will carry zero real calls until that future
-orchestrator exists and calls `runtime.start_call()`.
+**Phase 2.22 closes the remaining gap**: whenever FreeSWITCH is configured,
+this script now also constructs a `voiceagent.runtime.orchestrator
+.CallOrchestrator` around the real transport and wires it as the real
+FreeSWITCH connection's own unrouted-`OFFERED` handler
+(`TelephonyEventRouter.on_unrouted_offer`) -- an inbound call is now
+authoritatively routed, authorized, and handed to `CallRuntime.start_call()`
+by this same process, not merely heartbeating and connected. Outbound-call
+origination requests remain out of this phase's scope (see
+`docs/PHASE-2.22-CALL-ORCHESTRATION.md`'s "Known limitations").
 
 Usage::
 
@@ -68,7 +59,11 @@ from infra.jobs.config import get_jobs_config
 from infra.secrets import get_secrets_provider
 
 from voiceagent.config import Settings, settings_from_env, validate_deployment_readiness
+from voiceagent.runtime.conversation_persistence import ConversationPersistence
+from voiceagent.runtime.db import DatabaseBoundary
 from voiceagent.runtime.heartbeat import RedisHeartbeatStore, new_instance_id
+from voiceagent.runtime.orchestrator import CallOrchestrator
+from voiceagent.runtime.privacy import StaticAiDataPolicySource
 from voiceagent.runtime.supervisor import CallRuntime
 from voiceagent.runtime.telephony_events import TelephonyEventRouter
 from voiceagent.telephony.freeswitch.esl_transport import ManagedEslConnection
@@ -78,6 +73,7 @@ from voiceagent.telephony.freeswitch.media_transport import (
     serve_freeswitch_media,
 )
 from voiceagent.telephony.freeswitch.provider import FreeSwitchTelephonyProvider
+from voiceagent.tools.gateway import ToolGateway
 
 _logger = logging.getLogger("voiceagent.scripts.run_call_runtime")
 
@@ -85,9 +81,10 @@ _logger = logging.getLogger("voiceagent.scripts.run_call_runtime")
 class _FreeSwitchTransport:
     """Everything Phase 2.21's real FreeSWITCH transport needs started and
     stopped together -- constructed only when `settings.freeswitch
-    .is_configured`. Not itself wired into any `CallTaskDependencies`: no
-    Call Orchestrator exists yet to create the calls that would need one
-    (this module's own docstring)."""
+    .is_configured`. `_run()` builds the Phase 2.22 `CallOrchestrator`
+    around this transport's own `telephony`/`media`/`events` right after
+    constructing it (and before `start()`), wiring
+    `self.events.on_unrouted_offer = orchestrator.handle_unrouted_offer`."""
 
     def __init__(self, settings: Settings) -> None:
         self.esl = ManagedEslConnection(
@@ -98,7 +95,12 @@ class _FreeSwitchTransport:
             ),
         )
         self.telephony = FreeSwitchTelephonyProvider(
-            self.esl, command_timeout_seconds=settings.freeswitch.command_timeout_seconds
+            self.esl,
+            command_timeout_seconds=settings.freeswitch.command_timeout_seconds,
+            media_public_base_url=settings.freeswitch.media_public_url,
+            media_ticket_secret_provider=lambda: get_secrets_provider().get_required(
+                "FREESWITCH_MEDIA_TICKET_SECRET"
+            ),
         )
         self.media = FreeSwitchMediaProvider()
         self.media_listener = FreeSwitchMediaListener(
@@ -157,10 +159,26 @@ async def _run() -> None:
         ttl_seconds=settings.runtime.heartbeat_ttl_seconds,
     )
 
+    db = DatabaseBoundary(max_workers=settings.runtime.to_thread_pool_size)
+    orchestrator: CallOrchestrator | None = None
     freeswitch_transport = (
         _FreeSwitchTransport(settings) if settings.freeswitch.is_configured else None
     )
     if freeswitch_transport is not None:
+        orchestrator = CallOrchestrator(
+            db=db,
+            call_runtime=runtime,
+            telephony=freeswitch_transport.telephony,
+            media=freeswitch_transport.media,
+            telephony_events=freeswitch_transport.events,
+            heartbeat_store=heartbeat_store,
+            policy_source=StaticAiDataPolicySource(settings.ai_providers),
+            tool_gateway=ToolGateway(),
+            conversation_persistence=ConversationPersistence(db),
+            system_actor_user_id=settings.runtime.system_actor_user_id,
+            system_service_account_name=settings.runtime.system_service_account_name,
+        )
+        freeswitch_transport.events.on_unrouted_offer = orchestrator.handle_unrouted_offer
         await freeswitch_transport.start()
 
     _logger.info(
@@ -184,10 +202,13 @@ async def _run() -> None:
 
     await stop_event.wait()
     _logger.info("call_runtime.shutdown.begin", extra={"instance_id": runtime.instance_id})
+    if orchestrator is not None:
+        await orchestrator.shutdown()
     await runtime.shutdown()
     if freeswitch_transport is not None:
         await freeswitch_transport.stop()
     await heartbeat_store.close()
+    db.close()
     _logger.info("call_runtime.shutdown.complete", extra={"instance_id": runtime.instance_id})
 
 

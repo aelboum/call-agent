@@ -79,6 +79,7 @@ __all__ = [
     "record_call_setup_latency",
     "record_call_started",
     "record_call_teardown",
+    "record_orchestration_event",
     "record_provider_operation",
     "record_reconciliation",
     "record_runtime_call_startup_failure",
@@ -190,6 +191,15 @@ _runtime_call_startup_failures: Final = _meter.create_counter(
     unit="1",
     description="Call tasks that raised before or during teardown, by error category.",
 )
+#: Phase 2.22: one bounded counter for the whole Call Orchestrator flow --
+#: `outcome` is a small, fixed vocabulary (never a `call_ref`, tenant id, or
+#: phone number), matching the identical "no high-cardinality label"
+#: discipline every other counter in this module already follows.
+_orchestration_events: Final = _meter.create_counter(
+    "voiceagent.orchestration.events",
+    unit="1",
+    description="Call Orchestrator outcomes for an inbound telephony OFFERED event, by outcome.",
+)
 _runtime_shutdown_duration: Final = _meter.create_histogram(
     "voiceagent.runtime.shutdown_duration", unit="s", description="CallRuntime.shutdown() duration."
 )
@@ -288,6 +298,30 @@ def record_runtime_call_startup_failure(*, error_category: str) -> None:
         "runtime.call_startup_failure",
         lambda: _runtime_call_startup_failures.add(1, {"error_category": error_category}),
     )
+
+
+def record_orchestration_event(
+    outcome: Literal[
+        "started",
+        "unknown_route",
+        "route_disabled",
+        "unknown_agent",
+        "agent_version_unavailable",
+        "duplicate_ignored",
+        "authorization_denied",
+        "no_capacity",
+        "ownership_lost",
+        "media_unavailable",
+        "call_started",
+        "error",
+    ],
+) -> None:
+    """One counter, one bounded `outcome` label -- covers the whole Phase
+    2.22 flow (brief section 20: "call orchestration started; routing
+    result; call startup success/failure; duplicate event; authorization
+    rejection; runtime startup"). Never a `call_ref`, tenant id, phone
+    number, or any other unbounded value."""
+    _safe("orchestration.event", lambda: _orchestration_events.add(1, {"outcome": outcome}))
 
 
 def record_runtime_shutdown(duration_seconds: float) -> None:

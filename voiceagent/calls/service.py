@@ -40,18 +40,37 @@ from voiceagent.calls.lifecycle import TERMINAL_STATUSES, VALID_STATUSES, is_val
 from voiceagent.calls.models import CallSession
 from voiceagent.contacts.errors import ContactNotFoundError
 from voiceagent.contacts.models import Contact
-from voiceagent.db import select
+from voiceagent.db import IntegrityError, select
 from voiceagent.tenancy import TenantContext, tenant_scope
 
 __all__ = [
     "associate_call",
+    "claim_call_for_activation",
     "claim_runtime_ownership",
     "create_call_session",
     "get_call_session",
+    "get_call_session_by_fs_channel_uuid",
     "list_call_sessions",
     "list_non_terminal_call_sessions",
     "transition_call_session",
 ]
+
+#: Phase 2.22: `migrations/versions/0012_inbound_call_routing.py`'s partial
+#: unique index -- the constraint `create_call_session()` catches below to
+#: turn a replayed/duplicated `fs_channel_uuid` into an idempotent lookup
+#: instead of a raised `IntegrityError`.
+_FS_CHANNEL_UUID_UNIQUE_CONSTRAINT = "uq_call_sessions_fs_channel_uuid"
+
+
+def _constraint_name(exc: IntegrityError) -> str | None:
+    """Best-effort extraction of the failing constraint's name from the
+    underlying psycopg diagnostics, without leaking any of it outward.
+    Mirrors `voiceagent.phone_numbers.service._constraint_name()` exactly --
+    duplicated rather than shared, since it is four lines and the two
+    modules have no other reason to depend on each other."""
+    orig = getattr(exc, "orig", None)
+    diag = getattr(orig, "diag", None)
+    return getattr(diag, "constraint_name", None)
 
 
 def _get_row(session, tenant_id: uuid.UUID, call_session_id: uuid.UUID) -> CallSession:
@@ -84,28 +103,119 @@ def create_call_session(
     phone_number_id: uuid.UUID,
     agent_id: uuid.UUID,
     agent_version_id: uuid.UUID,
+    fs_channel_uuid: str | None = None,
 ) -> CallSession:
     """`agent_version_id` is resolved by the caller (e.g. via
     `voiceagent.agents.service.select_agent_version_id()`) *before* this
     call, and is written once, here -- this function provides no way to
-    change it afterward (ADR-0004; Phase 2.1 brief §15)."""
+    change it afterward (ADR-0004; Phase 2.1 brief §15).
+
+    Phase 2.22: `fs_channel_uuid`, when given, makes this call **idempotent**
+    -- exactly the property a replayed/duplicated telephony event (an ESL
+    reconnect replay, a duplicate `OFFERED`, two orchestrator processes
+    racing the same inbound call) needs. A second call with the same value
+    does not raise and does not create a second row: the database's own
+    partial unique index (`uq_call_sessions_fs_channel_uuid`, migrations/
+    0012) is what actually decides the race (`SELECT ... FOR UPDATE` is not
+    needed here -- Postgres already serializes two concurrent inserts of the
+    same unique value, blocking the loser until the winner commits or rolls
+    back, so the fallback lookup below can never miss a just-committed
+    winner). `fs_channel_uuid=None` -- every caller before Phase 2.22 -- is
+    entirely unaffected: the partial index does not constrain `NULL` at all,
+    and this function's behavior for that case is byte-for-byte unchanged.
+    """
+    try:
+        with tenant_scope(context) as session:
+            call = CallSession(
+                tenant_id=context.tenant_id,
+                direction=direction,
+                status="initiated",
+                from_e164=from_e164,
+                to_e164=to_e164,
+                phone_number_id=phone_number_id,
+                agent_id=agent_id,
+                agent_version_id=agent_version_id,
+                fs_channel_uuid=fs_channel_uuid,
+                started_at=datetime.now(UTC),
+            )
+            session.add(call)
+            session.flush()
+            session.refresh(call)
+            session.expunge(call)
+            return call
+    except IntegrityError as exc:
+        if (
+            fs_channel_uuid is not None
+            and _constraint_name(exc) == _FS_CHANNEL_UUID_UNIQUE_CONSTRAINT
+        ):
+            existing = get_call_session_by_fs_channel_uuid(context, fs_channel_uuid)
+            if existing is not None:
+                return existing
+        raise
+
+
+def get_call_session_by_fs_channel_uuid(
+    context: TenantContext, fs_channel_uuid: str
+) -> CallSession | None:
+    """`None` if no `CallSession` for this tenant carries this value --
+    never raises `CallSessionNotFoundError` (unlike `get_call_session()`):
+    "not found" is an expected, ordinary outcome here (the first time an
+    external call's `fs_channel_uuid` is seen), not an error."""
     with tenant_scope(context) as session:
-        call = CallSession(
-            tenant_id=context.tenant_id,
-            direction=direction,
-            status="initiated",
-            from_e164=from_e164,
-            to_e164=to_e164,
-            phone_number_id=phone_number_id,
-            agent_id=agent_id,
-            agent_version_id=agent_version_id,
-            started_at=datetime.now(UTC),
-        )
-        session.add(call)
+        row = session.execute(
+            select(CallSession).where(
+                CallSession.tenant_id == context.tenant_id,
+                CallSession.fs_channel_uuid == fs_channel_uuid,
+            )
+        ).scalar_one_or_none()
+        if row is not None:
+            session.expunge(row)
+        return row
+
+
+def claim_call_for_activation(context: TenantContext, call_session_id: uuid.UUID) -> bool:
+    """Phase 2.22: the exactly-once gate `voiceagent.runtime.orchestrator
+    .CallOrchestrator` takes right after this process has confirmed *itself*
+    as the call's owning runtime (`assign_call_to_runtime()`'s own
+    `winning_instance_id` matches this process's), and right before
+    `answer()`/media/`CallRuntime.start_call()`. **Not** right after
+    `create_call_session()` -- an earlier version placed it there, but a
+    concurrency test caught why that is wrong: this claim is a plain
+    first-come-first-served race, unrelated to which runtime the
+    deterministic least-loaded selection would actually assign the call to,
+    so the *non-owning* process could win it by chance, strand the call
+    (its own handler already exited as a false "duplicate" before ever
+    calling `assign_call_to_runtime`, while the true owner's handler lost
+    the earlier race and exited too), and nothing would ever call
+    `answer()`. After the ownership check, at most one process's own
+    `_handle_offer()` invocation can even reach this line for a given
+    external call -- cross-process duplication is already impossible there
+    by construction. What remains, and what this function closes, is two
+    truly concurrent duplicate events handled by *that one* process: both
+    independently compute themselves as the winning instance
+    (`claim_runtime_ownership()`'s own documented same-instance-reclaim
+    idempotency lets both succeed), and `SELECT ... FOR UPDATE`-serialized
+    (`_get_row_for_update()`, the same primitive `claim_runtime_ownership()`
+    uses) is what lets only one of them proceed to answer the channel.
+
+    Transitions `initiated -> ringing` and returns `True` for exactly one of
+    any number of concurrent callers; every other caller -- this call
+    already claimed by a concurrent racer, or already further along
+    (mid-call) or terminal (already ended) -- observes a `status` other than
+    `"initiated"` under the same row lock and returns `False` without
+    changing anything. The row lock (not the `status` value alone) is what
+    makes this exclusive: two concurrent callers cannot both observe
+    `"initiated"` the way two concurrent `create_call_session()` callers can
+    both observe "no row yet" -- the second call here blocks until the
+    first's transaction commits, then sees the first's own write.
+    """
+    with tenant_scope(context) as session:
+        call = _get_row_for_update(session, context.tenant_id, call_session_id)
+        if call.status != "initiated":
+            return False
+        call.status = "ringing"
         session.flush()
-        session.refresh(call)
-        session.expunge(call)
-        return call
+        return True
 
 
 def get_call_session(context: TenantContext, call_session_id: uuid.UUID) -> CallSession:

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import uuid
 from collections.abc import AsyncIterator
 
 from voiceagent.telephony.contracts import (
@@ -46,6 +47,18 @@ class FakeTelephonyProvider:
         self.recording: set[CallRef] = set()
         self.held: set[CallRef] = set()
         self._events: asyncio.Queue[CallEvent | None] = asyncio.Queue()
+        # A random per-instance token, not a plain counter starting at 1 --
+        # a hermetic test's own database is rolled back/discarded between
+        # runs, but a real-PostgreSQL integration test (Phase 2.22's own
+        # `tests/integration/`) commits `CallSession.fs_channel_uuid` rows
+        # for real into a long-lived shared database; a plain counter would
+        # deterministically mint the same call_ref across separate test
+        # *processes*, colliding with another run's still-present row on
+        # `create_call_session()`'s own uniqueness guarantee. No test
+        # asserts an exact `offer_inbound()`/`originate()`/`transfer()`
+        # value (only hardcoded literal `call_ref=` fixtures do that), so
+        # this changes nothing any existing test depends on.
+        self._instance_token = uuid.uuid4().hex[:8]
         self._ids = itertools.count(1)
 
     # -- test-side helpers -------------------------------------------------
@@ -60,7 +73,7 @@ class FakeTelephonyProvider:
 
     def offer_inbound(self, *, from_number: str, to_number: str) -> CallRef:
         """Simulate an inbound call arriving and being offered."""
-        call_ref: CallRef = f"fake-call-{next(self._ids)}"
+        call_ref: CallRef = f"fake-call-{self._instance_token}-{next(self._ids)}"
         self.live_calls.add(call_ref)
         self.emit(
             CallEvent(
@@ -80,7 +93,7 @@ class FakeTelephonyProvider:
     # -- TelephonyProvider -------------------------------------------------
 
     async def originate(self, request: OriginateRequest) -> CallRef:
-        call_ref: CallRef = f"fake-call-{next(self._ids)}"
+        call_ref: CallRef = f"fake-call-{self._instance_token}-{next(self._ids)}"
         self.commands.append(("originate", request.to_number, request.from_number))
         self.live_calls.add(call_ref)
         return call_ref
@@ -103,7 +116,7 @@ class FakeTelephonyProvider:
 
     async def transfer(self, call_ref: CallRef, destination: str) -> CallRef:
         self._require_live(call_ref)
-        destination_ref: CallRef = f"fake-call-{next(self._ids)}"
+        destination_ref: CallRef = f"fake-call-{self._instance_token}-{next(self._ids)}"
         self.commands.append(("transfer", call_ref, destination))
         self.live_calls.add(destination_ref)
         return destination_ref
@@ -131,6 +144,20 @@ class FakeTelephonyProvider:
         self._require_live(call_ref)
         self.commands.append(("stop_recording", call_ref))
         self.recording.discard(call_ref)
+
+    async def start_media_stream(self, call_ref: CallRef) -> None:
+        """Not part of `TelephonyProvider` (`voiceagent.telephony.freeswitch
+        .provider.FreeSwitchTelephonyProvider`'s own FreeSWITCH-specific
+        extra, Phase 2.21/2.22) -- added here anyway so this fake can stand
+        in for the real adapter wherever `voiceagent.runtime.orchestrator
+        .CallOrchestrator` (its one real caller) is exercised without a real
+        FreeSWITCH connection."""
+        self._require_live(call_ref)
+        self.commands.append(("start_media_stream", call_ref))
+
+    async def stop_media_stream(self, call_ref: CallRef) -> None:
+        self._require_live(call_ref)
+        self.commands.append(("stop_media_stream", call_ref))
 
     async def events(self) -> AsyncIterator[CallEvent]:
         while True:

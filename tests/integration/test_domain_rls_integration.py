@@ -174,6 +174,20 @@ def test_row_level_security_is_enabled_and_forced_for_every_table() -> None:
         "knowledge_sources": (True, True),
         "knowledge_items": (True, True),
         "call_ai_analyses": (True, True),
+        # Phase 2.22: `app.inbound_call_routes` (migrations/0012) is the one
+        # deliberate exception in this inventory -- it must be readable with
+        # *no* `app.tenant_id` set at all, because resolving which tenant an
+        # inbound call belongs to is the Call Orchestrator's first step,
+        # strictly before any `TenantContext` exists to set that variable
+        # with. It carries no data beyond `e164 -> tenant_id/agent_id`
+        # routing (never PII, never conversation/call content) and is kept
+        # in sync with `app.phone_numbers` -- which *is* RLS-protected --
+        # only by a database trigger, never by application code
+        # (`voiceagent/calls/routing.py`'s own module docstring; verified
+        # against real Postgres during this phase: a role with no
+        # `app.tenant_id` set can read this table but reads zero rows from
+        # `app.phone_numbers`).
+        "inbound_call_routes": (False, False),
     }
 
 

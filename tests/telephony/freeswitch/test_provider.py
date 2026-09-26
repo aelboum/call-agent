@@ -193,12 +193,30 @@ def test_transfer_mints_a_new_call_ref_for_the_second_leg() -> None:
 
 
 def test_start_media_stream_issues_the_expected_esl_command() -> None:
+    """Phase 2.22: `start_media_stream()` mints its own ticket internally
+    (`media_public_base_url`/`media_ticket_secret_provider` supplied at
+    construction) rather than taking a caller-built `media_url` -- see
+    `voiceagent.telephony.freeswitch.provider.FreeSwitchTelephonyProvider
+    .__init__`'s own docstring for why."""
+    esl = FakeEslConnection()
+    provider = FreeSwitchTelephonyProvider(
+        esl,
+        media_public_base_url="wss://runtime.example.test",
+        media_ticket_secret_provider=lambda: "test-secret",
+    )
+    asyncio.run(provider.start_media_stream("call-1"))
+    assert len(esl.commands) == 1
+    command = esl.commands[0]
+    assert command.startswith("uuid_audio_stream call-1 start wss://runtime.example.test/media/")
+    assert command.endswith(" mono 8k")
+
+
+def test_start_media_stream_without_configuration_raises() -> None:
     esl = FakeEslConnection()
     provider = FreeSwitchTelephonyProvider(esl)
-    asyncio.run(provider.start_media_stream("call-1", "wss://runtime.example.test/media/ticket-1"))
-    assert esl.commands == [
-        "uuid_audio_stream call-1 start wss://runtime.example.test/media/ticket-1 mono 8k"
-    ]
+    with pytest.raises(TransportError):
+        asyncio.run(provider.start_media_stream("call-1"))
+    assert esl.commands == []
 
 
 def test_stop_media_stream_issues_the_expected_esl_command() -> None:

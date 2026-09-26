@@ -49,6 +49,7 @@ from voiceagent.telephony.contracts import (
     TransportError,
 )
 from voiceagent.telephony.freeswitch.esl import EslConnection, EslEvent
+from voiceagent.telephony.freeswitch.media_transport import mint_media_ticket
 
 __all__ = ["FreeSwitchTelephonyProvider"]
 
@@ -160,6 +161,9 @@ class FreeSwitchTelephonyProvider:
         *,
         command_timeout_seconds: float = 10.0,
         uuid_factory: Callable[[], str] = lambda: str(uuid_module.uuid4()),
+        media_public_base_url: str | None = None,
+        media_ticket_secret_provider: Callable[[], str] | None = None,
+        media_ticket_ttl_seconds: float = 60.0,
     ) -> None:
         self._esl = esl
         self._command_timeout_seconds = command_timeout_seconds
@@ -170,6 +174,23 @@ class FreeSwitchTelephonyProvider:
         # below for why). Injectable so a test can assert an exact,
         # deterministic ESL command string.
         self._uuid_factory = uuid_factory
+        # Phase 2.22: `start_media_stream()` mints and owns its own media
+        # ticket -- moved here (rather than left as a caller-supplied
+        # `media_url`, Phase 2.21's own original shape) once a real caller
+        # (`voiceagent.runtime.orchestrator.CallOrchestrator`) needed one:
+        # minting requires `voiceagent.telephony.freeswitch.media_transport
+        # .mint_media_ticket()`, and the orchestrator must never import
+        # anything under `voiceagent.telephony.freeswitch` directly (brief
+        # section 18) -- exactly the boundary this move preserves. `None`
+        # for both is valid construction (every Phase 2.21 test, and any
+        # caller that never uses `start_media_stream()`); calling
+        # `start_media_stream()` itself without them is a programming error,
+        # raised explicitly rather than producing a malformed URL.
+        self._media_public_base_url = (
+            media_public_base_url.rstrip("/") if media_public_base_url is not None else None
+        )
+        self._media_ticket_secret_provider = media_ticket_secret_provider
+        self._media_ticket_ttl_seconds = media_ticket_ttl_seconds
 
     async def _command(self, command: str, *, operation: str) -> str:
         """`operation` is one of this class's own ten bounded ESL verb names
@@ -255,7 +276,7 @@ class FreeSwitchTelephonyProvider:
     async def stop_recording(self, call_ref: CallRef) -> None:
         await self._command(f"uuid_record {call_ref} stop /dev/null", operation="stop_recording")
 
-    async def start_media_stream(self, call_ref: CallRef, media_url: str) -> None:
+    async def start_media_stream(self, call_ref: CallRef) -> None:
         """Command FreeSWITCH's `mod_audio_stream` to open the product's own
         `wss://` media listener for this call leg (`uuid_audio_stream <uuid>
         start <url> mono 8k`, PSTN default per `voiceagent.telephony
@@ -263,11 +284,24 @@ class FreeSwitchTelephonyProvider:
         `voiceagent.telephony.contracts.TelephonyProvider`: which command
         starts media (if any -- a different vendor's mechanism could differ
         completely) is FreeSWITCH-specific, not something the vendor-neutral
-        contract should assume. The caller (an inbound/outbound call
-        orchestrator, not yet built -- see this module's own docs) is
-        responsible for minting `media_url`'s one-call short-lived ticket
-        (`voiceagent.telephony.freeswitch.media_transport
-        .mint_media_ticket()`) before calling this."""
+        contract should assume.
+
+        Mints and owns its own short-lived, signed media ticket (Phase
+        2.22) -- the caller (`voiceagent.runtime.orchestrator
+        .CallOrchestrator`) supplies only `call_ref`, never a URL or a
+        ticket, keeping every FreeSWITCH/`mod_audio_stream` concept
+        (including the ticket's own transport) confined to this package."""
+        if self._media_public_base_url is None or self._media_ticket_secret_provider is None:
+            raise TransportError(
+                "start_media_stream() requires media_public_base_url and "
+                "media_ticket_secret_provider to be configured at construction time"
+            )
+        ticket = mint_media_ticket(
+            call_ref,
+            self._media_ticket_secret_provider(),
+            ttl_seconds=self._media_ticket_ttl_seconds,
+        )
+        media_url = f"{self._media_public_base_url}/media/{ticket}"
         await self._command(
             f"uuid_audio_stream {call_ref} start {media_url} mono 8k",
             operation="start_media_stream",

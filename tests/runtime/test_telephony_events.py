@@ -135,6 +135,83 @@ def test_a_full_subscriber_queue_drops_the_new_event_and_does_not_raise() -> Non
     assert size == 32  # bounded, never grew past the router's own maxsize.
 
 
+def test_on_unrouted_offer_is_called_for_an_offered_event_with_no_subscriber() -> None:
+    """Phase 2.22: the one, narrow addition -- a brand-new inbound call's
+    `call_ref` is never already subscribed, so its `OFFERED` event must
+    reach the orchestrator's callback instead of being silently dropped."""
+
+    async def scenario() -> list[CallEvent]:
+        telephony = FakeTelephonyProvider()
+        received: list[CallEvent] = []
+        router = TelephonyEventRouter(telephony, on_unrouted_offer=received.append)
+        run_task = asyncio.create_task(router.run())
+
+        telephony.offer_inbound(from_number="+15550100", to_number="+15550199")
+        await asyncio.sleep(0.05)
+        run_task.cancel()
+        return received
+
+    received = asyncio.run(scenario())
+    assert len(received) == 1
+    assert received[0].type is CallEventType.OFFERED
+
+
+def test_on_unrouted_offer_is_not_called_for_a_subscribed_call_ref() -> None:
+    async def scenario() -> list[CallEvent]:
+        telephony = FakeTelephonyProvider()
+        received: list[CallEvent] = []
+        router = TelephonyEventRouter(telephony, on_unrouted_offer=received.append)
+        queue = router.subscribe("call-a")
+        run_task = asyncio.create_task(router.run())
+
+        telephony.emit(
+            CallEvent(
+                type=CallEventType.OFFERED, call_ref="call-a", direction=CallDirection.INBOUND
+            )
+        )
+        await asyncio.wait_for(queue.get(), timeout=2.0)
+        run_task.cancel()
+        return received
+
+    assert asyncio.run(scenario()) == []
+
+
+def test_on_unrouted_offer_is_not_called_for_non_offered_unrouted_events() -> None:
+    """Every other unrouted event type keeps its Phase 2.21 behavior exactly
+    -- dropped, never delivered anywhere."""
+
+    async def scenario() -> list[CallEvent]:
+        telephony = FakeTelephonyProvider()
+        received: list[CallEvent] = []
+        router = TelephonyEventRouter(telephony, on_unrouted_offer=received.append)
+        run_task = asyncio.create_task(router.run())
+
+        telephony.emit(
+            CallEvent(
+                type=CallEventType.HUNGUP, call_ref="unknown", direction=CallDirection.OUTBOUND
+            )
+        )
+        await asyncio.sleep(0.05)
+        run_task.cancel()
+        return received
+
+    assert asyncio.run(scenario()) == []
+
+
+def test_default_none_callback_preserves_phase_2_21_behavior() -> None:
+    async def scenario() -> bool:
+        telephony = FakeTelephonyProvider()
+        router = TelephonyEventRouter(telephony)  # no on_unrouted_offer -- the old default.
+        run_task = asyncio.create_task(router.run())
+        telephony.offer_inbound(from_number="+15550100", to_number="+15550199")
+        await asyncio.sleep(0.05)
+        still_running = not run_task.done()
+        run_task.cancel()
+        return still_running
+
+    assert asyncio.run(scenario()) is True
+
+
 def test_concurrent_calls_never_cross_talk() -> None:
     """At least one test demonstrating that multiple simulated calls can
     operate concurrently without cross-talk (Phase 2.21 brief section 15)."""

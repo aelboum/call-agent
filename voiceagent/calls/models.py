@@ -104,7 +104,19 @@ class CallSession(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         Index("ix_call_sessions_contact_id", "contact_id"),
         Index("ix_call_sessions_status", "status"),
         Index("ix_call_sessions_runtime_instance_id", "runtime_instance_id"),
-        Index("ix_call_sessions_fs_channel_uuid", "fs_channel_uuid"),
+        # Phase 2.22: replaced by a partial-unique index (migrations/0012) --
+        # a second `CallSession` created with the same `fs_channel_uuid` is
+        # a database-level conflict, not merely findable by an index. NULL
+        # (every outbound call before origination assigns one) stays
+        # unconstrained -- see `voiceagent.calls.routing`'s own module
+        # docstring and `voiceagent.calls.service.create_call_session()`
+        # for the idempotency this enables.
+        Index(
+            "uq_call_sessions_fs_channel_uuid",
+            "fs_channel_uuid",
+            unique=True,
+            postgresql_where=fs_channel_uuid.isnot(None),
+        ),
         # Phase 2.16 security/production-readiness audit (migration 0011):
         # the composite shape `list_non_terminal_call_sessions()`/
         # `list_call_sessions(status=...)` actually filter by -- both

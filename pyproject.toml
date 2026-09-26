@@ -201,7 +201,24 @@ source_modules = [
     "voiceagent.config",
     "voiceagent.conversations",
     "voiceagent.db",
-    "voiceagent.runtime",
+    # Phase 2.22: enumerated by real submodule, not the bare package -- see
+    # the STT contract's own comment immediately below for why
+    # `voiceagent.runtime.orchestrator` is the one legitimate exception
+    # (it calls `build_conversation_engine()` directly, same as
+    # `voiceagent.providers.engines.factory` itself already does).
+    "voiceagent.runtime.assignment",
+    "voiceagent.runtime.call_task",
+    "voiceagent.runtime.conversation_persistence",
+    "voiceagent.runtime.db",
+    "voiceagent.runtime.diagnostics",
+    "voiceagent.runtime.errors",
+    "voiceagent.runtime.fakes",
+    "voiceagent.runtime.heartbeat",
+    "voiceagent.runtime.privacy",
+    "voiceagent.runtime.reconciliation",
+    "voiceagent.runtime.stuck_calls",
+    "voiceagent.runtime.supervisor",
+    "voiceagent.runtime.telephony_events",
     "voiceagent.telephony",
     "voiceagent.tenancy",
     "voiceagent.tools",
@@ -227,6 +244,17 @@ forbidden_modules = ["pipecat"]
 # are complementary, not redundant, exactly as this repository's existing
 # Pipecat/FreeSWITCH fences already are (both an import-linter contract and
 # an AST test).
+#
+# Phase 2.22: `voiceagent.runtime` is enumerated by its own real submodules
+# here, rather than listed as the bare package, for the identical reason --
+# `voiceagent.runtime.orchestrator` is this product's *other* legitimate
+# caller of `build_conversation_engine()` (`voiceagent.calls.service
+# .create_call_session()`'s own new caller, the Call Orchestrator), so it
+# transitively reaches every vendor module exactly as `factory.py` itself
+# does, through the identical, already-audited path. Every other
+# `voiceagent.runtime` submodule -- especially `call_task.py`, the
+# audio-pump-adjacent one this fence exists for in the first place -- stays
+# listed and therefore still fully fenced.
 [[tool.importlinter.contracts]]
 name = "STT vendor adapters stay behind voiceagent.providers.stt.registry"
 type = "forbidden"
@@ -235,7 +263,19 @@ source_modules = [
     "voiceagent.config",
     "voiceagent.conversations",
     "voiceagent.db",
-    "voiceagent.runtime",
+    "voiceagent.runtime.assignment",
+    "voiceagent.runtime.call_task",
+    "voiceagent.runtime.conversation_persistence",
+    "voiceagent.runtime.db",
+    "voiceagent.runtime.diagnostics",
+    "voiceagent.runtime.errors",
+    "voiceagent.runtime.fakes",
+    "voiceagent.runtime.heartbeat",
+    "voiceagent.runtime.privacy",
+    "voiceagent.runtime.reconciliation",
+    "voiceagent.runtime.stuck_calls",
+    "voiceagent.runtime.supervisor",
+    "voiceagent.runtime.telephony_events",
     "voiceagent.telephony",
     "voiceagent.tenancy",
     "voiceagent.tools",
@@ -256,7 +296,19 @@ source_modules = [
     "voiceagent.config",
     "voiceagent.conversations",
     "voiceagent.db",
-    "voiceagent.runtime",
+    "voiceagent.runtime.assignment",
+    "voiceagent.runtime.call_task",
+    "voiceagent.runtime.conversation_persistence",
+    "voiceagent.runtime.db",
+    "voiceagent.runtime.diagnostics",
+    "voiceagent.runtime.errors",
+    "voiceagent.runtime.fakes",
+    "voiceagent.runtime.heartbeat",
+    "voiceagent.runtime.privacy",
+    "voiceagent.runtime.reconciliation",
+    "voiceagent.runtime.stuck_calls",
+    "voiceagent.runtime.supervisor",
+    "voiceagent.runtime.telephony_events",
     "voiceagent.telephony",
     "voiceagent.tenancy",
     "voiceagent.tools",
@@ -278,7 +330,19 @@ source_modules = [
     "voiceagent.config",
     "voiceagent.conversations",
     "voiceagent.db",
-    "voiceagent.runtime",
+    "voiceagent.runtime.assignment",
+    "voiceagent.runtime.call_task",
+    "voiceagent.runtime.conversation_persistence",
+    "voiceagent.runtime.db",
+    "voiceagent.runtime.diagnostics",
+    "voiceagent.runtime.errors",
+    "voiceagent.runtime.fakes",
+    "voiceagent.runtime.heartbeat",
+    "voiceagent.runtime.privacy",
+    "voiceagent.runtime.reconciliation",
+    "voiceagent.runtime.stuck_calls",
+    "voiceagent.runtime.supervisor",
+    "voiceagent.runtime.telephony_events",
     "voiceagent.telephony",
     "voiceagent.tenancy",
     "voiceagent.tools",
