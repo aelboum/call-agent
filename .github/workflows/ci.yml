@@ -163,6 +163,7 @@ jobs:
           "
       - name: Apply SaaS-OS's own migrations, then this product's
         env:
+          ENVIRONMENT: test
           DATABASE_URL: postgresql+psycopg://saas_os_app:app-ci-only-placeholder@127.0.0.1:5432/voiceagent
           MIGRATIONS_DATABASE_URL: postgresql+psycopg://saas_os:ci-only-placeholder@127.0.0.1:5432/voiceagent
           APP_DB_USER: saas_os_app
