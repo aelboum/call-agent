@@ -193,9 +193,20 @@ class CallTaskDependencies:
 
 
 def _engine_provider_name(agent_version: AgentVersion) -> str:
+    """The one provider name `authorize_call_data_access()` audits/checks
+    for this call (module docstring: evaluated once per call, never per
+    component). For `kind == "realtime"`, `engine.realtime.provider` is
+    that one provider by construction. For `kind == "pipelined"`, there are
+    three (`engine.stt`/`engine.llm`/`engine.tts`) -- `stt` is the
+    representative one, since it is the first point at which real call
+    audio reaches any AI vendor at all (this module's own docstring:
+    "no call audio reaches an AI engine before authorize_data_access()
+    succeeds").
+    """
     engine_config = agent_version.config.get("engine") or {}
     kind = engine_config.get("kind", "pipelined")
-    component = engine_config.get(kind) or {}
+    key = "stt" if kind == "pipelined" else kind
+    component = engine_config.get(key) or {}
     return str(component.get("provider", "fake"))
 
 

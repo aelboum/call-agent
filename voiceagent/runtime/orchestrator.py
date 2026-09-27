@@ -186,10 +186,18 @@ def _build_system_context(tenant_id: uuid.UUID) -> TenantContext:
 def _engine_provider_name(agent_version: AgentVersion) -> str:
     """Mirrors `voiceagent.runtime.call_task._engine_provider_name()`
     exactly -- duplicated rather than imported across modules for a private
-    four-line helper neither module has any other reason to share."""
+    four-line helper neither module has any other reason to share.
+
+    For `kind == "pipelined"` the representative provider is `engine.stt`
+    (per `voiceagent.agents.config.EngineConfig`'s own `stt`/`llm`/`tts`
+    fields) -- there is no top-level `engine.pipelined` key for any config
+    to have; `kind` itself is only a matching key for `kind == "realtime"`,
+    where `engine.realtime.provider` is that one provider by construction.
+    """
     engine_config = agent_version.config.get("engine") or {}
     kind = engine_config.get("kind", "pipelined")
-    component = engine_config.get(kind) or {}
+    key = "stt" if kind == "pipelined" else kind
+    component = engine_config.get(key) or {}
     return str(component.get("provider", "fake"))
 
 

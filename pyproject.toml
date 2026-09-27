@@ -46,6 +46,17 @@ dev = [
 security = [
     "detect-secrets>=1.5",
 ]
+# Phase 2.25: scripts/sip_uac.py's own real SIP UAC needs a real SIP/RTP
+# client library (see that module's own docstring for why it is not
+# hand-rolled below the signaling layer). Never imported by anything under
+# `voiceagent/` -- staging validation tooling only, not a product
+# dependency. `audioop-lts` restores the stdlib `audioop` module `pyvoip`
+# itself imports, removed from the standard library in this project's own
+# pinned Python version (3.13, PEP 594).
+staging-sip = [
+    "pyvoip==1.6.8",
+    "audioop-lts==0.2.2",
+]
 # ADR-0006: Pipecat is an OPTIONAL extra, never a base dependency, and is
 # importable only from `voiceagent.providers.engines.pipecat`. It is
 # deliberately NOT installed in Phase 1 -- the foundation does not need it,
