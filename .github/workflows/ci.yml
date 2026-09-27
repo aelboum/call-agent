@@ -3,7 +3,17 @@ name: CI
 # CI runs the same scripts a developer runs locally (`scripts/check-*.sh`),
 # so there is no second definition of "passing" to keep in sync.
 #
-# It requires no secrets and touches no infrastructure of its own: the
+# One secret is required: `SAAS_OS_TOKEN`, a fine-grained GitHub PAT with
+# read-only access to the pinned SaaS-OS dependency's own repository
+# (`aelboum/saas-os`), which is private -- the default `GITHUB_TOKEN` this
+# workflow otherwise runs with is scoped only to this repository and cannot
+# clone it (found the hard way: every run before this fix failed at
+# `pip install`'s own `git clone` of that dependency with "could not read
+# Username for 'https://github.com'"). Every job below that installs this
+# product's own Python package configures git to use that token for
+# `github.com` clones, immediately before its own `pip install` step, and
+# nowhere else -- the token is never read or referenced anywhere but there.
+# Otherwise, CI touches no infrastructure of its own: the
 # `backend`/`security`/`frontend`/`migrations` jobs are hermetic, and
 # `migrations` renders SQL offline without connecting to anything.
 #
@@ -32,6 +42,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+      - name: Configure git for private saas-os access
+        run: git config --global url."https://x-access-token:${SAAS_OS_TOKEN}@github.com/".insteadOf "https://github.com/"
+        env:
+          SAAS_OS_TOKEN: ${{ secrets.SAAS_OS_TOKEN }}
       # Installs the exact pinned SaaS-OS commit from a clean environment --
       # which is itself the test that ADR-0001's dependency declaration
       # resolves (acceptance criteria 1 and 2).
@@ -62,6 +76,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+      - name: Configure git for private saas-os access
+        run: git config --global url."https://x-access-token:${SAAS_OS_TOKEN}@github.com/".insteadOf "https://github.com/"
+        env:
+          SAAS_OS_TOKEN: ${{ secrets.SAAS_OS_TOKEN }}
       - name: Install
         run: |
           python -m pip install --upgrade pip
@@ -76,6 +94,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+      - name: Configure git for private saas-os access
+        run: git config --global url."https://x-access-token:${SAAS_OS_TOKEN}@github.com/".insteadOf "https://github.com/"
+        env:
+          SAAS_OS_TOKEN: ${{ secrets.SAAS_OS_TOKEN }}
       - name: Install
         run: |
           python -m pip install --upgrade pip
@@ -114,6 +136,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+      - name: Configure git for private saas-os access
+        run: git config --global url."https://x-access-token:${SAAS_OS_TOKEN}@github.com/".insteadOf "https://github.com/"
+        env:
+          SAAS_OS_TOKEN: ${{ secrets.SAAS_OS_TOKEN }}
       - name: Install
         run: |
           python -m pip install --upgrade pip
