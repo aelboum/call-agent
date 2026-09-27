@@ -23,7 +23,11 @@ name: CI
 # with the runner, applying SaaS-OS's own migrations first (ADR-0016's fixed
 # ordering) and then this product's, connected as the restricted
 # NOSUPERUSER/NOBYPASSRLS application role so Row-Level Security is actually
-# exercised rather than bypassed. See `tests/integration/README.md`.
+# exercised rather than bypassed. See `tests/integration/README.md`. It also
+# runs a disposable `redis:7-alpine` service container, also torn down with
+# the runner: `tests/integration/test_redis_heartbeat_integration.py`'s own
+# docstring deliberately ignores the placeholder `REDIS_URL` every other
+# integration test uses and requires a real one.
 
 on:
   push:
@@ -128,6 +132,22 @@ jobs:
           - 5432:5432
         options: >-
           --health-cmd "pg_isready -U saas_os -d voiceagent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      # tests/integration/test_redis_heartbeat_integration.py's own docstring:
+      # "Requires a real Redis instance reachable at REDIS_URL (or
+      # redis://127.0.0.1:6379/0 if unset)" -- it deliberately ignores the
+      # `redis://127.0.0.1:1/0` placeholder every other integration test
+      # uses (tests/integration/README.md), so this job needs a real one, a
+      # disposable service container torn down with the runner, same as
+      # `postgres` above.
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
