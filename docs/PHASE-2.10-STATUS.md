@@ -50,7 +50,7 @@ a failed step, cancellation, or `MAX_EXECUTION_TRANSITIONS`.
 ```python
 class WorkflowDefinition:
     entry_step_id: str
-    steps: list[WorkflowStep]   # discriminated union on `type`, 1-20 entries
+    steps: list[WorkflowStep]  # discriminated union on `type`, 1-20 entries
 ```
 
 Owned by `voiceagent.agents.config.AgentConfig.workflow: WorkflowDefinition | None`
