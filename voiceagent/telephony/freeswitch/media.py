@@ -31,7 +31,13 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Protocol, runtime_checkable
 
-from voiceagent.metrics import record_media_session_duration, record_provider_operation
+from voiceagent.metrics import (
+    record_media_playback_scheduling_delay,
+    record_media_session_duration,
+    record_media_session_ended,
+    record_media_session_started,
+    record_provider_operation,
+)
 from voiceagent.telephony.contracts import (
     AudioFormat,
     CallRef,
@@ -166,8 +172,10 @@ class _FreeSwitchMediaStream:
             self._playback_started_at = now
         else:
             scheduled_at = self._playback_started_at + self._audio_seconds_sent
-            if scheduled_at > now:
-                await self._sleep(scheduled_at - now)
+            delay_seconds = scheduled_at - now
+            if delay_seconds > 0:
+                await self._sleep(delay_seconds)
+            record_media_playback_scheduling_delay(max(delay_seconds, 0.0))
         self._audio_seconds_sent += duration_seconds + _LATENCY_MARGIN_SECONDS
 
     async def _flush(self, chunk: bytes) -> None:
@@ -281,6 +289,7 @@ class FreeSwitchMediaProvider:
         self._streams[call_ref] = stream
         self._attached_at[call_ref] = time.monotonic()
         record_provider_operation("media", "attach", "success", time.monotonic() - started)
+        record_media_session_started()
         return stream
 
     async def detach(self, call_ref: CallRef) -> None:
@@ -295,6 +304,7 @@ class FreeSwitchMediaProvider:
         if attached_at is not None:
             record_media_session_duration(time.monotonic() - attached_at)
         record_provider_operation("media", "detach", "success", time.monotonic() - started)
+        record_media_session_ended()
 
     def health(self, call_ref: CallRef) -> StreamHealth:
         stream = self._streams.get(call_ref)

@@ -63,3 +63,68 @@ def test_detach_with_no_attached_stream_records_failure(recorded_operations) -> 
     with pytest.raises(TransportError):
         asyncio.run(provider.detach("call-1"))
     assert recorded_operations == [("media", "detach", "failure")]
+
+
+@pytest.fixture
+def recorded_session_events(monkeypatch) -> list[str]:
+    """Phase 2.27: `voiceagent.metrics.record_media_session_started()`/
+    `record_media_session_ended()` -- the "active concurrent media
+    sessions" gauge this phase's own concurrency investigation needed and
+    did not have (docs/PHASE-2.27-CONCURRENT-MEDIA-VALIDATION.md)."""
+    events: list[str] = []
+    monkeypatch.setattr(
+        "voiceagent.telephony.freeswitch.media.record_media_session_started",
+        lambda: events.append("started"),
+    )
+    monkeypatch.setattr(
+        "voiceagent.telephony.freeswitch.media.record_media_session_ended",
+        lambda: events.append("ended"),
+    )
+    return events
+
+
+def test_successful_attach_records_session_started(recorded_session_events) -> None:
+    provider = FreeSwitchMediaProvider()
+    provider.register_socket("call-1", FakeMediaSocket())
+    asyncio.run(provider.attach("call-1"))
+    assert recorded_session_events == ["started"]
+
+
+def test_a_failed_attach_never_records_session_started(recorded_session_events) -> None:
+    provider = FreeSwitchMediaProvider()
+    with pytest.raises(TransportError):
+        asyncio.run(provider.attach("call-1"))
+    assert recorded_session_events == []
+
+
+def test_successful_detach_records_session_ended(recorded_session_events) -> None:
+    provider = FreeSwitchMediaProvider()
+    provider.register_socket("call-1", FakeMediaSocket())
+    asyncio.run(provider.attach("call-1"))
+    asyncio.run(provider.detach("call-1"))
+    assert recorded_session_events == ["started", "ended"]
+
+
+def test_a_failed_detach_never_records_session_ended(recorded_session_events) -> None:
+    provider = FreeSwitchMediaProvider()
+    with pytest.raises(TransportError):
+        asyncio.run(provider.detach("call-1"))
+    assert recorded_session_events == []
+
+
+def test_two_concurrent_attaches_each_record_their_own_started_event(
+    recorded_session_events,
+) -> None:
+    """The gauge is process-wide, not per-call -- but every attached call
+    must still contribute exactly one `started`/`ended` pair of its own, so
+    two concurrent calls read as two, never one (brief section 10's own
+    "active concurrent media sessions" signal)."""
+    provider = FreeSwitchMediaProvider()
+    provider.register_socket("call-1", FakeMediaSocket())
+    provider.register_socket("call-2", FakeMediaSocket())
+    asyncio.run(provider.attach("call-1"))
+    asyncio.run(provider.attach("call-2"))
+    assert recorded_session_events == ["started", "started"]
+    asyncio.run(provider.detach("call-1"))
+    asyncio.run(provider.detach("call-2"))
+    assert recorded_session_events == ["started", "started", "ended", "ended"]

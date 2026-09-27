@@ -165,6 +165,88 @@ def test_sending_on_one_call_never_reaches_another_calls_socket() -> None:
     assert socket_b.sent_text == []
 
 
+def test_truly_concurrent_sends_on_two_calls_never_share_pacing_or_buffer_state() -> None:
+    """Phase 2.27: proves per-call isolation under *actual* concurrent
+    scheduling (`asyncio.gather`, both streams' own `send()` coroutines
+    genuinely interleaved on the same event loop), not merely two
+    sequential calls that happen never to touch each other. Each
+    `_FreeSwitchMediaStream` owns its own `_buffer`/`_playback_started_at`/
+    `_audio_seconds_sent` -- if pacing or coalescing state were ever
+    accidentally shared (a module-level variable, a class-level mutable
+    default), interleaving these two calls' own sends would corrupt each
+    other's chunk boundaries or scheduling; this test would then fail on
+    either call's own envelope content, not just on cross-socket delivery
+    (already covered by `test_sending_on_one_call_never_reaches_another
+    _calls_socket`)."""
+    provider = FreeSwitchMediaProvider()
+    socket_a = FakeMediaSocket()
+    socket_b = FakeMediaSocket()
+    provider.register_socket("call-a", socket_a)
+    provider.register_socket("call-b", socket_b)
+
+    async def _drive(call_ref: str, marker: bytes) -> None:
+        stream = await provider.attach(call_ref)
+        for _ in range(5):
+            await stream.send(marker * 1600)  # each send is below the coalescing threshold.
+            await asyncio.sleep(0)  # yield, so the other call's own sends can interleave.
+        await stream.close()
+
+    async def scenario() -> None:
+        await asyncio.gather(_drive("call-a", b"\xaa"), _drive("call-b", b"\xbb"))
+
+    asyncio.run(scenario())
+
+    def _concatenated(socket: FakeMediaSocket) -> bytes:
+        out = bytearray()
+        for text in socket.sent_text:
+            out.extend(base64.b64decode(json.loads(text)["data"]["audioData"]))
+        return bytes(out)
+
+    audio_a = _concatenated(socket_a)
+    audio_b = _concatenated(socket_b)
+    assert audio_a == b"\xaa" * 8000
+    assert audio_b == b"\xbb" * 8000
+    assert b"\xbb" not in audio_a
+    assert b"\xaa" not in audio_b
+
+
+def test_closing_one_call_during_concurrent_playback_never_disturbs_another() -> None:
+    """Phase 2.27 brief section 9: "media disconnect during playback ...
+    other simultaneous calls continue unaffected" -- exercised hermetically
+    here (real-FreeSWITCH validation is section 9's own real-call
+    counterpart, docs/PHASE-2.27-CONCURRENT-MEDIA-VALIDATION.md). Call A
+    closing mid-stream (a real caller hangup's own effect) must never
+    raise, and must never affect call B's own independent stream."""
+    provider = FreeSwitchMediaProvider()
+    socket_a = FakeMediaSocket()
+    socket_b = FakeMediaSocket()
+    provider.register_socket("call-a", socket_a)
+    provider.register_socket("call-b", socket_b)
+
+    disturbed: dict[str, bool | None] = {"b_closed_after_a_detach": None}
+
+    async def scenario() -> None:
+        stream_a = await provider.attach("call-a")
+        stream_b = await provider.attach("call-b")
+        await stream_a.send(b"\xaa" * 8000)
+        await stream_b.send(b"\xbb" * 2000)  # 2000 < 3200 threshold -- stays buffered.
+        await provider.detach("call-a")  # simulates call A's own real hangup.
+        disturbed["b_closed_after_a_detach"] = socket_b.closed
+        await stream_b.send(b"\xbb" * 6000)  # call B carries on unaffected.
+        await stream_b.close()
+
+    asyncio.run(scenario())
+
+    assert socket_a.closed
+    assert disturbed["b_closed_after_a_detach"] is False  # never touched by call A's own detach.
+    assert len(socket_a.sent_text) == 1
+    assert len(socket_b.sent_text) == 1
+    envelope_b = json.loads(socket_b.sent_text[0])
+    assert base64.b64decode(envelope_b["data"]["audioData"]) == b"\xbb" * 8000
+    health_a = provider.health("call-a")
+    assert health_a.attached is False
+
+
 def test_health_before_attach_reports_unattached() -> None:
     provider = FreeSwitchMediaProvider()
     health = provider.health("never-attached")
@@ -240,6 +322,53 @@ def test_send_never_sleeps_when_the_caller_is_already_behind_real_time() -> None
 
     assert clock.sleeps == []
     assert len(socket.sent_text) == 2
+
+
+def test_pace_records_the_scheduling_delay_when_a_wait_was_needed(monkeypatch) -> None:
+    """Phase 2.27: `voiceagent.metrics.record_media_playback_scheduling_delay()`
+    -- the "playback scheduling delay" signal this phase's own concurrency
+    investigation needed and did not have from logs alone
+    (docs/PHASE-2.27-CONCURRENT-MEDIA-VALIDATION.md)."""
+    delays: list[float] = []
+    monkeypatch.setattr(
+        "voiceagent.telephony.freeswitch.media.record_media_playback_scheduling_delay",
+        delays.append,
+    )
+    clock = _FakeClock()
+    provider = FreeSwitchMediaProvider(clock=clock.clock, sleep=clock.sleep)
+    socket = FakeMediaSocket()
+    provider.register_socket("call-1", socket)
+
+    async def scenario() -> None:
+        stream = await provider.attach("call-1")
+        await stream.send(b"\x00" * 8000)  # 0.5s of audio -- no predecessor, no delay recorded.
+        await stream.send(b"\x00" * 8000)  # must wait for the first frame's own duration + margin.
+
+    asyncio.run(scenario())
+
+    assert delays == [0.5 + _LATENCY_MARGIN_SECONDS]
+
+
+def test_pace_records_zero_delay_when_already_behind_real_time(monkeypatch) -> None:
+    delays: list[float] = []
+    monkeypatch.setattr(
+        "voiceagent.telephony.freeswitch.media.record_media_playback_scheduling_delay",
+        delays.append,
+    )
+    clock = _FakeClock()
+    provider = FreeSwitchMediaProvider(clock=clock.clock, sleep=clock.sleep)
+    socket = FakeMediaSocket()
+    provider.register_socket("call-1", socket)
+
+    async def scenario() -> None:
+        stream = await provider.attach("call-1")
+        await stream.send(b"\x00" * 8000)
+        clock.now += 5.0
+        await stream.send(b"\x00" * 8000)
+
+    asyncio.run(scenario())
+
+    assert delays == [0.0]
 
 
 def test_send_buffers_small_frames_until_close_flushes_the_remainder() -> None:

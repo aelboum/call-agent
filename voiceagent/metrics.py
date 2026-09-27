@@ -79,7 +79,10 @@ __all__ = [
     "record_call_setup_latency",
     "record_call_started",
     "record_call_teardown",
+    "record_media_playback_scheduling_delay",
     "record_media_session_duration",
+    "record_media_session_ended",
+    "record_media_session_started",
     "record_media_ticket_rejected",
     "record_orchestration_event",
     "record_provider_operation",
@@ -255,6 +258,33 @@ _media_session_duration: Final = _meter.create_histogram(
     "voiceagent.media.session_duration", unit="s", description="Attached media session duration."
 )
 
+#: Phase 2.27: how many `_FreeSwitchMediaStream`s are attached right now,
+#: across every call this process is handling -- the concurrency-
+#: diagnostic question Phase 2.26's own concurrent test could not answer
+#: from logs alone ("how many calls were actually playing audio at once
+#: when this happened"). One process-wide value, `attach()`/`detach()`
+#: incrementing/decrementing it -- never a per-call label (that would be
+#: unbounded cardinality for no benefit; the *count* is the useful signal,
+#: not which calls).
+_media_active_sessions: Final = _meter.create_up_down_counter(
+    "voiceagent.media.active_sessions",
+    unit="1",
+    description="Media streams currently attached, across all calls this process is handling.",
+)
+
+#: Phase 2.27: `_FreeSwitchMediaStream._pace()`'s own computed wait before
+#: sending a coalesced chunk (`0` when a chunk was already due and no wait
+#: was needed) -- found necessary investigating real concurrent-call audio
+#: quality (docs/PHASE-2.27-CONCURRENT-MEDIA-VALIDATION.md): without this,
+#: "was pacing itself ever delayed under real concurrent load" was only
+#: answerable by re-deriving it from FreeSWITCH's own log timestamps after
+#: the fact, call by call, by hand.
+_media_playback_scheduling_delay: Final = _meter.create_histogram(
+    "voiceagent.media.playback_scheduling_delay",
+    unit="s",
+    description="_pace()'s own computed wait before sending a coalesced outbound chunk.",
+)
+
 _tool_executions: Final = _meter.create_counter(
     "voiceagent.tools.executions", unit="1", description="Tool Gateway executions, by outcome."
 )
@@ -386,6 +416,21 @@ def record_media_session_duration(duration_seconds: float) -> None:
     _safe(
         "media.session_duration",
         lambda: _media_session_duration.record(max(duration_seconds, 0.0)),
+    )
+
+
+def record_media_session_started() -> None:
+    _safe("media.active_sessions", lambda: _media_active_sessions.add(1))
+
+
+def record_media_session_ended() -> None:
+    _safe("media.active_sessions", lambda: _media_active_sessions.add(-1))
+
+
+def record_media_playback_scheduling_delay(delay_seconds: float) -> None:
+    _safe(
+        "media.playback_scheduling_delay",
+        lambda: _media_playback_scheduling_delay.record(max(delay_seconds, 0.0)),
     )
 
 
