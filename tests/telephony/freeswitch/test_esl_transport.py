@@ -95,6 +95,16 @@ class _FakeFreeSwitchServer:
         body = "".join(f"{k}: {v}\n" for k, v in fields.items())
         await self._send_frame({"Content-Type": "text/event-plain"}, body)
 
+    async def push_event_with_body(self, fields: dict[str, str], body: str) -> None:
+        """A CUSTOM event that itself carries a body -- FreeSWITCH's own
+        shape for e.g. `mod_audio_stream::play` (`switch_event_add_body()`):
+        the event's own header block, one more `Content-Length: <n>` header
+        for the nested body, a blank line, then `<n>` raw body bytes -- all
+        of it still just the outer `text/event-plain` frame's own body."""
+        header_lines = "".join(f"{k}: {v}\n" for k, v in fields.items())
+        nested = f"{header_lines}Content-Length: {len(body.encode())}\n\n{body}"
+        await self._send_frame({"Content-Type": "text/event-plain"}, nested)
+
     async def send_disconnect_notice(self) -> None:
         await self._send_frame({"Content-Type": "text/disconnect-notice"})
 
@@ -269,6 +279,69 @@ def test_event_field_values_are_url_decoded() -> None:
     event = asyncio.run(scenario())
     assert event["Caller-Caller-ID-Number"] == "+15550100"
     assert event["Caller-Destination-Number"] == "+15551234567"
+
+
+def test_an_events_own_body_is_exposed_as_dunder_body_not_corrupted_into_a_field() -> None:
+    """Phase 2.26 regression: `mod_audio_stream::play`'s own JSON body (the
+    `file` path this product needs to actually play audio back to a caller,
+    `voiceagent.telephony.freeswitch.provider._handle_play_event()`) was,
+    before this fix, silently split on its own first `":"` and merged into
+    `fields` as one garbage key -- found reproducing this exact CUSTOM event
+    against a real FreeSWITCH server. Every ordinary header field before the
+    body must still parse correctly; the body itself must survive intact,
+    unquoted (it is not FreeSWITCH's own percent-encoded header format)."""
+
+    async def scenario() -> dict[str, str]:
+        server = _FakeFreeSwitchServer()
+        host, port = await server.start()
+        try:
+            connection = await EslTcpConnection.connect(host, port, "secret")
+            try:
+                await server.push_event_with_body(
+                    {
+                        "Event-Name": "CUSTOM",
+                        "Event-Subclass": "mod_audio_stream::play",
+                        "Unique-ID": "call-1",
+                    },
+                    '{"audioDataType":"raw","sampleRate":8000,"file":"/tmp/call-1_0.tmp.r8"}',
+                )
+                event = await asyncio.wait_for(connection.events().__anext__(), timeout=2.0)
+                return dict(event)
+            finally:
+                await connection.close()
+        finally:
+            await server.close()
+
+    event = asyncio.run(scenario())
+    assert event["Event-Name"] == "CUSTOM"
+    assert event["Event-Subclass"] == "mod_audio_stream::play"
+    assert event["Unique-ID"] == "call-1"
+    assert (
+        event["__body__"]
+        == '{"audioDataType":"raw","sampleRate":8000,"file":"/tmp/call-1_0.tmp.r8"}'
+    )
+
+
+def test_an_event_with_no_body_has_no_dunder_body_key() -> None:
+    """Every event before Phase 2.26 never had a body -- confirms the fix
+    changes nothing for that, still overwhelmingly common, case."""
+
+    async def scenario() -> dict[str, str]:
+        server = _FakeFreeSwitchServer()
+        host, port = await server.start()
+        try:
+            connection = await EslTcpConnection.connect(host, port, "secret")
+            try:
+                await server.push_event({"Event-Name": "CHANNEL_ANSWER", "Unique-ID": "call-1"})
+                event = await asyncio.wait_for(connection.events().__anext__(), timeout=2.0)
+                return dict(event)
+            finally:
+                await connection.close()
+        finally:
+            await server.close()
+
+    event = asyncio.run(scenario())
+    assert "__body__" not in event
 
 
 def test_events_and_command_replies_do_not_cross_streams() -> None:

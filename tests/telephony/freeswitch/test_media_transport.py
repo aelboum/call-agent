@@ -166,7 +166,13 @@ def test_end_to_end_over_a_real_websocket_server() -> None:
                 await client.send(b"\x01\x02\x03\x04")
                 received = await asyncio.wait_for(stream.receive().__anext__(), timeout=2.0)
 
-                await stream.send(b"\x05\x06")
+                # Large enough to cross Phase 2.26's own coalescing
+                # threshold (`_MIN_CHUNK_SECONDS`) and flush immediately --
+                # this test is about `serve_freeswitch_media()`'s own wire
+                # plumbing, not `_FreeSwitchMediaStream`'s buffering, which
+                # `tests/telephony/freeswitch/test_media.py` covers on its
+                # own.
+                await stream.send(b"\x05\x06" * 2000)
                 sent_text = await asyncio.wait_for(client.recv(), timeout=2.0)
                 await provider.detach("call-1")
                 return received, [sent_text]

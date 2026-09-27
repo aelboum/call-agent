@@ -153,12 +153,38 @@ def _parse_kv_block(text: str) -> dict[str, str]:
     inbound routing entirely -- masked until now because
     `FakeEslConnection`/`FakeTelephonyProvider` never encode anything.
     `urllib.parse.unquote` is a safe no-op on a value with no `%` escape in
-    it, so this changes nothing for a field that was never encoded."""
+    it, so this changes nothing for a field that was never encoded.
+
+    **An event with its own body** (Phase 2.26 fix, found reproducing the
+    real `mod_audio_stream::play` CUSTOM event -- `mod_audio_stream`'s own
+    `switch_event_add_body()` call): FreeSWITCH's own plain-text
+    serialization of an event that carries a body appends one more
+    `Content-Length: <n>` header *inside* this same nested block, then a
+    blank line, then `<n>` raw bytes -- not further `Name: Value` lines.
+    Before this fix, that raw body (here, the JSON `mod_audio_stream` needs
+    read to actually broadcast play audio -- see
+    `voiceagent.telephony.freeswitch.provider`) was fed through the same
+    per-line `Name: Value` split as every header, silently corrupting it
+    into one garbage field (its first `":"` split at the wrong place) and
+    losing the rest -- masked until now because no event this product
+    handled before Phase 2.26 ever carried a body. The nested body, when
+    present, is exposed as `fields["__body__"]`, unquoted -- the same
+    convention `EslTcpConnection._read_loop()` already uses for a control
+    frame's own body, and deliberately **not** URL-decoded like every other
+    field here: the body is raw bytes as the module wrote them, never
+    FreeSWITCH's own percent-encoded header format."""
+    lines = text.splitlines()
     fields: dict[str, str] = {}
-    for line in text.splitlines():
+    body_start: int | None = None
+    for index, line in enumerate(lines):
+        if line == "":
+            body_start = index + 1
+            break
         name, sep, value = line.partition(":")
         if sep:
             fields[name.strip()] = unquote(value.strip())
+    if body_start is not None:
+        fields["__body__"] = "\n".join(lines[body_start:])
     return fields
 
 

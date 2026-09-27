@@ -33,6 +33,8 @@ second error type to handle a slow command differently from a failed one.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import re
 import time
 import uuid as uuid_module
@@ -100,6 +102,23 @@ _E164_PATTERN = re.compile(r"^\+[1-9]\d{1,14}$")
 #: FreeSWITCH's own accepted DTMF alphabet: digits, `*`, `#`, and `w`/`W` for
 #: an inter-digit pause -- never a character that could appear in ESL syntax.
 _DTMF_PATTERN = re.compile(r"^[0-9*#wW]{1,32}$")
+
+#: Phase 2.26: `mod_audio_stream`'s own event subclass (`mod_audio_stream.h`,
+#: `EVENT_PLAY`) for "I decoded a `streamAudio` playback payload and wrote it
+#: to this temp file" -- see `_handle_play_event()`'s own docstring for why
+#: this module, not the module itself, is the one that actually plays it.
+_PLAY_EVENT_SUBCLASS = "mod_audio_stream::play"
+#: The `file` path `mod_audio_stream` itself generates (its own
+#: `audio_streamer_glue.cpp`: `"%s%s%s_%d.tmp%s"`, built from
+#: `SWITCH_GLOBAL_dirs.temp_dir`, the channel UUID, a per-file counter, and a
+#: fixed extension) -- never influenced by this product or by anything a
+#: caller/tenant controls. Validated anyway, defense in depth, the same
+#: posture `_E164_PATTERN`/`_DTMF_PATTERN` already take for values that
+#: reach an ESL command string: reject anything shaped differently (a
+#: character that could break `uuid_broadcast`'s own space-delimited
+#: argument parsing, e.g. a space or a shell/ESL metacharacter) rather than
+#: interpolate it unchecked.
+_PLAYBACK_FILE_PATTERN = re.compile(r"^/[A-Za-z0-9_./-]+$")
 
 
 def _require_e164(value: str, *, field: str) -> None:
@@ -314,8 +333,58 @@ class FreeSwitchTelephonyProvider:
     async def stop_media_stream(self, call_ref: CallRef) -> None:
         await self._command(f"api uuid_audio_stream {call_ref} stop", operation="stop_media_stream")
 
+    async def _handle_play_event(self, raw: EslEvent) -> None:
+        """Phase 2.26: `mod_audio_stream`'s own build at this product's
+        pinned FreeSWITCH image commit (`ec2a781`, `amigniter/
+        mod_audio_stream`) implements exactly half of "play this audio to
+        the caller" -- it decodes a `streamAudio` payload, writes it to a
+        temp file, and fires `mod_audio_stream::play` (this module's own
+        `EVENT_PLAY`) naming that file. It never calls FreeSWITCH's own
+        channel-audio-injection API itself (verified empirically: reading
+        this exact pinned commit's own `audio_streamer_glue.cpp` top to
+        bottom, there is no `switch_ivr_broadcast`/`switch_ivr_play_file`
+        call anywhere in it) -- by this vendor's own design (its README:
+        the commercial edition, not this pinned free one, adds "automatic
+        playback"; the free edition's own event exists precisely so an ESL
+        listener can finish the job itself). This is the one place in this
+        product with a live ESL connection to react to that event, so it is
+        the one place that closes the loop: `uuid_broadcast <call_ref>
+        <file> aleg` is FreeSWITCH's own documented mechanism for playing a
+        file to one leg of a live channel -- confirmed against this exact
+        pinned image via a real SIP call, real RTP, and a real captured
+        tone (docs/PHASE-2.26-REAL-SIP-TTS-PLAYBACK.md).
+
+        Never raises: a malformed/absent body, an unparseable JSON payload,
+        an unexpected `file` shape, or a failed/timed-out broadcast (e.g.
+        the caller already hung up) all simply mean no audio is played for
+        this one event -- never a reason to tear down the whole event
+        stream every other call on this connection depends on."""
+        call_ref = raw.get("Unique-ID", "")
+        body = raw.get("__body__")
+        if not call_ref or not body:
+            return
+        try:
+            payload = json.loads(body)
+        except ValueError:
+            return
+        if not isinstance(payload, dict):
+            return
+        file_path = payload.get("file")
+        if not isinstance(file_path, str) or not _PLAYBACK_FILE_PATTERN.match(file_path):
+            return
+        with contextlib.suppress(TransportError):
+            await self._command(
+                f"api uuid_broadcast {call_ref} {file_path} aleg", operation="broadcast_play"
+            )
+
     async def events(self) -> AsyncIterator[CallEvent]:
         async for raw in self._esl.events():
+            if (
+                raw.get("Event-Name") == "CUSTOM"
+                and raw.get("Event-Subclass") == _PLAY_EVENT_SUBCLASS
+            ):
+                await self._handle_play_event(raw)
+                continue
             normalized = _normalize_event(raw)
             if normalized is not None:
                 yield normalized

@@ -572,46 +572,66 @@ async def _run_one_call(
     return 0, evidence
 
 
+def _call_kwargs(args: argparse.Namespace, i: int) -> dict:
+    media_listen_port = args.media_listen_port + i
+    # The port this call's own listener actually binds and the port in
+    # the URL FreeSWITCH is told to connect to (`media_public_base_url`)
+    # must be the exact same one -- offsetting only the former across
+    # sequential calls while leaving the latter fixed silently points
+    # FreeSWITCH's own `mod_audio_stream` at a port nothing is
+    # listening on for every call after the first, which it reports
+    # only as an unhelpful, instantaneous "connection error" with no
+    # further detail (found the hard way -- see
+    # docs/PHASE-2.25-REAL-SIP-SPOKEN-E2E.md section 3).
+    base_url, _, base_port_str = args.media_public_base_url.rpartition(":")
+    per_call_media_url = f"{base_url}:{int(base_port_str) + i}"
+    return {
+        "call_index": i,
+        "fs_host": args.fs_host,
+        "fs_esl_port": args.fs_esl_port,
+        "fs_password": args.fs_password,
+        "sip_host": args.sip_host,
+        "sip_port": args.sip_port,
+        "media_public_base_url": per_call_media_url,
+        "media_listen_host": args.media_listen_host,
+        "media_listen_port": media_listen_port,
+        "sip_advertise_ip": args.sip_advertise_ip,
+        "local_sip_port": args.local_sip_port + i,
+        "local_rtp_port": args.local_rtp_port + i,
+    }
+
+
 async def _run(args: argparse.Namespace) -> int:
     overall = 0
     all_evidence = []
-    for i in range(1, args.calls + 1):
-        media_listen_port = args.media_listen_port + i
-        # The port this call's own listener actually binds and the port in
-        # the URL FreeSWITCH is told to connect to (`media_public_base_url`)
-        # must be the exact same one -- offsetting only the former across
-        # sequential calls while leaving the latter fixed silently points
-        # FreeSWITCH's own `mod_audio_stream` at a port nothing is
-        # listening on for every call after the first, which it reports
-        # only as an unhelpful, instantaneous "connection error" with no
-        # further detail (found the hard way -- see
-        # docs/PHASE-2.25-REAL-SIP-SPOKEN-E2E.md section 3).
-        base_url, _, base_port_str = args.media_public_base_url.rpartition(":")
-        per_call_media_url = f"{base_url}:{int(base_port_str) + i}"
-        code, evidence = await _run_one_call(
-            call_index=i,
-            fs_host=args.fs_host,
-            fs_esl_port=args.fs_esl_port,
-            fs_password=args.fs_password,
-            sip_host=args.sip_host,
-            sip_port=args.sip_port,
-            media_public_base_url=per_call_media_url,
-            media_listen_host=args.media_listen_host,
-            media_listen_port=media_listen_port,
-            sip_advertise_ip=args.sip_advertise_ip,
-            local_sip_port=args.local_sip_port + i,
-            local_rtp_port=args.local_rtp_port + i,
+
+    if args.concurrent:
+        # Phase 2.26 brief section 9: a *real* concurrency test -- every
+        # call's own `_run_one_call()` in flight on the shared event loop at
+        # the same time (`asyncio.gather`), not merely run back-to-back.
+        # Distinct ports per call (`_call_kwargs()`, already required for
+        # the sequential mode too) are what make this safe: two real SIP
+        # calls, two real CallSessions, two real media WebSockets, all
+        # live simultaneously.
+        print(f"[concurrent] launching {args.calls} real SIP calls simultaneously ...")
+        results = await asyncio.gather(
+            *(_run_one_call(**_call_kwargs(args, i)) for i in range(1, args.calls + 1))
         )
-        all_evidence.append(evidence)
-        # Exit code 1 is a hard failure (signaling/lifecycle/STT-LLM never
-        # confirmed) -- stop. Exit code 2 is the known, documented partial
-        # result (real STT->LLM confirmed, real TTS audio return not
-        # observed) -- still worth attempting the remaining calls for
-        # cross-call isolation evidence.
-        if code == 1:
-            overall = 1
-            break
-        overall = max(overall, code)
+        for code, evidence in results:
+            all_evidence.append(evidence)
+            overall = 1 if code == 1 else max(overall, code)
+    else:
+        for i in range(1, args.calls + 1):
+            code, evidence = await _run_one_call(**_call_kwargs(args, i))
+            all_evidence.append(evidence)
+            # Exit code 1 is a hard failure (signaling/lifecycle/STT-LLM
+            # never confirmed) -- stop. Exit code 2 is the known,
+            # documented partial result -- still worth attempting the
+            # remaining calls for cross-call isolation evidence.
+            if code == 1:
+                overall = 1
+                break
+            overall = max(overall, code)
 
     if len(all_evidence) >= 2:
         tenants = {e.get("tenant_id") for e in all_evidence}
@@ -621,6 +641,14 @@ async def _run(args: argparse.Namespace) -> int:
         )
         if len(tenants) != len(all_evidence) or len(sessions) != len(all_evidence):
             print("FAIL: cross-call isolation check found reused tenant/CallSession identity")
+            overall = 1
+        audio_byte_counts = [e.get("captured_audio_bytes", 0) for e in all_evidence]
+        print(f"[cross-call] each call's own captured return-audio bytes: {audio_byte_counts}")
+        if args.concurrent and any(n == 0 for n in audio_byte_counts):
+            print(
+                "FAIL: concurrency check -- at least one simultaneous call received no "
+                "return audio at all (possible cross-call media starvation)"
+            )
             overall = 1
 
     if overall == 0:
@@ -650,6 +678,16 @@ def main() -> int:
     parser.add_argument("--local-sip-port", type=int, default=15070)
     parser.add_argument("--local-rtp-port", type=int, default=15170)
     parser.add_argument("--calls", type=int, default=1)
+    parser.add_argument(
+        "--concurrent",
+        action="store_true",
+        help=(
+            "Run every call simultaneously (asyncio.gather) instead of "
+            "sequentially -- Phase 2.26 brief section 9's real concurrency "
+            "validation, not just cross-call isolation between sequential "
+            "calls."
+        ),
+    )
     args = parser.parse_args()
     return asyncio.run(_run(args))
 

@@ -18,7 +18,11 @@ from voiceagent.telephony.contracts import (
     UnsupportedFormatError,
 )
 from voiceagent.telephony.freeswitch.fakes import FakeMediaSocket
-from voiceagent.telephony.freeswitch.media import FreeSwitchMediaProvider
+from voiceagent.telephony.freeswitch.media import (
+    _LATENCY_MARGIN_SECONDS,
+    _MIN_CHUNK_SECONDS,
+    FreeSwitchMediaProvider,
+)
 
 
 def test_provider_satisfies_the_media_provider_contract() -> None:
@@ -51,6 +55,12 @@ def test_double_attach_is_rejected() -> None:
 
 
 def test_send_wraps_the_documented_streamaudio_envelope() -> None:
+    """`close()` flushes: Phase 2.26's own coalescing buffer
+    (`_MIN_CHUNK_SECONDS`) does not wire out a frame this small (4 bytes,
+    far under the threshold) until either enough audio has accumulated or
+    the stream closes -- see `test_send_buffers_small_frames_and_flushes_
+    on_close` for that behavior on its own; this test only needs `close()`
+    to observe the envelope shape at all."""
     provider = FreeSwitchMediaProvider()
     socket = FakeMediaSocket()
     provider.register_socket("call-1", socket)
@@ -58,6 +68,7 @@ def test_send_wraps_the_documented_streamaudio_envelope() -> None:
     async def scenario() -> None:
         stream = await provider.attach("call-1")
         await stream.send(b"\x01\x02\x03\x04")
+        await stream.close()
 
     asyncio.run(scenario())
 
@@ -147,6 +158,7 @@ def test_sending_on_one_call_never_reaches_another_calls_socket() -> None:
     async def scenario() -> None:
         stream_a = await provider.attach("call-a")
         await stream_a.send(b"only-for-a")
+        await stream_a.close()  # flush Phase 2.26's own coalescing buffer.
 
     asyncio.run(scenario())
     assert len(socket_a.sent_text) == 1
@@ -160,3 +172,177 @@ def test_health_before_attach_reports_unattached() -> None:
     assert health.attached is False
     assert health.frames_sent == 0
     assert health.frames_received == 0
+
+
+class _FakeClock:
+    """A deterministic, manually-advanced clock/sleep pair for asserting
+    `_FreeSwitchMediaStream`'s own pacing math with no real `asyncio.sleep`
+    (Phase 2.26)."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def clock(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def test_send_paces_the_second_frame_to_the_first_frames_real_duration() -> None:
+    """Phase 2.26 regression: `mod_audio_stream`'s own pinned build turns
+    every `streamAudio` envelope into its own immediate `uuid_broadcast`
+    (`voiceagent.telephony.freeswitch.provider._handle_play_event()`),
+    which interrupts whatever the channel is already playing -- found
+    empirically against a real SIP call (docs/PHASE-2.26-REAL-SIP-TTS-
+    PLAYBACK.md): dozens of unpaced frames arrived at mod_audio_stream
+    within milliseconds of each other, each broadcast cutting off the last,
+    producing loud but unintelligible return audio. 8000 Hz, 16-bit, 1
+    channel: one second of audio is 16000 bytes, so an 8000-byte frame is
+    exactly 0.5 real seconds, plus this stream's own fixed per-frame latency
+    margin (`_LATENCY_MARGIN_SECONDS`, absorbing the real ESL round trip
+    `_handle_play_event()`'s own broadcast needs) -- the second `send()`
+    call must not be allowed to proceed until that much time has passed
+    since the first."""
+    clock = _FakeClock()
+    provider = FreeSwitchMediaProvider(clock=clock.clock, sleep=clock.sleep)
+    socket = FakeMediaSocket()
+    provider.register_socket("call-1", socket)
+
+    async def scenario() -> None:
+        stream = await provider.attach("call-1")
+        await stream.send(b"\x00" * 8000)  # 0.5s of 8kHz mono 16-bit PCM.
+        await stream.send(b"\x00" * 8000)
+
+    asyncio.run(scenario())
+
+    assert clock.sleeps == [0.5 + _LATENCY_MARGIN_SECONDS]
+
+
+def test_send_never_sleeps_when_the_caller_is_already_behind_real_time() -> None:
+    """If frames arrive slower than real-time playback (e.g. a slow AI
+    pipeline), pacing must never add an *extra* artificial delay on top --
+    only ever prevent sending *ahead* of real time, never behind it."""
+    clock = _FakeClock()
+    provider = FreeSwitchMediaProvider(clock=clock.clock, sleep=clock.sleep)
+    socket = FakeMediaSocket()
+    provider.register_socket("call-1", socket)
+
+    async def scenario() -> None:
+        stream = await provider.attach("call-1")
+        await stream.send(b"\x00" * 8000)  # 0.5s of audio.
+        clock.now += 5.0  # far more real time than the frame's own duration.
+        await stream.send(b"\x00" * 8000)
+
+    asyncio.run(scenario())
+
+    assert clock.sleeps == []
+    assert len(socket.sent_text) == 2
+
+
+def test_send_buffers_small_frames_until_close_flushes_the_remainder() -> None:
+    """Phase 2.26 regression: real TTS output arrives as many small chunks
+    (`voiceagent.providers.tts.deepgram_aura`'s own raw HTTP stream
+    chunks) -- each individually far under `_MIN_CHUNK_SECONDS`. Sending
+    one `uuid_broadcast` per tiny chunk multiplied real ESL round-trip
+    overhead across dozens of chunks for one reply and made a real SIP
+    call's return audio unintelligible (docs/PHASE-2.26-REAL-SIP-TTS-
+    PLAYBACK.md) -- fixed by buffering until enough audio has accumulated.
+    No caller-provided byte may ever be silently dropped: whatever remains
+    buffered below the threshold when the stream closes must still reach
+    the wire, intact and in order."""
+    provider = FreeSwitchMediaProvider()
+    socket = FakeMediaSocket()
+    provider.register_socket("call-1", socket)
+
+    async def scenario() -> None:
+        stream = await provider.attach("call-1")
+        await stream.send(b"\x01" * 100)
+        await stream.send(b"\x02" * 100)
+        assert socket.sent_text == []  # still well under _MIN_CHUNK_SECONDS.
+        await stream.close()
+
+    asyncio.run(scenario())
+
+    assert len(socket.sent_text) == 1
+    envelope = json.loads(socket.sent_text[0])
+    assert base64.b64decode(envelope["data"]["audioData"]) == b"\x01" * 100 + b"\x02" * 100
+
+
+def test_send_flushes_automatically_once_the_threshold_is_crossed() -> None:
+    provider = FreeSwitchMediaProvider()
+    socket = FakeMediaSocket()
+    provider.register_socket("call-1", socket)
+    threshold_bytes = int(_MIN_CHUNK_SECONDS * 8000 * 1 * 2)
+
+    async def scenario() -> None:
+        stream = await provider.attach("call-1")
+        await stream.send(b"\x00" * (threshold_bytes - 1))
+        assert socket.sent_text == []
+        await stream.send(b"\x01")  # crosses the threshold by exactly one byte.
+        assert len(socket.sent_text) == 1
+        await stream.send(b"\x02" * 10)  # starts a fresh buffer, not yet flushed.
+        assert len(socket.sent_text) == 1
+        await stream.close()
+
+    asyncio.run(scenario())
+
+    assert len(socket.sent_text) == 2
+    first = json.loads(socket.sent_text[0])
+    second = json.loads(socket.sent_text[1])
+    assert base64.b64decode(first["data"]["audioData"]) == b"\x00" * (threshold_bytes - 1) + b"\x01"
+    assert base64.b64decode(second["data"]["audioData"]) == b"\x02" * 10
+
+
+class _AlreadyClosedMediaSocket(FakeMediaSocket):
+    """A `MediaSocket` whose remote end already tore down the connection --
+    `send_text()` raises exactly like a real `WebSocketMediaSocket` does
+    against an already-closed real WebSocket
+    (`voiceagent.telephony.freeswitch.media_transport`'s own docstring:
+    only `receive_binary()` converts a closed connection to a clean end;
+    `send_text()` propagates it unchanged)."""
+
+    async def send_text(self, text: str) -> None:
+        raise ConnectionError("connection already closed")
+
+
+def test_close_swallows_a_flush_failure_from_an_already_closed_socket() -> None:
+    """Phase 2.26 regression: found on a real SIP call -- the remote end
+    (`mod_audio_stream`) tearing down its own WebSocket as part of a real
+    caller hangup, before this call's own `detach()`/`close()` ever runs,
+    is an ordinary race on the live call path, not a bug. Before this fix,
+    `close()`'s own new best-effort flush of a buffered tail turned that
+    ordinary race into an unhandled exception straight out of
+    `voiceagent.runtime.call_task.run_call_task()`'s own `media.detach()`
+    call -- this must never happen: there is no live channel left for that
+    last, already-decided tail of audio to reach anyway."""
+    provider = FreeSwitchMediaProvider()
+    socket = _AlreadyClosedMediaSocket()
+    provider.register_socket("call-1", socket)
+
+    async def scenario() -> None:
+        stream = await provider.attach("call-1")
+        await stream.send(b"\x01" * 100)  # buffered, under the threshold.
+        await stream.close()  # must not raise.
+
+    asyncio.run(scenario())  # would raise ConnectionError before this fix.
+
+    assert socket.closed
+
+
+def test_send_does_not_pace_the_very_first_frame() -> None:
+    clock = _FakeClock()
+    provider = FreeSwitchMediaProvider(clock=clock.clock, sleep=clock.sleep)
+    socket = FakeMediaSocket()
+    provider.register_socket("call-1", socket)
+
+    async def scenario() -> None:
+        stream = await provider.attach("call-1")
+        await stream.send(b"\x00" * 8000)
+
+    asyncio.run(scenario())
+
+    assert clock.sleeps == []
+    assert len(socket.sent_text) == 1
