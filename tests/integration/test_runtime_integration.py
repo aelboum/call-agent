@@ -40,7 +40,13 @@ from voiceagent.providers.engines.component_fakes import (
     FakeSttProvider,
     FakeTtsProvider,
 )
-from voiceagent.providers.engines.contracts import EngineSessionConfig, TurnEnded
+from voiceagent.providers.engines.contracts import (
+    AudioOut,
+    EngineSessionConfig,
+    FinalTranscript,
+    PartialTranscript,
+    TurnEnded,
+)
 from voiceagent.providers.engines.pipelined import PipelinedEngine
 from voiceagent.runtime.assignment import NoRuntimeCapacityError, assign_call_to_runtime
 from voiceagent.runtime.call_task import CallTaskDependencies, CancellationSignal, run_call_task
@@ -792,3 +798,162 @@ def test_shutdown_cancels_all_owned_calls_and_deregisters_heartbeat(
     assert get_call_session(context, call_a.id).status == "interrupted"
     assert get_call_session(context, call_b.id).status == "interrupted"
     assert get_call_session(context, call_a.id).end_reason == "runtime_shutdown"
+
+
+# --------------------------------------------------------------------------
+# Phase 2.28 (brief sections 7/8): a real caller hangup arriving while this
+# call's own AI turn is wedged mid-STT/LLM/TTS must finalize *this* call
+# without hanging, and must never delay or corrupt a second, concurrent
+# call's own independent audio -> STT -> LLM -> TTS round trip. Each stall
+# provider mirrors `tests/providers/test_pipelined_engine_hardening.py`'s
+# own `_Stalling*Provider` pattern (already proving `PipelinedEngineSession`
+# itself tolerates this) -- this test's own new ground is the *supervisor*
+# level: two real concurrent `CallRuntime`-owned tasks, one hangup
+# (`cancel_call`, the same call `voiceagent.runtime.telephony_events`'s own
+# remote-`HUNGUP` path makes), one call left running.
+# --------------------------------------------------------------------------
+
+
+class _StallingSttProvider:
+    async def stream(self, audio):
+        yield PartialTranscript(text="stalled")
+        await asyncio.Event().wait()
+        yield FinalTranscript(text="unreachable")  # pragma: no cover
+
+
+class _StallingLlmProvider:
+    async def stream_turn(self, messages, tools):
+        yield "partial reply, then wedged"
+        await asyncio.Event().wait()
+        yield "unreachable"  # pragma: no cover
+
+
+class _StallingTtsProvider:
+    async def synthesize(self, text, voice):
+        yield AudioOut(frame=b"one", sample_rate=8000)
+        await asyncio.Event().wait()
+        yield AudioOut(frame=b"unreachable", sample_rate=8000)  # pragma: no cover
+
+
+def _stalled_call_a_engine(stage: str) -> PipelinedEngine:
+    if stage == "stt":
+        return PipelinedEngine(
+            _StallingSttProvider(), FakeLlmProvider([[TurnEnded()]]), FakeTtsProvider()
+        )
+    if stage == "llm":
+        return PipelinedEngine(
+            FakeSttProvider(["hi"], frames_per_utterance=1),
+            _StallingLlmProvider(),
+            FakeTtsProvider(),
+        )
+    assert stage == "tts"
+    return PipelinedEngine(
+        FakeSttProvider(["hi"], frames_per_utterance=1),
+        FakeLlmProvider([["a reply to synthesize", TurnEnded()]]),
+        _StallingTtsProvider(),
+    )
+
+
+@pytest.mark.parametrize("stage", ["stt", "llm", "tts"])
+def test_hangup_mid_stalled_ai_turn_leaves_a_concurrent_call_unaffected(
+    make_call_session, system_actor_user_id, stage
+) -> None:
+    context, make = make_call_session
+    call_a, call_b = make(), make()
+    db = DatabaseBoundary(max_workers=4)
+    runtime = CallRuntime(
+        instance_id=f"rt-hangup-{stage}",
+        address="x",
+        capacity=10,
+        heartbeat_store=FakeHeartbeatStore(),
+    )
+    media_a = FakeMediaProvider()
+    deps_a = CallTaskDependencies(
+        engine=_stalled_call_a_engine(stage),
+        media=media_a,
+        telephony=FakeTelephonyProvider(),
+        db=db,
+        policy_source=_permissive_policy_source(),
+        tool_gateway=ToolGateway(),
+        conversation_persistence=ConversationPersistence(db),
+        system_actor_user_id=system_actor_user_id,
+        system_service_account_name="voiceagent-runtime",
+    )
+    media_b = FakeMediaProvider()
+    deps_b = CallTaskDependencies(
+        engine=PipelinedEngine(
+            FakeSttProvider(["hi"], frames_per_utterance=1),
+            FakeLlmProvider([["all clear", TurnEnded()]]),
+            FakeTtsProvider(),
+        ),
+        media=media_b,
+        telephony=FakeTelephonyProvider(),
+        db=db,
+        policy_source=_permissive_policy_source(),
+        tool_gateway=ToolGateway(),
+        conversation_persistence=ConversationPersistence(db),
+        system_actor_user_id=system_actor_user_id,
+        system_service_account_name="voiceagent-runtime",
+    )
+
+    async def scenario() -> None:
+        await runtime.start_call(context, call_a.id, "ref-a", deps_a)
+        await runtime.start_call(context, call_b.id, "ref-b", deps_b)
+
+        # Wait for both call tasks to actually reach `media.attach()` --
+        # a fixed sleep here raced the two tasks' own scheduling under load
+        # (observed: `KeyError: 'ref-b'` when call B's task had not yet run
+        # far enough to populate `media_b.streams`), the same class of
+        # test-harness timing sensitivity the comment below already warns
+        # about for `cancel_call()`'s own bound.
+        for _ in range(200):
+            if "ref-a" in media_a.streams and "ref-b" in media_b.streams:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("call tasks never attached media")
+
+        # Drive call A into the stalled stage, and call B through one real
+        # (fast, non-stalled) turn -- both concurrently, over their own
+        # independent `FakeMediaStream`.
+        media_a.streams["ref-a"].push(b"frame-a")
+        media_b.streams["ref-b"].push(b"frame-b")
+        await asyncio.sleep(0.1)
+
+        assert runtime.is_running(call_a.id)
+        assert runtime.is_running(call_b.id)
+
+        # The real hangup path: `voiceagent.runtime.telephony_events`'s own
+        # remote-HUNGUP handling ends here in exactly the same call --
+        # `CallRuntime.cancel_call()`.
+        # `cancel_call()` self-bounds (`cancel_timeout_seconds`, default
+        # 10s) -- long enough to cover `PipelinedEngineSession.close()`'s
+        # own bounded 5s wait for the stalled `_stt_task`/turn to unwind, so
+        # no additional wrapping timeout is layered on here (one already
+        # raced this bound in development: an outer `wait_for()` shorter
+        # than the inner close-bound races the exact moment the inner one
+        # fires and is swallowed by `cancel_call()`'s own broad `except
+        # asyncio.CancelledError: pass`, defeating the assertion below for
+        # a reason that has nothing to do with the product's own behavior).
+        await runtime.cancel_call(call_a.id, reason="hangup")
+
+        assert not runtime.is_running(call_a.id)
+        assert runtime.is_running(call_b.id)
+
+        await runtime.cancel_call(call_b.id, reason="hangup")
+        assert runtime.current_load == 0
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        db.close()
+
+    final_a = get_call_session(context, call_a.id)
+    final_b = get_call_session(context, call_b.id)
+    # Call A: hung up while wedged mid-turn -- must reach a real terminal
+    # status, never left `in_progress` with no runtime left to finish it
+    # (module docstring of `voiceagent.runtime.call_task`).
+    assert final_a.status in {"completed", "interrupted", "failed"}
+    # Call B: never stalled, and must complete its own round trip
+    # regardless of call A's own concurrent failure (brief section 8).
+    assert final_b.status == "completed"

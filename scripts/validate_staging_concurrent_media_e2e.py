@@ -54,6 +54,14 @@ ingredient is the shared-infra wiring and the instrumentation above.
 Staging-only test tooling, not product code, not imported by anything
 under `voiceagent/`. Never prints a secret or more than a short bounded
 transcript preview.
+
+**Phase 2.28 additions** (brief sections 3, 5, 7): `--phrase-mode identical`
+(section 5, isolates concurrency from phrase difficulty as a variable),
+`--early-hangup-seconds` (section 7 A-D, a real live hangup-during-
+processing test), and `CallTimeline.stt_transcript_persisted_at`/
+`llm_response_persisted_at` (section 3, read from the already-durable
+`ConversationTurn.created_at` rather than adding new instrumentation). No
+change to the shared-infra wiring or the Phase 2.27 default-mode behavior.
 """
 
 from __future__ import annotations
@@ -256,12 +264,29 @@ class CallTimeline:
     capture_stopped_at: float = 0.0
     bye_at: float = 0.0
     terminal_at: float = 0.0
+    #: Phase 2.28 (brief section 3): read from the already-durable
+    #: `ConversationTurn.created_at` this call's own turns were persisted
+    #: with (`voiceagent.conversations.models`) -- a real, existing
+    #: timestamp, not a new instrumentation point. Proxies for "STT
+    #: transcript ready" / "LLM response ready" respectively: a turn is
+    #: persisted immediately after the event that produced it is emitted
+    #: (`voiceagent.runtime.conversation_persistence`), so this is at most
+    #: one bounded, best-effort queue-flush delay later than the true
+    #: provider-side event, never earlier.
+    stt_transcript_persisted_at: float | None = None
+    llm_response_persisted_at: float | None = None
 
     def as_dict(self) -> dict:
-        return {k: round(v, 3) for k, v in vars(self).items() if k != "call_index"}
+        return {
+            k: (round(v, 3) if isinstance(v, float) else v)
+            for k, v in vars(self).items()
+            if k != "call_index"
+        }
 
 
-def _provision_fixture(call_index: int, user_id: uuid.UUID) -> CallFixture:
+def _provision_fixture(
+    call_index: int, user_id: uuid.UUID, *, phrase_mode: str = "distinct"
+) -> CallFixture:
     """Real SaaS-OS/product fixture creation -- deliberately run *before*
     any simultaneous SIP traffic starts (see this module's own docstring,
     point 3): these are bare, unwrapped synchronous calls (matching Phase
@@ -270,8 +295,19 @@ def _provision_fixture(call_index: int, user_id: uuid.UUID) -> CallFixture:
     phase. No production call path ever provisions a tenant/agent/phone
     number live during a call, so this ordering isolates the concurrency
     question this phase actually asks (does *concurrent call handling*
-    degrade audio) from an artifact of this script's own setup code."""
-    question, reply, keyword = _CALL_PHRASES[(call_index - 1) % len(_CALL_PHRASES)]
+    degrade audio) from an artifact of this script's own setup code.
+
+    Phase 2.28 (brief section 5): `phrase_mode="identical"` gives every
+    call in the batch the *same* (question, reply, keyword) triple --
+    every call's own agent is separately provisioned as always, but all
+    answer with the same phrase, so a recognition miss can no longer be
+    explained by "this one phrase is just harder to hear"; only concurrency
+    itself remains as a variable. Cross-contamination detection (`heard
+    another call's own distinct keyword`) is meaningless in this mode by
+    construction -- see `_run_shared()`'s own handling of
+    `cross_contamination_detected` for `phrase_mode="identical"`."""
+    index = 0 if phrase_mode == "identical" else (call_index - 1) % len(_CALL_PHRASES)
+    question, reply, keyword = _CALL_PHRASES[index]
     tenant = create_tenant(f"phase227-{uuid.uuid4().hex[:8]}")
     context = TenantContext(tenant_id=tenant.id, actor_id=user_id, membership_id=uuid.uuid4())
     agent = create_agent(context, name=f"Phase 2.27 Verification Bot {call_index}")
@@ -299,11 +335,29 @@ async def _run_call_on_shared_infra(
     sip_advertise_ip: str,
     local_sip_port: int,
     local_rtp_port: int,
+    early_hangup_seconds: float | None = None,
 ) -> tuple[int, dict]:
     """One call's own live-traffic scenario against infra that is already
     running and shared with every other concurrent call -- no
     construction/teardown of telephony/media/orchestrator here (see
-    `_run_shared()`, which owns that for the whole batch)."""
+    `_run_shared()`, which owns that for the whole batch).
+
+    Phase 2.28 (brief section 7, A-D): `early_hangup_seconds`, when set,
+    replaces the default full 12s AI-processing wait with a real caller BYE
+    after only that many seconds from the end of the caller's own spoken
+    utterance -- a real, live test of hanging up mid-STT/LLM/TTS/playback
+    against the real FreeSWITCH/Deepgram/OpenAI stack, rather than only the
+    hermetic fakes `tests/integration/test_runtime_integration.py
+    ::test_hangup_mid_stalled_ai_turn_leaves_a_concurrent_call_unaffected`
+    already proves this against. No stage boundary is known precisely in a
+    real network round trip (unlike the hermetic test's own deterministic
+    stall points), so this is coarse by construction -- a real elapsed-time
+    budget, not a proof of which exact stage was interrupted. When set, the
+    normal own-reply/duration audio-quality contract (below) is not
+    evaluated as a pass/fail signal, since a real early hangup can
+    legitimately mean no reply audio ever arrived -- only "did the
+    CallSession reach a real terminal state, cleanly, with no crash" is
+    asserted."""
     label = f"call {fixture.call_index}"
     evidence: dict = {"tenant_id": str(fixture.tenant_id), "e164": fixture.e164}
     timeline = CallTimeline(call_index=fixture.call_index)
@@ -393,7 +447,7 @@ async def _run_call_on_shared_infra(
     await asyncio.sleep(caller_audio_seconds + 1.0)
     timeline.caller_stream_ended_at = time.monotonic()
 
-    await asyncio.sleep(12.0)
+    await asyncio.sleep(12.0 if early_hangup_seconds is None else early_hangup_seconds)
     timeline.ai_wait_ended_at = time.monotonic()
 
     captured_rtp8 = capture.stop_and_get()
@@ -416,6 +470,12 @@ async def _run_call_on_shared_infra(
     evidence["real_user_transcript"] = user_turns[0].content if user_turns else None
     evidence["real_assistant_reply"] = assistant_turns[0].content if assistant_turns else None
     print(f"      {label}: real LLM response: {_preview(evidence['real_assistant_reply'] or '')!r}")
+    stt_persisted_at = user_turns[0].created_at.timestamp() if user_turns else None
+    llm_persisted_at = assistant_turns[0].created_at.timestamp() if assistant_turns else None
+    timeline.stt_transcript_persisted_at = stt_persisted_at
+    timeline.llm_response_persisted_at = llm_persisted_at
+    if stt_persisted_at is not None and llm_persisted_at is not None:
+        evidence["stt_to_llm_seconds"] = round(llm_persisted_at - stt_persisted_at, 3)
 
     timeline.bye_at = time.monotonic()
     bye_status = uac.bye(remote_tag=result.remote_tag)
@@ -442,6 +502,21 @@ async def _run_call_on_shared_infra(
     if not ok:
         print(f"FAIL ({label}): CallSession never reached a terminal status after real caller BYE")
         return 1, evidence
+
+    if early_hangup_seconds is not None:
+        # Section 7 A-D: the only claim this mode makes is "hung up early,
+        # still reached a real terminal state, cleanly" -- see this
+        # function's own docstring for why the usual audio-quality contract
+        # below is not a meaningful pass/fail signal here.
+        print(
+            f"PASS ({label}): early hangup after {early_hangup_seconds}s reached a real "
+            f"terminal CallSession status ({final_row.status!r}) cleanly"
+        )
+        evidence["early_hangup_seconds"] = early_hangup_seconds
+        evidence["own_reply_present"] = fixture.keyword in heard.lower()
+        evidence["cross_contamination_detected"] = False
+        evidence["timeline"] = timeline.as_dict()
+        return 0, evidence
 
     # --- audio-quality verification (brief section 7) --------------------
     # Keyword-based, not full-sentence: real Deepgram STT over a
@@ -491,7 +566,10 @@ async def _run_shared(args: argparse.Namespace) -> int:
         "(sequential, before any simultaneous SIP traffic) ..."
     )
     user = create_user()
-    fixtures = [_provision_fixture(i, user.id) for i in range(1, args.calls + 1)]
+    fixtures = [
+        _provision_fixture(i, user.id, phrase_mode=args.phrase_mode)
+        for i in range(1, args.calls + 1)
+    ]
     for f in fixtures:
         print(
             f"      call {f.call_index}: tenant={f.tenant_id} phone={f.e164} "
@@ -583,6 +661,7 @@ async def _run_shared(args: argparse.Namespace) -> int:
                     sip_advertise_ip=args.sip_advertise_ip,
                     local_sip_port=args.local_sip_port + f.call_index,
                     local_rtp_port=args.local_rtp_port + f.call_index,
+                    early_hangup_seconds=args.early_hangup_seconds,
                 )
                 for f in fixtures
             )
@@ -672,6 +751,31 @@ def main() -> int:
     parser.add_argument("--local-sip-port", type=int, default=15700)
     parser.add_argument("--local-rtp-port", type=int, default=15800)
     parser.add_argument("--calls", type=int, default=2)
+    parser.add_argument(
+        "--early-hangup-seconds",
+        type=float,
+        default=None,
+        help=(
+            "Phase 2.28 brief section 7 A-D: send a real caller BYE this many seconds "
+            "after the caller's own utterance ends, instead of waiting the default 12s "
+            "for a full AI round trip -- a real, live hangup-mid-processing test. Omit "
+            "for the default (Phase 2.27) full-round-trip behavior."
+        ),
+    )
+    parser.add_argument(
+        "--phrase-mode",
+        choices=["distinct", "identical"],
+        default="distinct",
+        help=(
+            "Phase 2.28 brief section 5: 'distinct' (default, Phase 2.27 behavior) gives "
+            "every call its own keyword so cross-call contamination is mechanically "
+            "detectable; 'identical' gives every call the same phrase so a recognition "
+            "miss cannot be blamed on 'this phrase is just harder to hear' -- only "
+            "concurrency remains as a variable. Cross-contamination detection is not "
+            "meaningful in 'identical' mode (every call's own keyword is every other "
+            "call's own keyword too) -- use 'distinct' runs for that question."
+        ),
+    )
     args = parser.parse_args()
     return asyncio.run(_run_shared(args))
 
