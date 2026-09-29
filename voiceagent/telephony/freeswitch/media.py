@@ -228,12 +228,10 @@ class _FreeSwitchMediaStream:
             # race on the live call path, not a bug -- found immediately
             # once this close-time flush existed, on a real SIP call
             # (docs/PHASE-2.26-REAL-SIP-TTS-PLAYBACK.md).
-            # `WebSocketMediaSocket.send_text()` propagates a closed
-            # connection unchanged (`voiceagent.telephony.freeswitch
-            # .media_transport`'s own docstring: only `receive_binary()`
-            # converts it to a clean end), so this is the one place that
-            # must not let it turn a normal hangup's own cleanup into an
-            # unhandled exception. Losing this last, sub-`_MIN_CHUNK_SECONDS`
+            # `WebSocketMediaSocket.send_text()` raises `TransportError` for
+            # a closed connection (Phase 2.29 fix), so this is the one place
+            # that must not let it turn a normal hangup's own cleanup into
+            # an unhandled exception. Losing this last, sub-`_MIN_CHUNK_SECONDS`
             # tail of already-decided audio to a connection that is already
             # gone is an acceptable, bounded loss -- there is no live
             # channel left for it to reach anyway.

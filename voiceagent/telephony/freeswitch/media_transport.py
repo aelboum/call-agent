@@ -145,7 +145,23 @@ class WebSocketMediaSocket:
         self._closed = False
 
     async def send_text(self, text: str) -> None:
-        await self._send(text)
+        """Raises `TransportError` if the remote end is gone (Phase 2.29
+        fix: previously propagated the raw `_send` callable's own exception
+        unchanged, which for the real `websockets` connection meant a raw
+        `websockets.exceptions.ConnectionClosed` reached `voiceagent.runtime
+        .call_task.run_call_task()` -- contradicting this module's own
+        stated contract (`voiceagent.telephony.contracts`'s own docstring:
+        "An adapter never lets a transport-specific exception escape: the
+        runtime reacts to this taxonomy, not to a vendor's exception
+        types"). `media.py`'s own `close()`-time best-effort flush already
+        wraps every call here in `contextlib.suppress(Exception)`, so this
+        change does not alter that path's behavior -- only a live (non-close)
+        `send()` during an active call newly gets a classifiable exception
+        instead of an unclassified one."""
+        try:
+            await self._send(text)
+        except _ConnectionClosed as exc:
+            raise TransportError("media transport closed") from exc
 
     async def receive_binary(self) -> AsyncIterator[bytes]:
         while True:
@@ -248,6 +264,12 @@ async def serve_freeswitch_media(
     .handle_connection()` itself is transport-agnostic (a test calls it with
     plain callables, no real socket needed)."""
 
+    async def _send(connection: ServerConnection, text: str) -> None:
+        try:
+            await connection.send(text)
+        except ConnectionClosed as exc:
+            raise _ConnectionClosed from exc
+
     async def _recv(connection: ServerConnection) -> bytes | str:
         try:
             return await connection.recv()
@@ -257,7 +279,7 @@ async def serve_freeswitch_media(
     async def _handler(connection: ServerConnection) -> None:
         await listener.handle_connection(
             connection.request.path if connection.request is not None else "",
-            send=connection.send,
+            send=lambda text: _send(connection, text),
             recv=lambda: _recv(connection),
             close=connection.close,
             wait_closed=connection.wait_closed,

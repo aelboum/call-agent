@@ -58,6 +58,7 @@ from voiceagent.runtime.heartbeat import RuntimeHeartbeat
 from voiceagent.runtime.privacy import StaticAiDataPolicySource, authorize_call_data_access
 from voiceagent.runtime.reconciliation import reconcile_tenant
 from voiceagent.runtime.supervisor import CallRuntime
+from voiceagent.telephony.contracts import TransportError
 from voiceagent.telephony.fakes import FakeMediaProvider, FakeTelephonyProvider
 from voiceagent.tenancy import TenantContext
 from voiceagent.tools.gateway import ToolGateway
@@ -957,3 +958,186 @@ def test_hangup_mid_stalled_ai_turn_leaves_a_concurrent_call_unaffected(
     # Call B: never stalled, and must complete its own round trip
     # regardless of call A's own concurrent failure (brief section 8).
     assert final_b.status == "completed"
+
+
+def test_media_transport_dying_mid_turn_reaches_a_terminal_status(
+    make_call_session, system_actor_user_id
+) -> None:
+    """Phase 2.29 section 2 defect, fixed. The media transport disappearing
+    out from under a live call (not a clean caller-initiated `detach()`, not
+    a real remote `HUNGUP` event, not outer runtime cancellation) mid-turn
+    must finalize the `CallSession` to a *failure* terminal status --
+    reaching *a* terminal status is not sufficient; reaching the *correct*
+    one is what this test asserts (matching the real-staging finding's own
+    precise complaint: the call silently reported itself as a normal
+    success).
+
+    First observed for real against the real p224-freeswitch staging stack:
+    a real `api uuid_audio_stream <uuid> stop` against one call's own
+    channel produced a real, logged `websockets.exceptions.ConnectionClosedOK`
+    from `media_stream.send()`, an ERROR-level `call.task.failed` supervisor
+    log, and yet `CallSession.status == 'completed'` (see
+    `docs/PHASE-2.29-REAL-MEDIA-FAILURE-STABILITY.md` for the full traceback
+    and the exact real command issued). Reproduced hermetically and
+    deterministically here without real infra, before and after the fix:
+    before, this test failed this exact assertion (`status == 'completed'`);
+    after (`voiceagent.runtime.call_task.run_call_task()`'s new `except
+    TransportError: cancellation.reason = "media_disconnect"`), it passes.
+
+    Raises `TransportError` -- the real media/telephony adapter's own
+    documented failure taxonomy (`voiceagent.telephony.contracts`), and
+    exactly what the real `_FreeSwitchMediaStream.send()` raises for a dead
+    connection since the companion Phase 2.29 fix to
+    `voiceagent.telephony.freeswitch.media_transport.WebSocketMediaSocket
+    .send_text()` -- not an arbitrary exception type, so this test proves
+    the fix's actual classification path, not just "some exception escaped
+    the pump"."""
+    context, make = make_call_session
+    call = make()
+    db = DatabaseBoundary(max_workers=2)
+    runtime = CallRuntime(
+        instance_id="rt-media-death",
+        address="x",
+        capacity=10,
+        heartbeat_store=FakeHeartbeatStore(),
+    )
+    media = FakeMediaProvider()
+    deps = CallTaskDependencies(
+        engine=PipelinedEngine(
+            FakeSttProvider(["hi"], frames_per_utterance=1),
+            FakeLlmProvider([["a reply to synthesize", TurnEnded()]]),
+            FakeTtsProvider(),
+        ),
+        media=media,
+        telephony=FakeTelephonyProvider(),
+        db=db,
+        policy_source=_permissive_policy_source(),
+        tool_gateway=ToolGateway(),
+        conversation_persistence=ConversationPersistence(db),
+        system_actor_user_id=system_actor_user_id,
+        system_service_account_name="voiceagent-runtime",
+    )
+
+    async def scenario() -> None:
+        await runtime.start_call(context, call.id, "ref-dying", deps)
+
+        for _ in range(200):
+            if "ref-dying" in media.streams:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("call task never attached media")
+
+        # Simulate the transport dying out from under the call -- exactly
+        # what the real `websockets` connection did in staging once
+        # `mod_audio_stream` was stopped on that one channel. Not a clean
+        # `detach()`/`close()`: the stream's own `closed` flag is left
+        # `False`, so this is indistinguishable, from inside `media.py`'s
+        # own code, from a transport that simply stopped working.
+        stream = media.streams["ref-dying"]
+
+        async def _dying_send(frame: bytes) -> None:
+            raise TransportError("simulated transport death mid-turn")
+
+        stream.send = _dying_send  # type: ignore[method-assign]
+
+        media.streams["ref-dying"].push(b"frame")
+
+        for _ in range(500):
+            if not runtime.is_running(call.id):
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError(
+                "call task never terminated after its media transport died mid-turn"
+            )
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        db.close()
+
+    final = get_call_session(context, call.id)
+    assert final.status == "failed", (
+        f"expected a failure terminal status after the media transport died mid-turn, "
+        f"got status={final.status!r} end_reason={final.end_reason!r} -- a genuine "
+        "media failure must never be reported as an ordinary successful call"
+    )
+    assert final.end_reason == "media_disconnect"
+
+
+def test_an_unrelated_pump_exception_is_not_misclassified_as_media_disconnect(
+    make_call_session, system_actor_user_id
+) -> None:
+    """Phase 2.29 section 3's own explicit counter-requirement: the new
+    `except TransportError` in `run_call_task()` must be narrow. A failure
+    that happens to occur during the same pump -- but is not a
+    `TransportError`, i.e. has nothing to do with the media/telephony
+    transport -- must not be classified as `media_disconnect`. This test
+    raises a plain `RuntimeError` from the engine's own event stream (not
+    `media_stream.send()`) to prove the classification is keyed on exception
+    *type* from the *media* boundary, never merely on "something failed
+    somewhere in the pump"."""
+
+    class _BrokenEventsEngine:
+        async def start(self, config):
+            return _BrokenEventsSession()
+
+    class _BrokenEventsSession:
+        async def send_audio(self, frame: bytes) -> None:
+            return None
+
+        async def events(self):
+            raise RuntimeError("unrelated engine bug, nothing to do with media")
+            yield  # pragma: no cover -- makes this an async generator.
+
+        async def interrupt(self) -> None:
+            return None
+
+        async def submit_tool_result(self, result) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+    context, make = make_call_session
+    call = make()
+    db = DatabaseBoundary(max_workers=2)
+    runtime = CallRuntime(
+        instance_id="rt-unrelated-failure",
+        address="x",
+        capacity=10,
+        heartbeat_store=FakeHeartbeatStore(),
+    )
+    media = FakeMediaProvider()
+    deps = CallTaskDependencies(
+        engine=_BrokenEventsEngine(),
+        media=media,
+        telephony=FakeTelephonyProvider(),
+        db=db,
+        policy_source=_permissive_policy_source(),
+        tool_gateway=ToolGateway(),
+        conversation_persistence=ConversationPersistence(db),
+        system_actor_user_id=system_actor_user_id,
+        system_service_account_name="voiceagent-runtime",
+    )
+
+    async def scenario() -> None:
+        await runtime.start_call(context, call.id, "ref-unrelated", deps)
+        for _ in range(500):
+            if not runtime.is_running(call.id):
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("call task never terminated after its engine raised")
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        db.close()
+
+    final = get_call_session(context, call.id)
+    assert final.end_reason != "media_disconnect", (
+        f"an unrelated engine exception (RuntimeError, not TransportError) must never "
+        f"be classified as a media disconnect -- got end_reason={final.end_reason!r}"
+    )

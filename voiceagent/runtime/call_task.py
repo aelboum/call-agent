@@ -100,7 +100,13 @@ from voiceagent.runtime.db import DatabaseBoundary
 from voiceagent.runtime.errors import DataAuthorizationDeniedError
 from voiceagent.runtime.privacy import AiDataPolicySource, authorize_call_data_access
 from voiceagent.runtime.telephony_events import TelephonyEventRouter
-from voiceagent.telephony.contracts import CallEventType, CallRef, MediaProvider, TelephonyProvider
+from voiceagent.telephony.contracts import (
+    CallEventType,
+    CallRef,
+    MediaProvider,
+    TelephonyProvider,
+    TransportError,
+)
 from voiceagent.tenancy import TenantContext
 from voiceagent.tools.gateway import ToolGateway
 from voiceagent.tools.registry import TOOL_REGISTRY, ToolRegistry
@@ -136,7 +142,13 @@ class CancellationSignal:
     `asyncio.Task.cancel()` on a call task, so the task's own teardown can
     record *why* it ended (hangup vs. runtime shutdown vs. provider
     disconnect) without threading a typed payload through
-    `asyncio.CancelledError` itself, which does not reliably carry one."""
+    `asyncio.CancelledError` itself, which does not reliably carry one.
+
+    Also mutated by `run_call_task()` itself, not only the supervisor: a
+    `TransportError` from the media pump (Phase 2.29 fix) sets `reason =
+    "media_disconnect"` before re-raising, so `_final_status()` classifies a
+    real media-transport failure as `failed`, not a stale default
+    `"hangup"`/`completed`."""
 
     reason: str = "hangup"
 
@@ -574,16 +586,44 @@ async def run_call_task(
                 expected_runtime_instance_id=deps.runtime_instance_id,
             )
 
-            await _run_pumps_with_remote_hangup_detection(
-                call_session_id,
-                media_stream,
-                engine_session,
-                _dispatch_tool_call,
-                _persist_turn,
-                telephony_events=deps.telephony_events,
-                call_ref=call_ref,
-                cancellation=cancellation,
-            )
+            try:
+                await _run_pumps_with_remote_hangup_detection(
+                    call_session_id,
+                    media_stream,
+                    engine_session,
+                    _dispatch_tool_call,
+                    _persist_turn,
+                    telephony_events=deps.telephony_events,
+                    call_ref=call_ref,
+                    cancellation=cancellation,
+                )
+            except TransportError:
+                # Phase 2.29 fix: `media_stream.send()`/`.receive()` raising
+                # `TransportError` (the media adapter's own documented
+                # failure taxonomy, `voiceagent.telephony.contracts`'s own
+                # docstring -- never a vendor-specific exception by the time
+                # it reaches here) means the media transport itself is gone,
+                # not a normal hangup. Without this, `cancellation.reason`
+                # stayed at its `CancellationSignal` default of `"hangup"`
+                # (nothing else ever sets it on this path -- only the
+                # remote-HUNGUP watcher above and the supervisor's own
+                # external cancellation do), so `_final_status()` below
+                # classified a real media failure as a clean `completed`
+                # call -- reproduced twice against real FreeSWITCH and
+                # deterministically by
+                # `tests/integration/test_runtime_integration.py
+                # ::test_media_transport_dying_mid_turn_reaches_a_terminal_status`.
+                # Narrowly scoped to `TransportError` alone (never a bare
+                # `except Exception`): an unrelated engine/tool-gateway
+                # failure must not be misclassified as a media disconnect,
+                # and `TransportError` is raised only by a telephony/media
+                # adapter, never by `engine_session` or the Tool Gateway.
+                # Re-raised unchanged, never swallowed -- the original
+                # exception still propagates to the supervisor's own
+                # existing error log exactly as before; only the
+                # finalization reason below changes.
+                cancellation.reason = "media_disconnect"
+                raise
         finally:
             teardown_started_monotonic = time.monotonic()
             deps.tool_gateway.forget_call(call_session_id)

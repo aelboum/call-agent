@@ -62,6 +62,17 @@ processing test), and `CallTimeline.stt_transcript_persisted_at`/
 `llm_response_persisted_at` (section 3, read from the already-durable
 `ConversationTurn.created_at` rather than adding new instrumentation). No
 change to the shared-infra wiring or the Phase 2.27 default-mode behavior.
+
+**Phase 2.29 addition** (brief section 2): `--stop-media-call-index N`
+issues a real `stop_media_stream()` (`api uuid_audio_stream <uuid> stop`)
+against exactly call N's own real FreeSWITCH channel, mid-call, right after
+its caller audio has been streamed -- the real, existing, production ESL
+command `FreeSwitchTelephonyProvider.stop_media_stream()` already exposes
+for tearing down one call leg's own `mod_audio_stream` session. This is a
+genuine per-call media disconnect on the real shared topology (one shared
+ESL connection, one shared media listener, every other concurrent call
+untouched), not a simulated one -- no new production seam, no change to
+`voiceagent/`. Omit for the default (no induced failure) behavior.
 """
 
 from __future__ import annotations
@@ -275,6 +286,15 @@ class CallTimeline:
     #: provider-side event, never earlier.
     stt_transcript_persisted_at: float | None = None
     llm_response_persisted_at: float | None = None
+    #: Phase 2.29 (brief section 2): when this call is the one selected via
+    #: `--stop-media-call-index`, the real timestamp `stop_media_stream()`
+    #: (`api uuid_audio_stream <uuid> stop`) was issued against this call's
+    #: own real FreeSWITCH channel -- a genuine per-channel ESL command that
+    #: tears down only this call's own inbound `wss://` media connection
+    #: while its SIP dialog, and every other concurrent call's own channel
+    #: and media socket, remain completely untouched. `None` for every call
+    #: not selected.
+    media_stop_at: float | None = None
 
     def as_dict(self) -> dict:
         return {
@@ -336,6 +356,8 @@ async def _run_call_on_shared_infra(
     local_sip_port: int,
     local_rtp_port: int,
     early_hangup_seconds: float | None = None,
+    telephony: FreeSwitchTelephonyProvider | None = None,
+    induce_media_stop: bool = False,
 ) -> tuple[int, dict]:
     """One call's own live-traffic scenario against infra that is already
     running and shared with every other concurrent call -- no
@@ -359,7 +381,11 @@ async def _run_call_on_shared_infra(
     CallSession reach a real terminal state, cleanly, with no crash" is
     asserted."""
     label = f"call {fixture.call_index}"
-    evidence: dict = {"tenant_id": str(fixture.tenant_id), "e164": fixture.e164}
+    evidence: dict = {
+        "tenant_id": str(fixture.tenant_id),
+        "e164": fixture.e164,
+        "media_stop_induced": induce_media_stop,
+    }
     timeline = CallTimeline(call_index=fixture.call_index)
     context = fixture.context
 
@@ -447,6 +473,18 @@ async def _run_call_on_shared_infra(
     await asyncio.sleep(caller_audio_seconds + 1.0)
     timeline.caller_stream_ended_at = time.monotonic()
 
+    if induce_media_stop:
+        if telephony is None:
+            raise ValueError("induce_media_stop=True requires telephony to be set")
+        print(
+            f"[{label}] Phase 2.29 section 2: issuing a real "
+            f"'api uuid_audio_stream {row.fs_channel_uuid} stop' against this call's own "
+            "real FreeSWITCH channel -- its own media socket only, SIP dialog stays up, "
+            "every other concurrent call untouched ..."
+        )
+        await telephony.stop_media_stream(row.fs_channel_uuid)
+        timeline.media_stop_at = time.monotonic()
+
     await asyncio.sleep(12.0 if early_hangup_seconds is None else early_hangup_seconds)
     timeline.ai_wait_ended_at = time.monotonic()
 
@@ -502,6 +540,25 @@ async def _run_call_on_shared_infra(
     if not ok:
         print(f"FAIL ({label}): CallSession never reached a terminal status after real caller BYE")
         return 1, evidence
+
+    if induce_media_stop:
+        # Section 2: the only claim this call makes is "its own media
+        # transport disappeared mid-call, and it still reached a real
+        # terminal CallSession status, cleanly, with no crash, without
+        # disturbing any other concurrent call" -- own-reply/audio-quality
+        # is not evaluated here, mirroring the `early_hangup_seconds`
+        # branch immediately below for the identical reason (real inbound
+        # audio genuinely may not have arrived after the transport was cut).
+        print(
+            f"PASS ({label}): real per-call media disconnect reached a real terminal "
+            f"CallSession status ({final_row.status!r}) cleanly, "
+            f"end_reason={final_row.end_reason!r}"
+        )
+        evidence["media_stop_induced"] = True
+        evidence["own_reply_present"] = fixture.keyword in heard.lower()
+        evidence["cross_contamination_detected"] = False
+        evidence["timeline"] = timeline.as_dict()
+        return 0, evidence
 
     if early_hangup_seconds is not None:
         # Section 7 A-D: the only claim this mode makes is "hung up early,
@@ -662,6 +719,8 @@ async def _run_shared(args: argparse.Namespace) -> int:
                     local_sip_port=args.local_sip_port + f.call_index,
                     local_rtp_port=args.local_rtp_port + f.call_index,
                     early_hangup_seconds=args.early_hangup_seconds,
+                    telephony=telephony,
+                    induce_media_stop=(f.call_index == args.stop_media_call_index),
                 )
                 for f in fixtures
             )
@@ -774,6 +833,18 @@ def main() -> int:
             "concurrency remains as a variable. Cross-contamination detection is not "
             "meaningful in 'identical' mode (every call's own keyword is every other "
             "call's own keyword too) -- use 'distinct' runs for that question."
+        ),
+    )
+    parser.add_argument(
+        "--stop-media-call-index",
+        type=int,
+        default=0,
+        help=(
+            "Phase 2.29 brief section 2: 1-based index of the one call to induce a real "
+            "per-call media disconnect on (a genuine 'api uuid_audio_stream <uuid> stop' "
+            "ESL command against only that call's own FreeSWITCH channel, mid-call, right "
+            "after its caller audio has streamed) -- its SIP dialog and every other "
+            "concurrent call remain untouched. 0 (default) disables this."
         ),
     )
     args = parser.parse_args()

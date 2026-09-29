@@ -427,11 +427,13 @@ def test_send_flushes_automatically_once_the_threshold_is_crossed() -> None:
 
 class _AlreadyClosedMediaSocket(FakeMediaSocket):
     """A `MediaSocket` whose remote end already tore down the connection --
-    `send_text()` raises exactly like a real `WebSocketMediaSocket` does
-    against an already-closed real WebSocket
-    (`voiceagent.telephony.freeswitch.media_transport`'s own docstring:
-    only `receive_binary()` converts a closed connection to a clean end;
-    `send_text()` propagates it unchanged)."""
+    `send_text()` raises, the same as a real `WebSocketMediaSocket` does
+    against an already-closed real WebSocket (which raises `TransportError`,
+    Phase 2.29 fix). A plain `ConnectionError` here is deliberate: this test
+    exercises `close()`'s own `contextlib.suppress(Exception)`, which must
+    swallow *any* exception from a dying flush, not specifically
+    `TransportError` -- using a different exception type proves the suppress
+    is not narrower than that."""
 
     async def send_text(self, text: str) -> None:
         raise ConnectionError("connection already closed")
