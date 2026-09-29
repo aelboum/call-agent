@@ -276,6 +276,212 @@ def test_one_calls_failure_is_isolated_from_another_calls_state(monkeypatch) -> 
     assert runtime.error_for(healthy_id) is None
 
 
+async def _run_to_completion(
+    runtime: CallRuntime, call_session_id: uuid.UUID, *, timeout: float = 2.0
+) -> None:
+    """Poll until `call_session_id` is no longer running. Every fake
+    `run_call_task` in this module either raises or returns immediately (no
+    real I/O), so this only ever waits out genuine event-loop scheduling,
+    never wall-clock call duration."""
+    deadline = time.monotonic() + timeout
+    while runtime.is_running(call_session_id):
+        if time.monotonic() > deadline:
+            raise AssertionError(f"call {call_session_id} never finished")
+        await asyncio.sleep(0.005)
+
+
+def test_error_for_is_reaped_once_a_different_call_starts(monkeypatch) -> None:
+    """Phase 2.30 remediation (brief section 4, 'Failed call cleanup'): a
+    failed call's `_errors` entry does not remain indefinitely -- it survives
+    exactly until a *different* call starts on this runtime, at which point
+    `start_call()`'s own `_reap_terminal_errors()` evicts it. `_tasks`/
+    `_cancellations` cleanup (already proven elsewhere in this file) is
+    unaffected -- this test only concerns `_errors`."""
+
+    async def fake_run_call_task(*, context, call_session_id, call_ref, deps, cancellation):
+        if call_ref == "ref-broken":
+            raise RuntimeError("provider blew up")
+
+    monkeypatch.setattr(supervisor_module, "run_call_task", fake_run_call_task)
+    runtime = _runtime()
+    broken_id = uuid.uuid4()
+    next_id = uuid.uuid4()
+
+    async def scenario() -> None:
+        await runtime.start_call(_context(), broken_id, "ref-broken", _fake_deps())
+        await _run_to_completion(runtime, broken_id)
+        assert runtime.error_for(broken_id) is not None
+
+        await runtime.start_call(_context(), next_id, "ref-next", _fake_deps())
+        # The reap happens synchronously inside `start_call()`, before the
+        # new task is even scheduled -- no need to wait for `next_id` itself
+        # to finish before observing `broken_id`'s entry is gone.
+        assert runtime.error_for(broken_id) is None
+        await _run_to_completion(runtime, next_id)
+
+    asyncio.run(scenario())
+
+
+def test_successful_call_leaves_no_error_state(monkeypatch) -> None:
+    async def fake_run_call_task(*, context, call_session_id, call_ref, deps, cancellation):
+        return
+
+    monkeypatch.setattr(supervisor_module, "run_call_task", fake_run_call_task)
+    runtime = _runtime()
+    call_id = uuid.uuid4()
+
+    async def scenario() -> None:
+        await runtime.start_call(_context(), call_id, "ref-ok", _fake_deps())
+        await _run_to_completion(runtime, call_id)
+
+    asyncio.run(scenario())
+    assert runtime.error_for(call_id) is None
+
+
+def test_cancelled_call_leaves_no_error_state(monkeypatch) -> None:
+    started = asyncio.Event()
+
+    async def fake_run_call_task(*, context, call_session_id, call_ref, deps, cancellation):
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(supervisor_module, "run_call_task", fake_run_call_task)
+    runtime = _runtime()
+    call_id = uuid.uuid4()
+
+    async def scenario() -> None:
+        await runtime.start_call(_context(), call_id, "ref-cancel", _fake_deps())
+        await asyncio.wait_for(started.wait(), timeout=2)
+        await runtime.cancel_call(call_id, reason="hangup")
+
+    asyncio.run(scenario())
+    assert runtime.is_running(call_id) is False
+    assert runtime.error_for(call_id) is None
+
+
+def test_repeated_failures_do_not_accumulate_in_the_errors_dict(monkeypatch) -> None:
+    """Reproduces, hermetically, the exact defect Phase 2.30's real-staging
+    soak measured (`docs/PHASE-2.30-LONG-RUNNING-STABILITY.md` section 1):
+    before this remediation, `len(CallRuntime._errors)` grew by one for
+    every failed call and never shrank -- N failed calls in, N entries
+    retained, for the life of the process. After this remediation, the dict
+    never holds more than the single most recently failed call's entry,
+    because each new call's own `start_call()` reaps the previous one."""
+
+    async def fake_run_call_task(*, context, call_session_id, call_ref, deps, cancellation):
+        raise RuntimeError("provider blew up")
+
+    monkeypatch.setattr(supervisor_module, "run_call_task", fake_run_call_task)
+    runtime = _runtime()
+    observed_sizes: list[int] = []
+
+    async def scenario() -> None:
+        for _ in range(10):
+            call_id = uuid.uuid4()
+            await runtime.start_call(_context(), call_id, "ref-fail", _fake_deps())
+            await _run_to_completion(runtime, call_id)
+            assert runtime.error_for(call_id) is not None
+            observed_sizes.append(len(runtime._errors))  # noqa: SLF001 -- assert the old defect stays fixed
+
+    asyncio.run(scenario())
+    # Old (buggy) behavior would have produced [1, 2, 3, ..., 10]: strictly
+    # monotonic, unbounded growth. Fixed behavior: every entry is its own
+    # call's, and none has been reaped yet by the *time it is observed*
+    # (only the next call's start reaps the *previous* one) -- so each
+    # observation here is exactly 1, never accumulating.
+    assert observed_sizes == [1] * 10
+
+
+def test_concurrent_calls_error_cleanup_is_isolated_and_bounded(monkeypatch) -> None:
+    """Brief section 3/4 ('concurrent calls'): a failed call's reaping must
+    never touch another call's still-relevant state, whether that other
+    call is currently running, already succeeded, or is itself a distinct
+    failure -- and reaping is still eventually bounded once new,
+    unconnected call activity begins."""
+    release_b = asyncio.Event()
+
+    async def fake_run_call_task(*, context, call_session_id, call_ref, deps, cancellation):
+        if call_ref == "ref-a":
+            raise RuntimeError("A blew up")
+        if call_ref == "ref-b":
+            await release_b.wait()
+            return
+        if call_ref == "ref-c":
+            return
+        raise AssertionError(f"unexpected call_ref {call_ref!r}")
+
+    monkeypatch.setattr(supervisor_module, "run_call_task", fake_run_call_task)
+    runtime = _runtime()
+    call_a, call_b, call_c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+
+    async def scenario() -> None:
+        # A and B start concurrently -- A fails almost immediately while B
+        # is still deliberately held open, so A's reap-on-next-start cannot
+        # have fired yet (no *other* call has started since A's own start).
+        await runtime.start_call(_context(), call_a, "ref-a", _fake_deps())
+        await runtime.start_call(_context(), call_b, "ref-b", _fake_deps())
+        await _run_to_completion(runtime, call_a)
+        assert runtime.error_for(call_a) is not None
+        assert runtime.is_running(call_b) is True
+
+        release_b.set()
+        await _run_to_completion(runtime, call_b)
+        # B succeeding, and its own start_call() having already run before
+        # A failed, must not have disturbed A's error.
+        assert runtime.error_for(call_a) is not None
+        assert runtime.error_for(call_b) is None
+
+        # A brand new, unrelated call C starting is what finally reaps A --
+        # and must never remove B's (already-`None`) or its own state.
+        await runtime.start_call(_context(), call_c, "ref-c", _fake_deps())
+        assert runtime.error_for(call_a) is None
+        assert runtime.error_for(call_b) is None
+        await _run_to_completion(runtime, call_c)
+        assert runtime.error_for(call_c) is None
+
+    asyncio.run(scenario())
+
+
+def test_error_metric_and_log_are_recorded_independently_of_errors_dict_reaping(
+    monkeypatch,
+) -> None:
+    """Brief section 4 ('Error observability'): reaping `_errors` must not
+    remove the failure information from whatever durable/logging path is
+    supposed to retain it. `CallRuntime` itself durably records a failure
+    two ways independent of `_errors` -- `_logger.exception(...)` and
+    `record_runtime_call_startup_failure()` (a metric) -- both fire from
+    `_wrap_call_task()`'s `except` clause, before `_errors` is ever reaped,
+    and neither is affected by a later call's `start_call()` reaping the
+    dict entry."""
+    recorded_categories: list[str] = []
+
+    def fake_record_failure(*, error_category: str) -> None:
+        recorded_categories.append(error_category)
+
+    monkeypatch.setattr(
+        supervisor_module, "record_runtime_call_startup_failure", fake_record_failure
+    )
+
+    async def fake_run_call_task(*, context, call_session_id, call_ref, deps, cancellation):
+        raise RuntimeError("provider blew up")
+
+    monkeypatch.setattr(supervisor_module, "run_call_task", fake_run_call_task)
+    runtime = _runtime()
+    call_a, call_b = uuid.uuid4(), uuid.uuid4()
+
+    async def scenario() -> None:
+        await runtime.start_call(_context(), call_a, "ref-a", _fake_deps())
+        await _run_to_completion(runtime, call_a)
+        # Reaps call_a's `_errors` entry -- the metric was already recorded
+        # before this point and must not be affected by the reap.
+        await runtime.start_call(_context(), call_b, "ref-b", _fake_deps())
+        await _run_to_completion(runtime, call_b)
+
+    asyncio.run(scenario())
+    assert runtime.error_for(call_a) is None
+    assert recorded_categories == ["internal", "internal"]
+
+
 @pytest.mark.parametrize("reason", ["hangup", "runtime_shutdown", "provider_disconnect"])
 def test_cancel_call_reason_reaches_the_cancellation_signal_for_every_reason(
     monkeypatch, reason: str

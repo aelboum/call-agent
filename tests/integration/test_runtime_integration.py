@@ -742,6 +742,105 @@ def test_one_call_failing_does_not_affect_others(make_call_session, system_actor
     assert get_call_session(context, healthy_call.id).status == "completed"
 
 
+async def _wait_until(
+    predicate, *, timeout_seconds: float = 5.0, interval_seconds: float = 0.01
+) -> bool:
+    """Poll `predicate` (a zero-arg callable) until it returns truthy or
+    `timeout_seconds` elapses. Used in place of a single fixed
+    `asyncio.sleep()` (Phase 2.30 brief: known fixed-sleep races in this
+    file's own `test_one_call_failing_does_not_affect_others` and
+    `test_run_call_task_happy_path_completes_and_finalizes` are documented,
+    not reopened -- this helper is for *new* coverage only, deliberately
+    written to avoid reproducing that same race shape)."""
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    while asyncio.get_running_loop().time() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(interval_seconds)
+    return predicate()
+
+
+def test_repeated_failures_do_not_poison_later_calls(
+    make_call_session, system_actor_user_id
+) -> None:
+    """Phase 2.30 brief section 5: 'failure of call N must not poison call
+    N+1.' Runs a sequence of failure/success calls -- including two
+    failures back to back -- one at a time on the SAME `CallRuntime`
+    instance (never restarted between them, matching this phase's own
+    long-lived-process topology requirement), verifying every failure is
+    correctly isolated (`error_for()` set, `current_load` returns to 0) and
+    never prevents a later, unrelated call from starting and completing
+    normally. Does not assert anything about `CallRuntime._errors`'s own
+    long-run size (see `docs/PHASE-2.30-LONG-RUNNING-STABILITY.md` section
+    1 for that separate, real-staging-measured finding) -- this test's own
+    claim is narrower and purely functional: repeated failures do not block
+    subsequent calls."""
+
+    class _BrokenEngine:
+        async def start(self, config: EngineSessionConfig):
+            raise RuntimeError("boom")
+
+    context, make = make_call_session
+    db = DatabaseBoundary(max_workers=4)
+    runtime = CallRuntime(
+        instance_id="rt-repeated-failures",
+        address="x",
+        capacity=10,
+        heartbeat_store=FakeHeartbeatStore(),
+    )
+    broken_deps = CallTaskDependencies(
+        engine=_BrokenEngine(),
+        media=FakeMediaProvider(),
+        telephony=FakeTelephonyProvider(),
+        db=db,
+        policy_source=_permissive_policy_source(),
+        tool_gateway=ToolGateway(),
+        conversation_persistence=ConversationPersistence(db),
+        system_actor_user_id=system_actor_user_id,
+        system_service_account_name="voiceagent-runtime",
+    )
+    # normal, failure, normal, failure, failure, normal, normal -- the
+    # brief's own suggested repeated-failure-then-recovery sequence.
+    sequence = ["normal", "failure", "normal", "failure", "failure", "normal", "normal"]
+    calls = [make() for _ in sequence]
+
+    async def scenario() -> None:
+        for index, (kind, call) in enumerate(zip(sequence, calls, strict=True)):
+            deps = broken_deps if kind == "failure" else _deps(db, system_actor_user_id)
+            await runtime.start_call(context, call.id, f"ref-{index}", deps)
+            if kind == "failure":
+                ok = await _wait_until(lambda cid=call.id: runtime.error_for(cid) is not None)
+                assert ok, f"call {index} ({kind}) never recorded an error"
+                assert runtime.error_for(call.id) is not None
+            else:
+                # A "normal" `FakeMediaProvider`/`FakeTelephonyProvider`
+                # call runs until explicitly hung up -- it does not finish
+                # on its own (matching `test_two_simultaneous_calls`'s own
+                # pattern above).
+                ok = await _wait_until(
+                    lambda cid=call.id: get_call_session(context, cid).status == "in_progress"
+                )
+                assert ok, f"call {index} ({kind}) never reached in_progress"
+                await runtime.cancel_call(call.id, reason="hangup")
+                ok = await _wait_until(lambda cid=call.id: not runtime.is_running(cid))
+                assert ok, f"call {index} ({kind}) never finished after cancel"
+                assert get_call_session(context, call.id).status == "completed"
+            # The runtime must be idle again before the next call in the
+            # sequence starts -- this is what "one long-lived runtime,
+            # calls run one at a time" actually means operationally.
+            ok = await _wait_until(lambda: runtime.current_load == 0)
+            assert ok, f"runtime.current_load did not return to 0 after call {index} ({kind})"
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        db.close()
+
+    for kind, call in zip(sequence, calls, strict=True):
+        if kind == "normal":
+            assert get_call_session(context, call.id).status == "completed"
+
+
 def test_cancelling_one_call_does_not_cancel_another(
     make_call_session, system_actor_user_id
 ) -> None:

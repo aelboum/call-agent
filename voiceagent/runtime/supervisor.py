@@ -10,6 +10,12 @@ A failure there is recorded (`error_for()`) and logged; it never propagates
 to another call's task, and never crashes the event loop this `CallRuntime`
 owns. Only `asyncio.CancelledError` is allowed to pass through unmodified --
 catching it here would silently defeat `cancel_call()`/`shutdown()`.
+`error_for()`'s own record is reaped by `start_call()` the next time a
+*different* call starts on this runtime (`_reap_terminal_errors()`, Phase
+2.30 remediation) -- it is a recent-failure diagnostic, not a durable
+failure log; the durable record of a failed call is its logged exception,
+its `record_runtime_call_startup_failure()` metric, and its terminal
+`CallSession` row, none of which this reaping touches.
 
 **Ownership is exclusive by construction** (ADR-0008 point 10): this class
 does not itself decide *which* runtime a call belongs to (that is
@@ -118,16 +124,48 @@ class CallRuntime:
     ) -> None:
         """Start supervising one call. Idempotent: starting a call already
         running here is a no-op, never a second concurrent task for the same
-        `call_session_id`."""
+        `call_session_id`.
+
+        Also the one place `_errors` is reaped (Phase 2.30 remediation --
+        see `_reap_terminal_errors()`): a real call's `call_session_id` is a
+        fresh UUID, minted once and never reused, so the entry a failed call
+        leaves in `_errors` cannot rely on a same-id restart to ever clean
+        it up (that path only ever existed for a hypothetical reused key
+        space this runtime does not actually have). Reaping here, rather
+        than in `_wrap_call_task()`'s own `finally`, is deliberate: it keeps
+        a failed call's error observable via `error_for()` for as long as no
+        *other* new call has started on this runtime since -- exactly the
+        window every existing caller (this module's own tests) already
+        relies on -- while still giving the dict a real, non-arbitrary
+        bound tied to this runtime's own call volume instead of growing
+        forever. No TTL, no periodic sweep task, no size cap: eviction is
+        driven only by the same `start_call()` traffic that grew the dict in
+        the first place."""
         if self.is_running(call_session_id):
             return
         cancellation = CancellationSignal()
         self._cancellations[call_session_id] = cancellation
-        self._errors.pop(call_session_id, None)
+        self._reap_terminal_errors()
         task = asyncio.create_task(
             self._wrap_call_task(context, call_session_id, call_ref, deps, cancellation)
         )
         self._tasks[call_session_id] = task
+
+    def _reap_terminal_errors(self) -> None:
+        """Evict every `_errors` entry for a call this runtime is no longer
+        running. Every entry in `_errors` is, by construction, already for a
+        call not in `_tasks` -- `_wrap_call_task()` only ever writes
+        `_errors[call_session_id]` from its `except` clause, and its own
+        `finally` (which pops `_tasks`/`_cancellations`) runs immediately
+        after with no `await` in between, so no other coroutine can ever
+        observe a call that is both in `_errors` and still in `_tasks`. The
+        `cid not in self._tasks` guard is kept anyway, not for that reason,
+        but as the explicit invariant this method must never violate: a
+        call still actively supervised here must never have its error state
+        removed by another call merely starting (brief section 3)."""
+        for call_session_id in list(self._errors):
+            if call_session_id not in self._tasks:
+                self._errors.pop(call_session_id, None)
 
     async def _wrap_call_task(
         self,
