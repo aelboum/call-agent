@@ -18,13 +18,13 @@ This script reuses that module's own fixture/call helpers unchanged
 copy-pasted) and its own shared-infra construction (duplicated here only
 because `_run_shared()` bundles setup and the concurrent-gather execution
 together as one function with no seam to call setup alone), then drives
-calls through that shared infra ONE AT A TIME, in a caller-supplied
-sequence of `normal` / `media_fail` / `cancel` (a real early caller hangup
-mid-AI-processing, `--early-hangup-seconds`, the same real-staging analog
-Phase 2.28 already established and documented for exercising a live
-hangup-during-processing scenario against the real stack -- genuine
-`CallRuntime.cancel_call()`-initiated cancellation mid-processing is
-already covered hermetically, see
+calls through that shared infra in a caller-supplied `--sequence`, in a
+caller-supplied sequence of `normal` / `media_fail` / `cancel` (a real
+early caller hangup mid-AI-processing, `--early-hangup-seconds`, the same
+real-staging analog Phase 2.28 already established and documented for
+exercising a live hangup-during-processing scenario against the real
+stack -- genuine `CallRuntime.cancel_call()`-initiated cancellation
+mid-processing is already covered hermetically, see
 `tests/integration/test_runtime_integration.py
 ::test_hangup_mid_stalled_ai_turn_leaves_a_concurrent_call_unaffected`;
 this script does not attempt to re-exercise that exact supervisor-side
@@ -32,6 +32,20 @@ trigger against the real SIP stack, since `_run_call_on_shared_infra` has
 no hook for it without modifying that shared helper -- an explicit,
 documented limitation, not a silent gap), while sampling resources at
 caller-chosen checkpoints.
+
+Phase 2.31 extension: a `--sequence` token may also be a
+`parallel:tokenA+tokenB+...` group (e.g. `parallel:normal+media_fail`),
+which runs its member calls **concurrently**, via `asyncio.gather()`,
+against the SAME shared `CallRuntime`/ESL connection/media listener as
+every sequential call around it -- never a separate process, never a
+fresh runtime. This is what lets one long-lived soak process exercise both
+"many successive calls" (Phase 2.30's own question) and "several calls
+truly in flight at once, with one deliberately failing while another
+succeeds" (Phase 2.31's own section C) without restarting anything between
+them. Every call in the whole run, sequential or parallel-group member,
+gets a globally unique local SIP/RTP port pair (`local_sip_port +
+global_call_index`, no modulo/reuse) precisely because a parallel group's
+members are genuinely in flight at the same time and must never collide.
 
 Resource sampling, all read-only, no new production dependency:
 * this process's own Working Set (RSS) via `ctypes`/`psapi.dll`
@@ -197,6 +211,12 @@ class CallOutcome:
     error_dict_size_after: int
     runtime_load_after: int
     result_code: int
+    #: Phase 2.31: None for a sequential call; an incrementing group id
+    #: (shared by every member of that same `parallel:...` batch) for a
+    #: call that ran concurrently with others -- lets the summary quantify
+    #: "how many genuinely concurrent trials, how big" (brief section C)
+    #: without inferring it after the fact from timestamps.
+    concurrent_group: int | None = None
     raw_evidence: dict = field(default_factory=dict)
 
 
@@ -239,18 +259,44 @@ def _sample(
     return cp
 
 
-async def _run_soak(args: argparse.Namespace) -> int:
-    scenarios = [s.strip() for s in args.sequence.split(",") if s.strip()]
-    if not scenarios:
-        raise ValueError("--sequence must contain at least one scenario")
-    for s in scenarios:
-        if s not in {"normal", "media_fail", "cancel"}:
-            raise ValueError(f"unknown scenario {s!r} (expected normal|media_fail|cancel)")
+_VALID_SCENARIOS = {"normal", "media_fail", "cancel"}
 
-    print(f"[setup] provisioning {len(scenarios)} real tenant/agent/phone-number fixtures ...")
+
+def _parse_sequence(raw: str) -> list[list[str]]:
+    """Parse `--sequence` into a flat list of steps, each step a list of
+    one or more scenario tokens. A plain token (`normal`) is a step of
+    length 1, run sequentially. A `parallel:tokenA+tokenB+...` token is a
+    step of length N>1, whose N calls run concurrently (Phase 2.31, see
+    module docstring)."""
+    steps: list[list[str]] = []
+    for raw_step in (s.strip() for s in raw.split(",") if s.strip()):
+        if raw_step.startswith("parallel:"):
+            members = [
+                m.strip() for m in raw_step.removeprefix("parallel:").split("+") if m.strip()
+            ]
+            if len(members) < 2:
+                raise ValueError(
+                    f"parallel group {raw_step!r} needs at least 2 members separated by '+'"
+                )
+        else:
+            members = [raw_step]
+        for m in members:
+            if m not in _VALID_SCENARIOS:
+                raise ValueError(f"unknown scenario {m!r} (expected normal|media_fail|cancel)")
+        steps.append(members)
+    if not steps:
+        raise ValueError("--sequence must contain at least one scenario")
+    return steps
+
+
+async def _run_soak(args: argparse.Namespace) -> int:
+    steps = _parse_sequence(args.sequence)
+    total_calls = sum(len(step) for step in steps)
+
+    print(f"[setup] provisioning {total_calls} real tenant/agent/phone-number fixtures ...")
     user = create_user()
     fixtures: list[CallFixture] = [
-        _provision_fixture(i, user.id, phrase_mode="distinct") for i in range(1, len(scenarios) + 1)
+        _provision_fixture(i, user.id, phrase_mode="distinct") for i in range(1, total_calls + 1)
     ]
 
     esl = ManagedEslConnection(
@@ -326,50 +372,87 @@ async def _run_soak(args: argparse.Namespace) -> int:
             )
         )
 
+    async def _run_one(global_index: int, fixture: CallFixture, scenario: str) -> CallOutcome:
+        code, evidence = await _run_call_on_shared_infra(
+            fixture,
+            db=db,
+            sip_host=args.sip_host,
+            sip_port=args.sip_port,
+            sip_advertise_ip=args.sip_advertise_ip,
+            local_sip_port=args.local_sip_port + global_index,
+            local_rtp_port=args.local_rtp_port + global_index,
+            early_hangup_seconds=(args.cancel_hangup_seconds if scenario == "cancel" else None),
+            telephony=telephony,
+            induce_media_stop=(scenario == "media_fail"),
+        )
+        return CallOutcome(
+            call_index=global_index,
+            scenario=scenario,
+            tenant_id=evidence.get("tenant_id", ""),
+            call_session_id=evidence.get("call_session_id"),
+            fs_channel_uuid=evidence.get("fs_channel_uuid"),
+            sip_call_id=evidence.get("sip_call_id"),
+            final_status=evidence.get("final_status"),
+            final_end_reason=evidence.get("final_end_reason"),
+            own_reply_present=evidence.get("own_reply_present"),
+            cross_contamination_detected=evidence.get("cross_contamination_detected"),
+            error_dict_size_after=len(call_runtime._errors),  # noqa: SLF001
+            runtime_load_after=call_runtime.current_load,
+            result_code=code,
+            raw_evidence=evidence,
+        )
+
     try:
         sample("before_first_call", 0)
-        for i, (fixture, scenario) in enumerate(zip(fixtures, scenarios, strict=True), start=1):
-            print(f"\n[soak] === call {i}/{len(scenarios)} -- scenario={scenario} ===")
-            port_slot = (i % 8) + 1
-            code, evidence = await _run_call_on_shared_infra(
-                fixture,
-                db=db,
-                sip_host=args.sip_host,
-                sip_port=args.sip_port,
-                sip_advertise_ip=args.sip_advertise_ip,
-                local_sip_port=args.local_sip_port + port_slot,
-                local_rtp_port=args.local_rtp_port + port_slot,
-                early_hangup_seconds=(args.cancel_hangup_seconds if scenario == "cancel" else None),
-                telephony=telephony,
-                induce_media_stop=(scenario == "media_fail"),
-            )
-            outcomes.append(
-                CallOutcome(
-                    call_index=i,
-                    scenario=scenario,
-                    tenant_id=evidence.get("tenant_id", ""),
-                    call_session_id=evidence.get("call_session_id"),
-                    fs_channel_uuid=evidence.get("fs_channel_uuid"),
-                    sip_call_id=evidence.get("sip_call_id"),
-                    final_status=evidence.get("final_status"),
-                    final_end_reason=evidence.get("final_end_reason"),
-                    own_reply_present=evidence.get("own_reply_present"),
-                    cross_contamination_detected=evidence.get("cross_contamination_detected"),
-                    error_dict_size_after=len(call_runtime._errors),  # noqa: SLF001
-                    runtime_load_after=call_runtime.current_load,
-                    result_code=code,
-                    raw_evidence=evidence,
+        global_index = 0
+        concurrent_group_id = 0
+        checkpoint_every = max(1, args.checkpoint_every)
+        for step in steps:
+            step_fixtures = fixtures[global_index : global_index + len(step)]
+            step_indices = list(range(global_index + 1, global_index + len(step) + 1))
+            if len(step) == 1:
+                i, scenario, fixture = step_indices[0], step[0], step_fixtures[0]
+                print(f"\n[soak] === call {i}/{total_calls} -- scenario={scenario} ===")
+                outcome = await _run_one(i, fixture, scenario)
+                outcomes.append(outcome)
+                print(
+                    f"[soak] call {i} scenario={scenario} result_code={outcome.result_code} "
+                    f"final_status={outcome.final_status!r} "
+                    f"end_reason={outcome.final_end_reason!r} "
+                    f"runtime_errors_dict_size_now={len(call_runtime._errors)} "  # noqa: SLF001
+                    f"runtime_load_now={call_runtime.current_load}"
                 )
-            )
-            print(
-                f"[soak] call {i} scenario={scenario} result_code={code} "
-                f"final_status={evidence.get('final_status')!r} "
-                f"end_reason={evidence.get('final_end_reason')!r} "
-                f"runtime_errors_dict_size_now={len(call_runtime._errors)} "  # noqa: SLF001
-                f"runtime_load_now={call_runtime.current_load}"
-            )
-            if i in {5, 10, 20} or i == len(scenarios):
-                sample(f"after_{i}_calls", i)
+            else:
+                concurrent_group_id += 1
+                print(
+                    f"\n[soak] === concurrent group {concurrent_group_id} "
+                    f"(calls {step_indices[0]}-{step_indices[-1]}/{total_calls}, "
+                    f"scenarios={step}) ==="
+                )
+                group_outcomes = list(
+                    await asyncio.gather(
+                        *(
+                            _run_one(i, fx, sc)
+                            for i, fx, sc in zip(step_indices, step_fixtures, step, strict=True)
+                        )
+                    )
+                )
+                for o in group_outcomes:
+                    o.concurrent_group = concurrent_group_id
+                    outcomes.append(o)
+                    print(
+                        f"[soak] concurrent-group-{concurrent_group_id} call {o.call_index} "
+                        f"scenario={o.scenario} result_code={o.result_code} "
+                        f"final_status={o.final_status!r} end_reason={o.final_end_reason!r}"
+                    )
+                print(
+                    f"[soak] concurrent group {concurrent_group_id} done -- "
+                    f"runtime_errors_dict_size_now={len(call_runtime._errors)} "  # noqa: SLF001
+                    f"runtime_load_now={call_runtime.current_load}"
+                )
+            global_index += len(step)
+            if global_index % checkpoint_every == 0 or global_index == total_calls:
+                sample(f"after_{global_index}_calls", global_index)
     finally:
         router_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -385,8 +468,10 @@ async def _run_soak(args: argparse.Namespace) -> int:
     fs_uuids = {o.fs_channel_uuid for o in outcomes if o.fs_channel_uuid}
     sip_ids = {o.sip_call_id for o in outcomes if o.sip_call_id}
     for o in outcomes:
+        group = f"group{o.concurrent_group}" if o.concurrent_group is not None else "sequential"
         print(
-            f"  #{o.call_index:02d} scenario={o.scenario:10s} status={o.final_status!r} "
+            f"  #{o.call_index:03d} [{group:11s}] scenario={o.scenario:10s} "
+            f"status={o.final_status!r} "
             f"end_reason={o.final_end_reason!r} session={o.call_session_id} "
             f"fs_uuid={o.fs_channel_uuid} sip_call_id={o.sip_call_id} "
             f"errors_dict_size_after={o.error_dict_size_after} "
@@ -400,6 +485,22 @@ async def _run_soak(args: argparse.Namespace) -> int:
     )
     identity_ok = len({len(outcomes), len(tenants), len(sessions)}) == 1
     print(f"[isolation] identity-reuse check: {'PASS' if identity_ok else 'FAIL'}")
+
+    concurrent_groups = {o.concurrent_group for o in outcomes if o.concurrent_group is not None}
+    for group_id in sorted(concurrent_groups):
+        members = [o for o in outcomes if o.concurrent_group == group_id]
+        member_tenants = {o.tenant_id for o in members}
+        member_sessions = {o.call_session_id for o in members}
+        member_fs = {o.fs_channel_uuid for o in members if o.fs_channel_uuid}
+        member_sip = {o.sip_call_id for o in members if o.sip_call_id}
+        isolated = len({len(members), len(member_tenants), len(member_sessions)}) == 1
+        print(
+            f"[concurrent-group-{group_id}] members={len(members)} "
+            f"distinct_tenants={len(member_tenants)} distinct_sessions={len(member_sessions)} "
+            f"distinct_fs_uuids={len(member_fs)} distinct_sip_call_ids={len(member_sip)} "
+            f"isolation={'PASS' if isolated else 'FAIL'} "
+            f"statuses={[(o.scenario, o.final_status) for o in members]}"
+        )
 
     non_media_fail_normal = [o for o in outcomes if o.scenario == "normal"]
     normal_ok = all(o.final_status == "completed" for o in non_media_fail_normal)
@@ -466,15 +567,23 @@ def main() -> int:
         "--sequence",
         required=True,
         help=(
-            "comma-separated scenario list, one per sequential call, e.g. "
-            "'normal,normal,normal,normal,normal,media_fail,normal,cancel,normal,...' "
+            "comma-separated step list, e.g. "
+            "'normal,normal,media_fail,normal,parallel:normal+media_fail+normal,cancel,...' "
             "-- 'normal' (no induced failure), 'media_fail' (real per-call "
             "'api uuid_audio_stream <uuid> stop'), 'cancel' (real early caller BYE "
             "--cancel-hangup-seconds after the caller's utterance ends, instead of "
-            "waiting the full AI round trip)."
+            "waiting the full AI round trip), 'parallel:a+b+...' (Phase 2.31: 2+ calls run "
+            "concurrently, via asyncio.gather(), against the same shared runtime as every "
+            "other step)."
         ),
     )
     parser.add_argument("--cancel-hangup-seconds", type=float, default=2.0)
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=10,
+        help="sample resources after every N completed calls (default 10)",
+    )
     parser.add_argument(
         "--json-out", default="", help="path to write full JSON evidence; empty disables"
     )

@@ -482,6 +482,141 @@ def test_error_metric_and_log_are_recorded_independently_of_errors_dict_reaping(
     assert recorded_categories == ["internal", "internal"]
 
 
+def test_mixed_concurrent_success_failure_cancel_cleanup_is_isolated(monkeypatch) -> None:
+    """Phase 2.31 (brief section C/F): Phase 2.30's own concurrent-cleanup
+    test only ever mixed a failure with a success. This proves the same
+    isolation property holds with all three terminal shapes -- success,
+    failure, and cancellation -- live on this runtime at once, matching
+    this phase's own real-staging concurrent trials (normal + media_fail +
+    cancel in one group). After all three settle: `_tasks` and
+    `_cancellations` are both back to empty (every call's own bookkeeping
+    is fully released, regardless of how it ended), the failed call's
+    error is observable, and neither the successful nor the cancelled
+    call ever populated `_errors`. A fourth, unrelated call starting is
+    what reaps the failed call's entry, touching nothing else."""
+    release_success = asyncio.Event()
+    cancel_started = asyncio.Event()
+
+    async def fake_run_call_task(*, context, call_session_id, call_ref, deps, cancellation):
+        if call_ref == "ref-fail":
+            raise RuntimeError("provider blew up")
+        if call_ref == "ref-success":
+            await release_success.wait()
+            return
+        if call_ref == "ref-cancel":
+            cancel_started.set()
+            await asyncio.Event().wait()
+        raise AssertionError(f"unexpected call_ref {call_ref!r}")
+
+    monkeypatch.setattr(supervisor_module, "run_call_task", fake_run_call_task)
+    runtime = _runtime()
+    call_fail, call_success, call_cancel, call_next = (
+        uuid.uuid4(),
+        uuid.uuid4(),
+        uuid.uuid4(),
+        uuid.uuid4(),
+    )
+
+    async def scenario() -> None:
+        await runtime.start_call(_context(), call_fail, "ref-fail", _fake_deps())
+        await runtime.start_call(_context(), call_success, "ref-success", _fake_deps())
+        await runtime.start_call(_context(), call_cancel, "ref-cancel", _fake_deps())
+        await asyncio.wait_for(cancel_started.wait(), timeout=2)
+
+        await _run_to_completion(runtime, call_fail)
+        assert runtime.error_for(call_fail) is not None
+        assert runtime.is_running(call_success) is True
+        assert runtime.is_running(call_cancel) is True
+
+        release_success.set()
+        await _run_to_completion(runtime, call_success)
+        await runtime.cancel_call(call_cancel, reason="hangup")
+
+        assert runtime._tasks == {}  # noqa: SLF001 -- every call's own bookkeeping released
+        assert runtime._cancellations == {}  # noqa: SLF001
+        assert runtime.error_for(call_fail) is not None
+        assert runtime.error_for(call_success) is None
+        assert runtime.error_for(call_cancel) is None
+
+        await runtime.start_call(_context(), call_next, "ref-success", _fake_deps())
+        assert runtime.error_for(call_fail) is None
+        assert runtime.error_for(call_success) is None
+        assert runtime.error_for(call_cancel) is None
+        release_success.set()
+        await _run_to_completion(runtime, call_next)
+
+    asyncio.run(scenario())
+
+
+def test_long_mixed_failure_recovery_sequence_returns_bookkeeping_to_baseline(
+    monkeypatch,
+) -> None:
+    """Phase 2.31 (brief section B): Phase 2.30's own repeated-failure test
+    (`test_repeated_failures_do_not_accumulate_in_the_errors_dict`) only
+    ever exercised failures. This runs the brief's own suggested mixed
+    pattern -- normal / media-failure-analog / cancellation, repeated,
+    including back-to-back failures -- sequentially on one long-lived
+    runtime, and proves `_tasks` and `_cancellations` return to their
+    empty baseline after every single call regardless of which of the
+    three ways it ended, that `_errors` never holds more than one entry
+    at a time, and that no call's own outcome is influenced by whatever
+    came immediately before it."""
+    cancel_started = asyncio.Event()
+
+    async def fake_run_call_task(*, context, call_session_id, call_ref, deps, cancellation):
+        if call_ref == "fail":
+            raise RuntimeError("provider blew up")
+        if call_ref == "cancel":
+            cancel_started.set()
+            await asyncio.Event().wait()
+        return  # "normal"
+
+    monkeypatch.setattr(supervisor_module, "run_call_task", fake_run_call_task)
+    runtime = _runtime()
+    # normal, failure, normal, failure, cancel, normal, failure, failure,
+    # normal, cancel -- mirrors this phase's own real-staging pattern
+    # (brief section B), compressed to run hermetically in milliseconds.
+    sequence = [
+        "normal",
+        "fail",
+        "normal",
+        "fail",
+        "cancel",
+        "normal",
+        "fail",
+        "fail",
+        "normal",
+        "cancel",
+    ]
+    max_errors_dict_size = 0
+
+    async def scenario() -> None:
+        nonlocal max_errors_dict_size
+        for kind in sequence:
+            call_id = uuid.uuid4()
+            cancel_started.clear()
+            await runtime.start_call(_context(), call_id, kind, _fake_deps())
+            if kind == "cancel":
+                await asyncio.wait_for(cancel_started.wait(), timeout=2)
+                await runtime.cancel_call(call_id, reason="hangup")
+            else:
+                await _run_to_completion(runtime, call_id)
+            assert runtime._tasks == {}  # noqa: SLF001 -- baseline after every call, any outcome
+            assert runtime._cancellations == {}  # noqa: SLF001
+            max_errors_dict_size = max(max_errors_dict_size, len(runtime._errors))  # noqa: SLF001
+            if kind == "fail":
+                assert runtime.error_for(call_id) is not None
+            else:
+                assert runtime.error_for(call_id) is None
+
+    asyncio.run(scenario())
+    # Never more than the single most-recently-failed call's entry, no
+    # matter how many failures (4, including two back-to-back) occurred
+    # across the whole sequence -- the exact invariant Phase 2.30's fix
+    # established, now proven under a genuinely mixed workload too.
+    assert max_errors_dict_size <= 1
+
+
 @pytest.mark.parametrize("reason", ["hangup", "runtime_shutdown", "provider_disconnect"])
 def test_cancel_call_reason_reaches_the_cancellation_signal_for_every_reason(
     monkeypatch, reason: str
