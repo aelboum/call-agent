@@ -59,6 +59,23 @@ once before the first call and once after each completed step, which
 cannot show a peak that comes and goes entirely inside one group's own
 execution window.
 
+Phase 2.33 extension (harness instrumentation only -- no live run performed
+in that phase, no memory-retention claim made by this change itself): the
+Phase 2.32 audit found the pre-existing "recovery" checkpoints were never
+actually idle -- `after_9`/`after_10`-style labels were taken immediately
+after the *next* sequential calls, not after a settle period with nothing
+in flight, and no checkpoint ever ran `gc.collect()` first, so an RSS rise
+could not be distinguished from Python garbage still awaiting collection.
+Every concurrent group (`parallel:...` step) now unconditionally takes two
+checkpoints of its own, independent of `--checkpoint-every`:
+`group{N}_immediate` right after the group's own `asyncio.gather()`
+returns (old behavior, renamed -- never called "recovery"), then
+`group{N}_settled_idle` after an explicit `--group-idle-seconds` sleep
+with no new call started and an explicit `gc.collect()` immediately
+before sampling. This still does not prove anything about memory by
+itself -- it only gives a future real run the two numbers it needs to
+tell "still-pending garbage" apart from "retained after collection."
+
 Resource sampling, all read-only, no new production dependency:
 * this process's own Working Set (RSS) via `ctypes`/`psapi.dll`
   (`GetProcessMemoryInfo` against `GetCurrentProcess()`) -- Windows-only,
@@ -97,6 +114,7 @@ import argparse
 import asyncio
 import contextlib
 import ctypes
+import gc
 import json
 import subprocess
 import sys as _sys
@@ -206,6 +224,15 @@ class ResourceCheckpoint:
     db_executor_thread_count: int
     fs_docker_stats: str
     wall_elapsed_seconds: float
+    #: Phase 2.33: True only for a checkpoint taken after an explicit idle
+    #: settle period (`--group-idle-seconds`) with `gc.collect()` run
+    #: immediately before sampling -- False for every pre-existing
+    #: immediate/step-boundary checkpoint, whose RSS may include garbage
+    #: not yet collected. Never inferred from the label string.
+    settled: bool = False
+    #: Phase 2.33: the actual idle sleep this settled checkpoint waited
+    #: through before sampling; None for a non-settled checkpoint.
+    idle_seconds: float | None = None
 
 
 @dataclass
@@ -308,7 +335,17 @@ def _sample(
     db: DatabaseBoundary,
     fs_container: str,
     wall_start: float,
+    settled: bool = False,
+    idle_seconds: float | None = None,
 ) -> ResourceCheckpoint:
+    """Phase 2.33: when `settled` is True, this is a settled/idle
+    checkpoint -- `gc.collect()` runs immediately before `_rss_bytes()` so
+    the reading reflects memory retained after collection, not garbage
+    still pending it. Every pre-existing call site (`settled` defaults to
+    False) is unchanged: no behavior or number it already produced is
+    altered by this addition."""
+    if settled:
+        gc.collect()
     cp = ResourceCheckpoint(
         label=label,
         calls_completed=calls_completed,
@@ -323,9 +360,12 @@ def _sample(
         db_executor_thread_count=len(db._executor._threads),  # noqa: SLF001
         fs_docker_stats=_docker_stats(fs_container) if fs_container else "(disabled)",
         wall_elapsed_seconds=round(time.monotonic() - wall_start, 1),
+        settled=settled,
+        idle_seconds=idle_seconds,
     )
     print(
         f"[resource-checkpoint:{label}] calls={calls_completed} "
+        f"settled={cp.settled} idle_seconds={cp.idle_seconds} "
         f"rss={cp.rss_bytes / (1024 * 1024):.1f}MiB "
         f"asyncio_tasks={cp.asyncio_task_count} "
         f"runtime_load={cp.call_runtime_current_load} "
@@ -439,7 +479,9 @@ async def _run_soak(args: argparse.Namespace) -> int:
     checkpoints: list[ResourceCheckpoint] = []
     group_peaks: list[GroupPeak] = []
 
-    def sample(label: str, n_done: int) -> None:
+    def sample(
+        label: str, n_done: int, *, settled: bool = False, idle_seconds: float | None = None
+    ) -> None:
         checkpoints.append(
             _sample(
                 label,
@@ -449,6 +491,8 @@ async def _run_soak(args: argparse.Namespace) -> int:
                 db=db,
                 fs_container=args.fs_container,
                 wall_start=wall_start,
+                settled=settled,
+                idle_seconds=idle_seconds,
             )
         )
 
@@ -554,7 +598,22 @@ async def _run_soak(args: argparse.Namespace) -> int:
                     f"runtime_load_now={call_runtime.current_load}"
                 )
             global_index += len(step)
-            if global_index % checkpoint_every == 0 or global_index == total_calls:
+            if len(step) > 1:
+                # Phase 2.33: every concurrent group gets its own immediate
+                # + settled/idle checkpoint pair, unconditionally -- never
+                # gated on --checkpoint-every coincidentally lining up with
+                # this group's own boundary (the Phase 2.32 audit's own
+                # finding: it isn't guaranteed to).
+                sample(f"group{concurrent_group_id}_immediate", global_index)
+                if args.group_idle_seconds > 0:
+                    await asyncio.sleep(args.group_idle_seconds)
+                sample(
+                    f"group{concurrent_group_id}_settled_idle",
+                    global_index,
+                    settled=True,
+                    idle_seconds=args.group_idle_seconds,
+                )
+            elif global_index % checkpoint_every == 0 or global_index == total_calls:
                 sample(f"after_{global_index}_calls", global_index)
     finally:
         router_task.cancel()
@@ -629,7 +688,7 @@ async def _run_soak(args: argparse.Namespace) -> int:
     print("\n[resource-checkpoints] summary:")
     for cp in checkpoints:
         print(
-            f"  {cp.label:20s} calls={cp.calls_completed:3d} "
+            f"  {cp.label:24s} calls={cp.calls_completed:3d} settled={cp.settled!s:5s} "
             f"rss={cp.rss_bytes / (1024 * 1024):.1f}MiB "
             f"asyncio_tasks={cp.asyncio_task_count} "
             f"runtime_errors_dict_size={cp.call_runtime_error_dict_size} "
@@ -687,6 +746,20 @@ def main() -> int:
         type=int,
         default=10,
         help="sample resources after every N completed calls (default 10)",
+    )
+    parser.add_argument(
+        "--group-idle-seconds",
+        type=float,
+        default=5.0,
+        help=(
+            "Phase 2.33: idle settle period after each concurrent group, with no new "
+            "call started, before the group's own settled/idle checkpoint (gc.collect() "
+            "then resource sampling). 0 disables the idle wait but still takes the "
+            "settled checkpoint immediately (gc.collect() still runs). Default 5.0s, "
+            "matching this harness's own existing media_detach_timeout_seconds bound -- "
+            "long enough for any already-bounded best-effort cleanup still in flight to "
+            "finish, not an arbitrary long wait."
+        ),
     )
     parser.add_argument(
         "--json-out", default="", help="path to write full JSON evidence; empty disables"
