@@ -115,6 +115,45 @@ def test_detach_unknown_call_raises() -> None:
         asyncio.run(provider.detach("nonexistent"))
 
 
+class _NeverRespondsMediaSocket(FakeMediaSocket):
+    """`send_text()` never returns -- stands in for a real
+    `WebSocketMediaSocket` whose close-time flush is slow enough that the
+    caller's own `asyncio.wait_for(provider.detach(...), timeout=...)`
+    (`voiceagent/runtime/call_task.py`) fires and cancels `detach()` while
+    it is suspended inside `await stream.close()`."""
+
+    async def send_text(self, text: str) -> None:
+        await asyncio.Event().wait()
+
+
+def test_detach_cancelled_mid_close_still_releases_the_socket() -> None:
+    """Phase 2.32 regression: real-staging evidence at 8+ simultaneous
+    calls tearing down together showed `FreeSwitchMediaProvider._sockets`
+    (and `_attached_at`) staying populated for a `call_ref` forever after
+    its own `detach()` was cancelled by the caller's `asyncio.wait_for`
+    timeout -- while `_streams` correctly still emptied every time. Root
+    cause: the old `detach()` only popped `_sockets`/`_attached_at` *after*
+    `await stream.close()`, so a cancellation suspended inside that await
+    skipped both pops. This asserts the fixed ordering: both pops happen
+    before the awaited close, so a cancellation there still leaves the
+    provider's own bookkeeping clean."""
+    provider = FreeSwitchMediaProvider()
+    socket = _NeverRespondsMediaSocket()
+    provider.register_socket("call-1", socket)
+
+    async def scenario() -> None:
+        stream = await provider.attach("call-1")
+        await stream.send(b"\x01\x02\x03\x04")  # non-empty buffer -> close() flushes
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(provider.detach("call-1"), timeout=0.05)
+
+    asyncio.run(scenario())
+
+    assert "call-1" not in provider._streams  # noqa: SLF001 -- already correct pre-fix
+    assert "call-1" not in provider._sockets  # noqa: SLF001 -- the fix
+    assert "call-1" not in provider._attached_at  # noqa: SLF001 -- the fix
+
+
 def test_no_cross_call_frame_leakage() -> None:
     """Phase 2.24 brief section 5: "no cross-call frame leakage"/"no
     cross-tenant frame leakage" -- this layer has no concept of tenant at

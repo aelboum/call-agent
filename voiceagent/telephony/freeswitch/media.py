@@ -291,14 +291,31 @@ class FreeSwitchMediaProvider:
         return stream
 
     async def detach(self, call_ref: CallRef) -> None:
+        # Phase 2.32: `self._sockets`/`self._attached_at` are popped here,
+        # *before* `await stream.close()`, not after it. `call_task.py`
+        # wraps this whole call in `asyncio.wait_for(..., timeout=
+        # media_detach_timeout_seconds)`; when `close()` is slow enough to
+        # hit that timeout under sustained concurrency (observed starting
+        # at 8 simultaneous calls tearing down together against one shared
+        # media listener -- never at Phase 2.31's own max of 3), `wait_for`
+        # cancels this coroutine while it is suspended inside `await
+        # stream.close()`. With the old ordering (both pops after the
+        # await), a cancellation there left `_sockets`/`_attached_at`
+        # holding a stale entry for that `call_ref` forever -- `_streams`
+        # (popped first, before any `await`) always still returned to
+        # empty, which is exactly the split observed in real-staging
+        # evidence: `media_streams=0` at every checkpoint but
+        # `media_sockets` stuck above 0 after a concurrent group. Moving
+        # both pops ahead of the await makes cleanup of this bookkeeping
+        # unconditional on cancellation, matching `_streams`.
         started = time.monotonic()
         stream = self._streams.pop(call_ref, None)
         if stream is None:
             record_provider_operation("media", "detach", "failure", time.monotonic() - started)
             raise TransportError(f"no attached stream: {call_ref}")
-        await stream.close()
         self._sockets.pop(call_ref, None)
         attached_at = self._attached_at.pop(call_ref, None)
+        await stream.close()
         if attached_at is not None:
             record_media_session_duration(time.monotonic() - attached_at)
         record_provider_operation("media", "detach", "success", time.monotonic() - started)

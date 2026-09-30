@@ -47,6 +47,18 @@ gets a globally unique local SIP/RTP port pair (`local_sip_port +
 global_call_index`, no modulo/reuse) precisely because a parallel group's
 members are genuinely in flight at the same time and must never collide.
 
+Phase 2.32 extension: `parallel:...` groups were exercised at 8- and
+10-member size (Phase 2.31's own trials topped out at 3) to validate
+sustained concurrency materially above the 2-3 concurrent calls earlier
+phases established. A new background sampler
+(`_sample_peaks_during`/`GroupPeak`) polls the same read-only
+`CallRuntime`/`FreeSwitchMediaProvider`/`DatabaseBoundary` attributes every
+0.25s for the duration of each group's own `asyncio.gather()` window and
+keeps the max of each -- the pre-existing `_sample()` checkpoints only run
+once before the first call and once after each completed step, which
+cannot show a peak that comes and goes entirely inside one group's own
+execution window.
+
 Resource sampling, all read-only, no new production dependency:
 * this process's own Working Set (RSS) via `ctypes`/`psapi.dll`
   (`GetProcessMemoryInfo` against `GetCurrentProcess()`) -- Windows-only,
@@ -194,6 +206,73 @@ class ResourceCheckpoint:
     db_executor_thread_count: int
     fs_docker_stats: str
     wall_elapsed_seconds: float
+
+
+@dataclass
+class GroupPeak:
+    """Phase 2.32: peak resource readings taken *during* one concurrent
+    group's own `asyncio.gather()` window, not just the before/after
+    checkpoints `_sample()` already takes at step boundaries. A background
+    sampler (`_sample_peaks_during`) polls the same read-only
+    `CallRuntime`/`FreeSwitchMediaProvider`/`DatabaseBoundary` attributes
+    `_sample()` already reads, every `peak_poll_interval_seconds`, for the
+    duration of the group's own concurrent window, and keeps only the max
+    of each -- this is the only way to see e.g. "8 calls' worth of tasks
+    were briefly alive together" when the group finishes in a few seconds
+    and the next `_sample()` call only runs once the whole group is done."""
+
+    concurrent_group: int
+    member_count: int
+    peak_rss_bytes: int
+    peak_asyncio_task_count: int
+    peak_runtime_current_load: int
+    peak_media_active_streams: int
+    peak_media_active_sockets: int
+    peak_db_executor_thread_count: int
+    poll_count: int
+
+
+async def _sample_peaks_during(
+    *,
+    call_runtime: CallRuntime,
+    media: FreeSwitchMediaProvider,
+    db: DatabaseBoundary,
+    stop: asyncio.Event,
+    interval_seconds: float = 0.25,
+) -> GroupPeak:
+    peak = GroupPeak(
+        concurrent_group=0,
+        member_count=0,
+        peak_rss_bytes=0,
+        peak_asyncio_task_count=0,
+        peak_runtime_current_load=0,
+        peak_media_active_streams=0,
+        peak_media_active_sockets=0,
+        peak_db_executor_thread_count=0,
+        poll_count=0,
+    )
+    while not stop.is_set():
+        peak.peak_rss_bytes = max(peak.peak_rss_bytes, _rss_bytes())
+        peak.peak_asyncio_task_count = max(peak.peak_asyncio_task_count, len(asyncio.all_tasks()))
+        peak.peak_runtime_current_load = max(
+            peak.peak_runtime_current_load, call_runtime.current_load
+        )
+        peak.peak_media_active_streams = max(
+            peak.peak_media_active_streams,
+            len(media._streams),  # noqa: SLF001 -- read-only validation introspection
+        )
+        peak.peak_media_active_sockets = max(
+            peak.peak_media_active_sockets,
+            len(media._sockets),  # noqa: SLF001
+        )
+        peak.peak_db_executor_thread_count = max(
+            peak.peak_db_executor_thread_count,
+            len(db._executor._threads),  # noqa: SLF001
+        )
+        peak.poll_count += 1
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stop.wait(), timeout=interval_seconds)
+    return peak
 
 
 @dataclass
@@ -358,6 +437,7 @@ async def _run_soak(args: argparse.Namespace) -> int:
     wall_start = time.monotonic()
     outcomes: list[CallOutcome] = []
     checkpoints: list[ResourceCheckpoint] = []
+    group_peaks: list[GroupPeak] = []
 
     def sample(label: str, n_done: int) -> None:
         checkpoints.append(
@@ -429,14 +509,37 @@ async def _run_soak(args: argparse.Namespace) -> int:
                     f"(calls {step_indices[0]}-{step_indices[-1]}/{total_calls}, "
                     f"scenarios={step}) ==="
                 )
-                group_outcomes = list(
-                    await asyncio.gather(
-                        *(
-                            _run_one(i, fx, sc)
-                            for i, fx, sc in zip(step_indices, step_fixtures, step, strict=True)
-                        )
+                peak_stop = asyncio.Event()
+                peak_task = asyncio.create_task(
+                    _sample_peaks_during(
+                        call_runtime=call_runtime, media=media, db=db, stop=peak_stop
                     )
                 )
+                try:
+                    group_outcomes = list(
+                        await asyncio.gather(
+                            *(
+                                _run_one(i, fx, sc)
+                                for i, fx, sc in zip(step_indices, step_fixtures, step, strict=True)
+                            )
+                        )
+                    )
+                finally:
+                    peak_stop.set()
+                    peak = await peak_task
+                    peak.concurrent_group = concurrent_group_id
+                    peak.member_count = len(step)
+                    group_peaks.append(peak)
+                    print(
+                        f"[concurrent-group-{concurrent_group_id}] peak-during-window "
+                        f"(polled {peak.poll_count}x): "
+                        f"rss={peak.peak_rss_bytes / (1024 * 1024):.1f}MiB "
+                        f"asyncio_tasks={peak.peak_asyncio_task_count} "
+                        f"runtime_load={peak.peak_runtime_current_load} "
+                        f"media_streams={peak.peak_media_active_streams} "
+                        f"media_sockets={peak.peak_media_active_sockets} "
+                        f"db_executor_threads={peak.peak_db_executor_thread_count}"
+                    )
                 for o in group_outcomes:
                     o.concurrent_group = concurrent_group_id
                     outcomes.append(o)
@@ -541,6 +644,7 @@ async def _run_soak(args: argparse.Namespace) -> int:
                 {k: v for k, v in vars(o).items() if k != "raw_evidence"} for o in outcomes
             ],
             "checkpoints": [vars(cp) for cp in checkpoints],
+            "group_peaks": [vars(p) for p in group_peaks],
         }
         _Path(args.json_out).write_text(json.dumps(payload, indent=2, default=str))
         print(f"\n[output] wrote {args.json_out}")
