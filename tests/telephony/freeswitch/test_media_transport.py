@@ -8,17 +8,23 @@ matching every other async test file here.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 import pytest
 import websockets
 
+from voiceagent.telephony.contracts import TransportError
 from voiceagent.telephony.freeswitch.media import FreeSwitchMediaProvider
 from voiceagent.telephony.freeswitch.media_transport import (
     FreeSwitchMediaListener,
     TicketVerificationError,
+    WebSocketMediaSocket,
     mint_media_ticket,
     serve_freeswitch_media,
     verify_media_ticket,
+)
+from voiceagent.telephony.freeswitch.media_transport import (
+    _ConnectionClosed as _MediaConnectionClosed,  # noqa: SLF001 -- test-only internal signal.
 )
 
 _SECRET = "test-ticket-secret"  # noqa: S105 -- test-only.  # pragma: allowlist secret
@@ -246,3 +252,101 @@ def test_end_to_end_client_disconnect_during_active_media_ends_the_stream_cleanl
 
     frames = asyncio.run(scenario())
     assert frames == [b"\x01\x02"]
+
+
+def test_receive_binary_raises_transport_error_when_the_listener_itself_is_closing() -> None:
+    """Phase 2.33 fix: a `_ConnectionClosed` that happens because the shared
+    listener's own `Server.close()` was invoked -- not because this one
+    call's own remote end hung up normally -- must surface as the same
+    `TransportError("media transport closed")` `send_text()` already raises
+    (Phase 2.29), not a silent end of stream. Unit-level: `WebSocketMediaSocket`
+    exercised directly with fakes, no real socket needed."""
+
+    async def _recv_closed() -> bytes:
+        raise _MediaConnectionClosed
+
+    async def _send_unused(_: str) -> None:
+        raise AssertionError("not exercised by this test")
+
+    async def _close_unused() -> None:
+        raise AssertionError("not exercised by this test")
+
+    async def scenario() -> None:
+        socket = WebSocketMediaSocket(
+            send=_send_unused,
+            recv=_recv_closed,
+            close=_close_unused,
+            listener_closing=lambda: True,
+        )
+        async for _ in socket.receive_binary():
+            raise AssertionError("no frame should ever be yielded")
+
+    with pytest.raises(TransportError, match="media transport closed"):
+        asyncio.run(scenario())
+
+
+def test_receive_binary_still_ends_cleanly_when_listener_closing_is_unset() -> None:
+    """The default (`listener_closing` omitted, every pre-Phase-2.33 caller
+    and test) must be completely unchanged: a closed connection still ends
+    `receive_binary()`'s iteration cleanly, no exception -- the exact Phase
+    2.24 contract `test_end_to_end_client_disconnect_during_active_media_ends
+    _the_stream_cleanly` already proves end to end; this is the same
+    assertion at the unit level, directly against the default parameter."""
+
+    async def _recv_closed() -> bytes:
+        raise _MediaConnectionClosed
+
+    async def _send_unused(_: str) -> None:
+        raise AssertionError("not exercised by this test")
+
+    async def _close_unused() -> None:
+        raise AssertionError("not exercised by this test")
+
+    async def scenario() -> list[bytes]:
+        socket = WebSocketMediaSocket(send=_send_unused, recv=_recv_closed, close=_close_unused)
+        return [frame async for frame in socket.receive_binary()]
+
+    assert asyncio.run(scenario()) == []
+
+
+def test_end_to_end_listener_close_during_active_media_raises_transport_error() -> None:
+    """Phase 2.33: the shared listener's own `Server.close()` -- the actual
+    mechanism a real listener-level disconnect uses (and the one
+    `scripts/validate_staging_listener_disconnect.py` uses against real
+    staging) -- must surface as `TransportError`, proving `serve_freeswitch_
+    media()`'s own production wiring end to end, not just `WebSocketMediaSocket`
+    in isolation."""
+
+    async def scenario() -> None:
+        provider = FreeSwitchMediaProvider()
+        listener = FreeSwitchMediaListener(provider, ticket_secret=_SECRET)
+        server = await serve_freeswitch_media(listener, host="127.0.0.1", port=0)
+        host, port = server.sockets[0].getsockname()[:2]
+        ticket = mint_media_ticket("call-1", _SECRET, ttl_seconds=60)
+
+        client = await websockets.connect(f"ws://{host}:{port}/media/{ticket}")
+        try:
+            for _ in range(50):
+                if "call-1" in provider._sockets:  # noqa: SLF001
+                    break
+                await asyncio.sleep(0.02)
+            else:
+                raise AssertionError("server never registered the socket")
+
+            stream = await provider.attach("call-1")
+            await client.send(b"\x01\x02")
+            first = await asyncio.wait_for(stream.receive().__anext__(), timeout=2.0)
+            assert first == b"\x01\x02"
+
+            server.close()
+            await server.wait_closed()
+
+            with pytest.raises(TransportError, match="media transport closed"):
+                async with asyncio.timeout(2.0):
+                    async for _ in stream.receive():
+                        raise AssertionError("no frame should ever be yielded")
+        finally:
+            with contextlib.suppress(Exception):
+                await client.close()
+
+    asyncio.run(scenario())

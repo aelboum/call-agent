@@ -43,6 +43,7 @@ from typing import Literal
 import websockets
 from websockets.asyncio.server import Server, ServerConnection
 from websockets.exceptions import ConnectionClosed
+from websockets.frames import CloseCode
 
 from voiceagent.metrics import record_media_ticket_rejected
 from voiceagent.telephony.contracts import CallRef, TransportError
@@ -138,11 +139,23 @@ class WebSocketMediaSocket:
         send: Callable[[str], Awaitable[None]],
         recv: Callable[[], Awaitable[bytes | str]],
         close: Callable[[], Awaitable[None]],
+        listener_closing: Callable[[], bool] = lambda: False,
     ) -> None:
         self._send = send
         self._recv = recv
         self._close = close
         self._closed = False
+        # Phase 2.33 fix: distinguishes the shared listener itself being
+        # torn down out from under an active call (real defect -- must
+        # raise `TransportError`, exactly like `send_text()` already does)
+        # from the ordinary, expected race where *this connection's own*
+        # remote end (FreeSWITCH/mod_audio_stream) closes first as part of
+        # a normal hangup, before this call's own `detach()` ever runs
+        # (Phase 2.24 brief section 5, `test_end_to_end_client_disconnect_
+        # during_active_media_ends_the_stream_cleanly` -- that contract is
+        # unchanged: a per-connection close with `listener_closing()` still
+        # `False` still ends `receive_binary()` cleanly, no exception).
+        self._listener_closing = listener_closing
 
     async def send_text(self, text: str) -> None:
         """Raises `TransportError` if the remote end is gone (Phase 2.29
@@ -167,7 +180,14 @@ class WebSocketMediaSocket:
         while True:
             try:
                 message = await self._recv()
-            except _ConnectionClosed:
+            except _ConnectionClosed as exc:
+                if self._listener_closing():
+                    # The shared listener's own server was closed while this
+                    # call was still active (Phase 2.33) -- this connection
+                    # did not end because the call ended, so the transport
+                    # contract must match `send_text()`'s: a classifiable
+                    # `TransportError`, never a silent end of stream.
+                    raise TransportError("media transport closed") from exc
                 return
             if isinstance(message, bytes):
                 yield message
@@ -229,6 +249,7 @@ class FreeSwitchMediaListener:
         recv: Callable[[], Awaitable[bytes | str]],
         close: Callable[[], Awaitable[None]],
         wait_closed: Callable[[], Awaitable[None]],
+        listener_closing: Callable[[], bool] = lambda: False,
     ) -> None:
         """The transport-agnostic connection handler: verify the ticket
         first, *before* ever registering a socket (Phase 2.21 brief section
@@ -237,7 +258,12 @@ class FreeSwitchMediaListener:
         and never reaches `MediaProvider.attach()` for any call. `websockets
         .serve()`'s own per-connection handler (a thin wrapper supplying the
         real `send`/`recv`/`close`/`wait_closed`) is the only production
-        caller; a test can call this directly with fakes."""
+        caller; a test can call this directly with fakes.
+
+        `listener_closing` (Phase 2.33) defaults to "never" so every
+        pre-existing caller/test is unaffected -- only `serve_freeswitch_
+        media()`'s own production `_handler()` passes a real one, set the
+        moment the shared `Server.close()` is invoked."""
         try:
             call_ref = self.extract_call_ref(path)
         except TicketVerificationError as exc:
@@ -245,7 +271,9 @@ class FreeSwitchMediaListener:
             record_media_ticket_rejected(reason=exc.reason)
             await close()
             return
-        socket = WebSocketMediaSocket(send=send, recv=recv, close=close)
+        socket = WebSocketMediaSocket(
+            send=send, recv=recv, close=close, listener_closing=listener_closing
+        )
         self._media_provider.register_socket(call_ref, socket)
         # Registration only hands the socket over; `attach()` (called by
         # `voiceagent.runtime.call_task.run_call_task()`, off the audio
@@ -262,7 +290,19 @@ async def serve_freeswitch_media(
     """Binds `listener` to a real `websockets` server. The only function in
     this module that imports `websockets` directly -- `FreeSwitchMediaListener
     .handle_connection()` itself is transport-agnostic (a test calls it with
-    plain callables, no real socket needed)."""
+    plain callables, no real socket needed).
+
+    Phase 2.33: the returned `Server`'s own `close()` is wrapped (never
+    overriding its signature or behavior, only observing the call) so every
+    connection's own `WebSocketMediaSocket.receive_binary()` can tell "the
+    shared listener itself was just closed" from "this one connection's own
+    remote end closed for an ordinary reason" -- see `WebSocketMediaSocket
+    .__init__()`'s own docstring/comment for why that distinction matters."""
+
+    listener_closing = False
+
+    def _is_listener_closing() -> bool:
+        return listener_closing
 
     async def _send(connection: ServerConnection, text: str) -> None:
         try:
@@ -283,6 +323,20 @@ async def serve_freeswitch_media(
             recv=lambda: _recv(connection),
             close=connection.close,
             wait_closed=connection.wait_closed,
+            listener_closing=_is_listener_closing,
         )
 
-    return await websockets.serve(_handler, host, port)
+    server = await websockets.serve(_handler, host, port)
+    original_close = server.close
+
+    def _close(
+        close_connections: bool = True,
+        code: CloseCode | int = CloseCode.GOING_AWAY,
+        reason: str = "",
+    ) -> None:
+        nonlocal listener_closing
+        listener_closing = True
+        return original_close(close_connections, code, reason)
+
+    server.close = _close  # type: ignore[method-assign]
+    return server
