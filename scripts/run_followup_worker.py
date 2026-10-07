@@ -57,6 +57,7 @@ from collections.abc import Sequence
 
 from voiceagent.config import settings_from_env, validate_deployment_readiness
 from voiceagent.followups.worker import FollowUpWorker
+from voiceagent.metrics import configure_metrics
 from voiceagent.runtime.db import DatabaseBoundary
 
 _logger = logging.getLogger("voiceagent.scripts.run_followup_worker")
@@ -97,6 +98,12 @@ def _optional_int(name: str, default: int) -> int:
 async def _run() -> None:
     logging.basicConfig(level=logging.INFO)
     validate_deployment_readiness(settings_from_env())
+    # Phase 2.39: this worker is one of `voiceagent.metrics`'s own two
+    # `record_worker_tick()` callers (the other is
+    # `run_call_intelligence_worker.py`, its own separate process) --
+    # called once, at startup, before the poller's first tick can record
+    # anything.
+    configure_metrics()
 
     tenant_ids = _parse_tenant_ids(_required_env("VOICEAGENT_FOLLOWUP_WORKER_TENANT_IDS"))
     system_actor_user_id = uuid.UUID(

@@ -59,6 +59,7 @@ from infra.jobs.config import get_jobs_config
 from infra.secrets import get_secrets_provider
 
 from voiceagent.config import Settings, settings_from_env, validate_deployment_readiness
+from voiceagent.metrics import configure_metrics
 from voiceagent.runtime.conversation_persistence import ConversationPersistence
 from voiceagent.runtime.db import DatabaseBoundary
 from voiceagent.runtime.heartbeat import RedisHeartbeatStore, new_instance_id
@@ -145,6 +146,13 @@ async def _run() -> None:
     logging.basicConfig(level=logging.INFO)
     settings = settings_from_env()
     validate_deployment_readiness(settings)
+    # Phase 2.39: this process is the sole owner of every `voiceagent.metrics`
+    # instrument this product actually records (calls, provider operations,
+    # media sessions, orchestration, reconciliation, tool executions --
+    # `voiceagent.api.app` and `voiceagent.api.v1` record none of these).
+    # Called once, at startup, before anything below can emit a single
+    # instrument -- never per call, per request, or per tick.
+    configure_metrics()
     address = _env("VOICEAGENT_RUNTIME_ADDRESS", socket.gethostname())
 
     heartbeat_store = RedisHeartbeatStore(get_jobs_config().redis_url)

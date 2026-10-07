@@ -50,6 +50,7 @@ from collections.abc import Sequence
 
 from voiceagent.call_intelligence.worker import CallAiAnalysisWorker
 from voiceagent.config import settings_from_env, validate_deployment_readiness
+from voiceagent.metrics import configure_metrics
 from voiceagent.providers.call_intelligence.registry import create_call_intelligence_provider
 from voiceagent.runtime.db import DatabaseBoundary
 
@@ -87,6 +88,11 @@ async def _run() -> None:
     logging.basicConfig(level=logging.INFO)
     settings = settings_from_env()
     validate_deployment_readiness(settings)
+    # Phase 2.39: this worker is one of `voiceagent.metrics`'s own two
+    # `record_worker_tick()` callers (the other is `run_followup_worker.py`,
+    # its own separate process) -- called once, at startup, before the
+    # poller's first tick can record anything.
+    configure_metrics()
 
     tenant_ids = _parse_tenant_ids(_required_env("VOICEAGENT_CALL_INTELLIGENCE_WORKER_TENANT_IDS"))
 
