@@ -249,17 +249,48 @@ class CallRuntime:
         )
 
     async def _run_heartbeat_loop(self, *, interval_seconds: float, ttl_seconds: float) -> None:
+        """A failed `write()` (a transient Redis outage, timeout, connection
+        reset) must never permanently stop this loop: Redis is a liveness
+        signal only (`voiceagent.runtime.heartbeat` module docstring), never
+        this runtime's ownership record, so a write failure here is caught
+        and retried on the same `interval_seconds` cadence rather than
+        letting the task die -- this runtime keeps serving the calls it
+        already owns either way, and a missed heartbeat is only ever read by
+        the reconciler/orchestrator as "temporarily unknown load", never as
+        "ownership released" (that remains PostgreSQL's own, unrelated
+        mechanism). Logged once on the transition into failure and once on
+        recovery, not on every retry, so a prolonged outage cannot spam the
+        log. `asyncio.CancelledError` is `BaseException`, not `Exception`,
+        so it is never caught here -- `shutdown()`'s cancellation still
+        propagates straight out undisturbed."""
+        failing = False
         while True:
-            await self._heartbeat_store.write(
-                RuntimeHeartbeat(
-                    instance_id=self.instance_id,
-                    address=self.address,
-                    capacity=self.capacity,
-                    current_load=self.current_load,
-                    last_heartbeat_epoch_seconds=wall_clock_now(),
-                ),
-                ttl_seconds=ttl_seconds,
-            )
+            try:
+                await self._heartbeat_store.write(
+                    RuntimeHeartbeat(
+                        instance_id=self.instance_id,
+                        address=self.address,
+                        capacity=self.capacity,
+                        current_load=self.current_load,
+                        last_heartbeat_epoch_seconds=wall_clock_now(),
+                    ),
+                    ttl_seconds=ttl_seconds,
+                )
+                if failing:
+                    _logger.warning(
+                        "runtime.heartbeat.recovered",
+                        extra={"runtime_instance_id": self.instance_id},
+                    )
+                    failing = False
+            except Exception:
+                if not failing:
+                    _logger.warning(
+                        "runtime.heartbeat.write_failed -- liveness signal degraded, "
+                        "retrying; no ownership state changed, no call affected",
+                        extra={"runtime_instance_id": self.instance_id},
+                        exc_info=True,
+                    )
+                    failing = True
             await asyncio.sleep(interval_seconds)
 
     async def shutdown(self) -> None:

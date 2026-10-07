@@ -643,3 +643,188 @@ def test_cancel_call_reason_reaches_the_cancellation_signal_for_every_reason(
 
     asyncio.run(scenario())
     assert seen == [reason]
+
+
+class _ScriptedHeartbeatStore(FakeHeartbeatStore):
+    """A `FakeHeartbeatStore` whose `write()` raises for a scripted prefix of
+    calls (simulating a transient Redis outage -- connection reset, timeout,
+    whatever) before falling through to the real in-memory write every call
+    after the script is exhausted. Proves Phase 2.38's own retry/recovery
+    behavior without needing a real Redis client."""
+
+    def __init__(self, write_outcomes: list[Exception | None]) -> None:
+        super().__init__()
+        self._outcomes = list(write_outcomes)
+        self.write_calls = 0
+
+    async def write(self, heartbeat: RuntimeHeartbeat, *, ttl_seconds: float) -> None:
+        self.write_calls += 1
+        if self._outcomes:
+            outcome = self._outcomes.pop(0)
+            if outcome is not None:
+                raise outcome
+        await super().write(heartbeat, ttl_seconds=ttl_seconds)
+
+
+async def _wait_for_write_calls(store: _ScriptedHeartbeatStore, at_least: int) -> None:
+    for _ in range(400):
+        if store.write_calls >= at_least:
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError(f"write_calls never reached {at_least}, stuck at {store.write_calls}")
+
+
+def test_heartbeat_survives_one_transient_redis_failure(monkeypatch) -> None:
+    """Test 1 (Phase 2.38 brief): a single failed `write()` must not kill the
+    heartbeat task -- the next tick's write succeeds normally."""
+    store = _ScriptedHeartbeatStore([ConnectionError("redis unavailable")])
+    runtime = CallRuntime(
+        instance_id="runtime-hb-1",
+        address="ws://runtime-hb-1/media",
+        capacity=10,
+        heartbeat_store=store,
+    )
+
+    async def scenario() -> None:
+        runtime.start_heartbeat(interval_seconds=0.01, ttl_seconds=10)
+        await _wait_for_write_calls(store, at_least=2)
+        assert runtime._heartbeat_task is not None  # noqa: SLF001
+        assert not runtime._heartbeat_task.done()  # noqa: SLF001
+        live = await store.read_all()
+        assert "runtime-hb-1" in live, "later heartbeat never actually succeeded"
+        await runtime.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_heartbeat_repeated_failures_retry_at_a_bounded_rate_not_a_tight_loop(monkeypatch) -> None:
+    """Test 2: several consecutive failures must not produce a tight,
+    unbounded retry loop -- retries are paced by `interval_seconds`, and the
+    task survives every one of them."""
+    interval_seconds = 0.02
+    failures = 8
+    store = _ScriptedHeartbeatStore([TimeoutError("redis timeout")] * failures)
+    runtime = CallRuntime(
+        instance_id="runtime-hb-2",
+        address="ws://runtime-hb-2/media",
+        capacity=10,
+        heartbeat_store=store,
+    )
+
+    async def scenario() -> float:
+        started_at = time.monotonic()
+        runtime.start_heartbeat(interval_seconds=interval_seconds, ttl_seconds=10)
+        # One write past the scripted failures proves the loop kept retrying
+        # all the way through them rather than dying partway.
+        await _wait_for_write_calls(store, at_least=failures + 1)
+        elapsed = time.monotonic() - started_at
+        assert runtime._heartbeat_task is not None  # noqa: SLF001
+        assert not runtime._heartbeat_task.done()  # noqa: SLF001
+        await runtime.shutdown()
+        return elapsed
+
+    elapsed = asyncio.run(scenario())
+    # A tight loop would clear `failures + 1` calls in microseconds; pacing
+    # by `interval_seconds` means it must take at least most of that many
+    # intervals (generous lower bound to absorb scheduler jitter) -- and an
+    # equally generous upper bound rules out runaway/unbounded backoff.
+    assert elapsed >= interval_seconds * failures * 0.5, elapsed
+    assert elapsed < interval_seconds * failures * 10, elapsed
+
+
+def test_heartbeat_resumes_after_a_failure_recovery_failure_recovery_sequence(monkeypatch) -> None:
+    """Test 3: success / failure / failure / success / success -- heartbeat
+    emission must resume automatically each time, not just once."""
+    store = _ScriptedHeartbeatStore([None, RuntimeError("blip"), RuntimeError("blip"), None, None])
+    runtime = CallRuntime(
+        instance_id="runtime-hb-3",
+        address="ws://runtime-hb-3/media",
+        capacity=10,
+        heartbeat_store=store,
+    )
+
+    async def scenario() -> None:
+        runtime.start_heartbeat(interval_seconds=0.01, ttl_seconds=10)
+        await _wait_for_write_calls(store, at_least=5)
+        # Give the loop one more tick past the scripted sequence so the
+        # final (unscripted, always-succeeding) write actually lands.
+        await _wait_for_write_calls(store, at_least=6)
+        live = await store.read_all()
+        assert "runtime-hb-3" in live, "heartbeat did not resume after recovery"
+        assert runtime._heartbeat_task is not None  # noqa: SLF001
+        assert not runtime._heartbeat_task.done()  # noqa: SLF001
+        await runtime.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_heartbeat_cancellation_still_propagates_while_retrying(monkeypatch) -> None:
+    """Test 4: shutdown() while the loop is mid-outage (about to sleep/retry)
+    must still cancel the heartbeat task cleanly and promptly -- a Redis
+    failure must never be mistaken for a reason to keep retrying forever,
+    ignoring cancellation."""
+    store = _ScriptedHeartbeatStore([ConnectionError("down")] * 1000)  # never recovers
+    runtime = CallRuntime(
+        instance_id="runtime-hb-4",
+        address="ws://runtime-hb-4/media",
+        capacity=10,
+        heartbeat_store=store,
+    )
+
+    async def scenario() -> None:
+        runtime.start_heartbeat(interval_seconds=0.01, ttl_seconds=10)
+        await _wait_for_write_calls(store, at_least=3)
+        await asyncio.wait_for(runtime.shutdown(), timeout=2)
+        assert runtime._heartbeat_task is None  # noqa: SLF001
+
+    asyncio.run(scenario())  # must not hang, must not raise
+
+
+def test_heartbeat_failure_does_not_alter_call_ownership_or_cancel_active_calls(
+    monkeypatch,
+) -> None:
+    """Tests 5 and 6: a Redis heartbeat failure must not touch this
+    runtime's own ownership bookkeeping (`_tasks`/`_cancellations`) or cause
+    an active call's own cancellation -- heartbeat is a liveness signal only
+    (`voiceagent.runtime.heartbeat` module docstring), never the authority
+    `run_call_task()`'s own cancellation is driven by. Reuses the existing
+    ownership/call-task primitives already exercised elsewhere in this file
+    rather than inventing a new ownership model or integration framework."""
+    cancelled = asyncio.Event()
+    started = asyncio.Event()
+
+    async def fake_run_call_task(*, context, call_session_id, call_ref, deps, cancellation):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    monkeypatch.setattr(supervisor_module, "run_call_task", fake_run_call_task)
+    store = _ScriptedHeartbeatStore([ConnectionError("down")] * 20)
+    runtime = CallRuntime(
+        instance_id="runtime-hb-5",
+        address="ws://runtime-hb-5/media",
+        capacity=10,
+        heartbeat_store=store,
+    )
+    call_session_id = uuid.uuid4()
+
+    async def scenario() -> None:
+        await runtime.start_call(_context(), call_session_id, "ref-1", _fake_deps())
+        await asyncio.wait_for(started.wait(), timeout=2)
+        runtime.start_heartbeat(interval_seconds=0.01, ttl_seconds=10)
+        await _wait_for_write_calls(store, at_least=10)  # several heartbeat failures land
+        # Ownership/call state is completely untouched by any of them.
+        assert runtime.is_running(call_session_id) is True
+        assert runtime.current_load == 1
+        assert call_session_id in runtime._tasks  # noqa: SLF001
+        # Present since `start_call()` (default reason), untouched by any
+        # heartbeat failure -- a real cancel would overwrite this reason.
+        assert runtime._cancellations[call_session_id].reason == "hangup"  # noqa: SLF001
+        assert cancelled.is_set() is False
+        await runtime.shutdown()
+
+    asyncio.run(scenario())
+    assert cancelled.is_set() is True  # only shutdown()'s own cancellation touched it
