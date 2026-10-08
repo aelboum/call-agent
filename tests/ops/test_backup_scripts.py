@@ -32,14 +32,18 @@ def test_backup_script_fails_closed_on_strict_mode() -> None:
 
 def test_backup_script_checks_artifact_integrity() -> None:
     text = _read("db_backup.sh")
-    assert "pg_restore --list" in text, "must verify archive structure, not just pg_dump's exit code"
+    assert "pg_restore --list" in text, (
+        "must verify archive structure, not just pg_dump's exit code"
+    )
     assert '[ "$size" -le 0 ]' in text, "must reject an empty artifact"
 
 
 def test_backup_script_requires_password_via_env_not_argument() -> None:
     text = _read("db_backup.sh")
     assert "PGPASSWORD" in text
-    assert "--password" not in text, "a password must never be a CLI argument (visible in process listings)"
+    assert "--password" not in text, (
+        "a password must never be a CLI argument (visible in process listings)"
+    )
 
 
 def test_backup_filename_has_no_secret_or_credential() -> None:
@@ -54,7 +58,9 @@ def test_restore_script_fails_closed_on_strict_mode() -> None:
 
 def test_restore_script_verifies_before_restoring() -> None:
     text = _read("db_restore.sh")
-    assert "pg_restore --list" in text, "must verify archive integrity before attempting a destructive restore"
+    assert "pg_restore --list" in text, (
+        "must verify archive integrity before attempting a destructive restore"
+    )
     assert "--exit-on-error" in text, "a partial/erroring restore must not be reported as success"
 
 
