@@ -142,6 +142,23 @@ def downgrade() -> None:
     op.drop_column(_TABLE, "next_attempt_at", schema="app")
     op.drop_column(_TABLE, "attempt_count", schema="app")
 
+    # Phase 2.41: a row already moved by the application to one of this
+    # migration's own two new values (`'processing'` via
+    # `claim_due_follow_up()`, `'failed'` via `fail_follow_up_execution()`)
+    # would otherwise make the `ADD CONSTRAINT` below fail with a
+    # `CheckViolation` -- PostgreSQL validates every existing row against a
+    # newly added CHECK constraint. Neither value is terminal (a
+    # `'processing'` row is still in flight; a `'failed'` row that has not
+    # exhausted `retry_policy.MAX_ATTEMPTS` still has a future
+    # `next_attempt_at` and is expected to be claimed again) -- exactly
+    # what `'pending'` meant before this migration introduced the
+    # narrower-to-wider distinction, so collapsing both into `'pending'` is
+    # the historically faithful downgrade target, not an approximation.
+    op.execute(
+        "UPDATE app.follow_up_actions SET status = 'pending' "
+        "WHERE status IN ('processing', 'failed')"
+    )
+
     op.drop_constraint("ck_follow_up_actions_status", _TABLE, schema="app", type_="check")
     op.create_check_constraint(
         "ck_follow_up_actions_status",
