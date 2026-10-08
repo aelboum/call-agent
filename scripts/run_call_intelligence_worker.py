@@ -33,10 +33,17 @@ should also be set (`voiceagent.config.settings.CallIntelligenceSettings
 `_authorize()` step fails closed without one (the same discipline
 `RuntimeSettings.system_actor_user_id` already establishes); this script
 does not weaken that by inventing a value.
+`VOICEAGENT_HEALTH_HOST`/`VOICEAGENT_HEALTH_PORT` (Phase 2.40; default
+`127.0.0.1`/`9100`) configure this process's own `/healthz`/`/readyz`
+listener (`voiceagent.health`) -- internal-only by default, meant to be
+reached from a `docker compose` `healthcheck:` running inside this same
+container, never published as a container port.
 
-Shutdown: SIGTERM or SIGINT calls `CallAiAnalysisWorker.shutdown()` (cancel
-the polling task, await the in-flight tick to unwind), then closes this
-script's own `DatabaseBoundary` (the worker does not own it).
+Shutdown: SIGTERM or SIGINT marks this process not-ready
+(`HealthState.mark_not_ready()`, Phase 2.40, before anything else), calls
+`CallAiAnalysisWorker.shutdown()` (cancel the polling task, await the
+in-flight tick to unwind), closes this script's own `DatabaseBoundary` (the
+worker does not own it), then stops the health listener.
 """
 
 from __future__ import annotations
@@ -50,6 +57,7 @@ from collections.abc import Sequence
 
 from voiceagent.call_intelligence.worker import CallAiAnalysisWorker
 from voiceagent.config import settings_from_env, validate_deployment_readiness
+from voiceagent.health import HealthState, serve_health_http
 from voiceagent.metrics import configure_metrics
 from voiceagent.providers.call_intelligence.registry import create_call_intelligence_provider
 from voiceagent.runtime.db import DatabaseBoundary
@@ -68,6 +76,10 @@ def _required_env(name: str) -> str:
     if not value:
         raise SystemExit(f"{name} is required and was not set")
     return value
+
+
+def _env(name: str, default: str) -> str:
+    return os.environ.get(name, default)
 
 
 def _parse_tenant_ids(raw: str) -> tuple[uuid.UUID, ...]:
@@ -93,6 +105,17 @@ async def _run() -> None:
     # its own separate process) -- called once, at startup, before the
     # poller's first tick can record anything.
     configure_metrics()
+
+    # Phase 2.40: liveness is reachable as soon as this listener is up --
+    # before provider construction or the first poll tick -- readiness
+    # flips true only once `worker.start()` has actually launched the
+    # polling loop (see the `mark_ready()` call site below).
+    health_state = HealthState()
+    health_server = await serve_health_http(
+        health_state,
+        host=_env("VOICEAGENT_HEALTH_HOST", "127.0.0.1"),
+        port=int(_env("VOICEAGENT_HEALTH_PORT", "9100")),
+    )
 
     tenant_ids = _parse_tenant_ids(_required_env("VOICEAGENT_CALL_INTELLIGENCE_WORKER_TENANT_IDS"))
 
@@ -129,6 +152,9 @@ async def _run() -> None:
         max_concurrent_tenants=settings.call_intelligence.max_concurrent_tenants,
     )
     worker.start()
+    # Phase 2.40: only now -- the polling loop is actually running -- is
+    # this process capable of claiming/processing its intended work.
+    health_state.mark_ready()
     _logger.info(
         "call_intelligence_worker.started",
         extra={"tenant_count": len(tenant_ids), "provider": settings.call_intelligence.provider},
@@ -144,9 +170,13 @@ async def _run() -> None:
         signal.signal(sig, _request_stop)
 
     await stop_event.wait()
+    # Phase 2.40: not-ready before anything else in shutdown.
+    health_state.mark_not_ready()
     _logger.info("call_intelligence_worker.shutdown.begin")
     await worker.shutdown()
     db.close()
+    health_server.close()
+    await health_server.wait_closed()
     _logger.info("call_intelligence_worker.shutdown.complete")
 
 

@@ -41,9 +41,16 @@ Optional tuning (defaults match `FollowUpWorker`'s own, unchanged):
 `VOICEAGENT_FOLLOWUP_WORKER_POLL_INTERVAL_SECONDS`,
 `VOICEAGENT_FOLLOWUP_WORKER_MAX_CLAIMS_PER_TENANT_PER_TICK`,
 `VOICEAGENT_FOLLOWUP_WORKER_MAX_CONCURRENT_TENANTS`.
+`VOICEAGENT_HEALTH_HOST`/`VOICEAGENT_HEALTH_PORT` (Phase 2.40; default
+`127.0.0.1`/`9100`) configure this process's own `/healthz`/`/readyz`
+listener (`voiceagent.health`) -- internal-only by default, meant to be
+reached from a `docker compose` `healthcheck:` running inside this same
+container, never published as a container port.
 
-Shutdown: SIGTERM or SIGINT calls `FollowUpWorker.shutdown()` (cancel the
-polling task, await it) before the process exits.
+Shutdown: SIGTERM or SIGINT marks this process not-ready
+(`HealthState.mark_not_ready()`, Phase 2.40, before anything else), calls
+`FollowUpWorker.shutdown()` (cancel the polling task, await it), then stops
+the health listener before the process exits.
 """
 
 from __future__ import annotations
@@ -57,6 +64,7 @@ from collections.abc import Sequence
 
 from voiceagent.config import settings_from_env, validate_deployment_readiness
 from voiceagent.followups.worker import FollowUpWorker
+from voiceagent.health import HealthState, serve_health_http
 from voiceagent.metrics import configure_metrics
 from voiceagent.runtime.db import DatabaseBoundary
 
@@ -73,6 +81,10 @@ def _required_env(name: str) -> str:
     if not value:
         raise SystemExit(f"{name} is required and was not set")
     return value
+
+
+def _env(name: str, default: str) -> str:
+    return os.environ.get(name, default)
 
 
 def _parse_tenant_ids(raw: str) -> tuple[uuid.UUID, ...]:
@@ -105,6 +117,16 @@ async def _run() -> None:
     # anything.
     configure_metrics()
 
+    # Phase 2.40: liveness is reachable as soon as this listener is up;
+    # readiness flips true only once `worker.start()` has actually
+    # launched the polling loop (see the `mark_ready()` call site below).
+    health_state = HealthState()
+    health_server = await serve_health_http(
+        health_state,
+        host=_env("VOICEAGENT_HEALTH_HOST", "127.0.0.1"),
+        port=int(_env("VOICEAGENT_HEALTH_PORT", "9100")),
+    )
+
     tenant_ids = _parse_tenant_ids(_required_env("VOICEAGENT_FOLLOWUP_WORKER_TENANT_IDS"))
     system_actor_user_id = uuid.UUID(
         _required_env("VOICEAGENT_FOLLOWUP_WORKER_SYSTEM_ACTOR_USER_ID")
@@ -129,6 +151,9 @@ async def _run() -> None:
         ),
     )
     worker.start()
+    # Phase 2.40: only now -- the polling loop is actually running -- is
+    # this process capable of claiming/processing its intended work.
+    health_state.mark_ready()
     _logger.info("followup_worker.started", extra={"tenant_count": len(tenant_ids)})
 
     stop_event = asyncio.Event()
@@ -141,9 +166,13 @@ async def _run() -> None:
         signal.signal(sig, _request_stop)
 
     await stop_event.wait()
+    # Phase 2.40: not-ready before anything else in shutdown.
+    health_state.mark_not_ready()
     _logger.info("followup_worker.shutdown.begin")
     await worker.shutdown()
     db.close()
+    health_server.close()
+    await health_server.wait_closed()
     _logger.info("followup_worker.shutdown.complete")
 
 

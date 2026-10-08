@@ -143,6 +143,15 @@ services:
       REDIS_REQUIRE_TLS: "false"  # see the top-of-file note
       VOICEAGENT_RUNTIME_ADDRESS: call-runtime:0
     command: python scripts/run_call_runtime.py
+    # Phase 2.40: identical shape to the `api` service's own healthcheck
+    # above, against this process's own internal-only `voiceagent.health`
+    # listener (default `127.0.0.1:9100`, never published as a container
+    # port) instead of the ASGI app's `/healthz`.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9100/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     stop_grace_period: 30s
 
   follow-up-worker:
@@ -167,6 +176,12 @@ services:
       VOICEAGENT_FOLLOWUP_WORKER_TENANT_IDS: ""
       VOICEAGENT_FOLLOWUP_WORKER_SYSTEM_ACTOR_USER_ID: ""
     command: python scripts/run_followup_worker.py
+    # Phase 2.40: see `call-runtime`'s own identical healthcheck above.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9100/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     stop_grace_period: 15s
 
   call-intelligence-worker:
@@ -191,6 +206,12 @@ services:
       VOICEAGENT_CALL_INTELLIGENCE_WORKER_TENANT_IDS: ""
       VOICEAGENT_CALL_INTELLIGENCE_SYSTEM_ACTOR_USER_ID: ""
     command: python scripts/run_call_intelligence_worker.py
+    # Phase 2.40: see `call-runtime`'s own identical healthcheck above.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9100/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     stop_grace_period: 15s
 
   frontend:

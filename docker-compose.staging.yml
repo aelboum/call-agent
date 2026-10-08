@@ -161,6 +161,15 @@ services:
     # public wss:// origin named in VOICEAGENT_FREESWITCH_MEDIA_PUBLIC_URL).
     ports:
       - "8100:8100"
+    # Phase 2.40: identical shape to the `api` service's own healthcheck
+    # above, against this process's own internal-only `voiceagent.health`
+    # listener (default `127.0.0.1:9100`, never published as a container
+    # port) instead of the ASGI app's `/healthz`.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9100/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     stop_grace_period: 30s
 
   follow-up-worker:
@@ -188,6 +197,12 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
     command: python scripts/run_followup_worker.py
+    # Phase 2.40: see `call-runtime`'s own identical healthcheck above.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9100/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     stop_grace_period: 15s
 
   call-intelligence-worker:
@@ -218,6 +233,12 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
     command: python scripts/run_call_intelligence_worker.py
+    # Phase 2.40: see `call-runtime`'s own identical healthcheck above.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9100/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     stop_grace_period: 15s
 
   frontend:

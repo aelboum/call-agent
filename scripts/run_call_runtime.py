@@ -38,11 +38,19 @@ defaults to the local hostname). `VOICEAGENT_RUNTIME_MAX_CONCURRENT_CALLS`,
 `FREESWITCH_MEDIA_TICKET_SECRET` secrets (`infra.secrets`, never `Settings`)
 enable the real telephony transport; leaving `_ESL_HOST` unset keeps this
 process exactly as it was before Phase 2.21 (heartbeat only).
+`VOICEAGENT_HEALTH_HOST`/`VOICEAGENT_HEALTH_PORT` (Phase 2.40; default
+`127.0.0.1`/`9100`) configure this process's own `/healthz`/`/readyz`
+listener (`voiceagent.health`) -- internal-only by default, meant to be
+reached from a `docker compose` `healthcheck:` running inside this same
+container, never published as a container port.
 
-Shutdown: SIGTERM or SIGINT calls `CallRuntime.shutdown()` (cancels every
-owned call concurrently, bounded per-call), closes the FreeSWITCH transport
-if it was started (`ManagedEslConnection.close()`, the media listener), and
-deregisters this instance's heartbeat before the process exits -- a clean
+Shutdown: SIGTERM or SIGINT marks this process not-ready
+(`HealthState.mark_not_ready()`, Phase 2.40 -- before anything else, so an
+orchestrator stops routing new work here immediately), then calls
+`CallRuntime.shutdown()` (cancels every owned call concurrently, bounded
+per-call), closes the FreeSWITCH transport if it was started
+(`ManagedEslConnection.close()`, the media listener), deregisters this
+instance's heartbeat, and finally stops the health listener -- a clean
 stop is never mistaken for a crash by the reconciler.
 """
 
@@ -59,6 +67,7 @@ from infra.jobs.config import get_jobs_config
 from infra.secrets import get_secrets_provider
 
 from voiceagent.config import Settings, settings_from_env, validate_deployment_readiness
+from voiceagent.health import HealthState, serve_health_http
 from voiceagent.metrics import configure_metrics
 from voiceagent.runtime.conversation_persistence import ConversationPersistence
 from voiceagent.runtime.db import DatabaseBoundary
@@ -155,6 +164,18 @@ async def _run() -> None:
     configure_metrics()
     address = _env("VOICEAGENT_RUNTIME_ADDRESS", socket.gethostname())
 
+    # Phase 2.40: liveness is reachable as soon as this listener is up --
+    # before any of the (potentially slow, potentially failing) startup
+    # below -- readiness flips true only once this process has actually
+    # completed its own startup contract (see the `mark_ready()` call
+    # site below).
+    health_state = HealthState()
+    health_server = await serve_health_http(
+        health_state,
+        host=_env("VOICEAGENT_HEALTH_HOST", "127.0.0.1"),
+        port=int(_env("VOICEAGENT_HEALTH_PORT", "9100")),
+    )
+
     heartbeat_store = RedisHeartbeatStore(get_jobs_config().redis_url)
     runtime = CallRuntime(
         instance_id=new_instance_id(),
@@ -189,6 +210,11 @@ async def _run() -> None:
         freeswitch_transport.events.on_unrouted_offer = orchestrator.handle_unrouted_offer
         await freeswitch_transport.start()
 
+    # Phase 2.40: only now -- required startup (metrics, heartbeat loop
+    # launched, and, if configured, the real FreeSWITCH transport +
+    # orchestrator) has genuinely completed -- is this process capable of
+    # safely accepting/starting a call.
+    health_state.mark_ready()
     _logger.info(
         "call_runtime.started",
         extra={
@@ -209,6 +235,10 @@ async def _run() -> None:
         signal.signal(sig, _request_stop)
 
     await stop_event.wait()
+    # Phase 2.40: not-ready before anything else in shutdown -- an
+    # orchestrator must stop considering this instance for new work the
+    # moment shutdown begins, not once it has already finished.
+    health_state.mark_not_ready()
     _logger.info("call_runtime.shutdown.begin", extra={"instance_id": runtime.instance_id})
     if orchestrator is not None:
         await orchestrator.shutdown()
@@ -217,6 +247,8 @@ async def _run() -> None:
         await freeswitch_transport.stop()
     await heartbeat_store.close()
     db.close()
+    health_server.close()
+    await health_server.wait_closed()
     _logger.info("call_runtime.shutdown.complete", extra={"instance_id": runtime.instance_id})
 
 
