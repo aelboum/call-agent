@@ -120,6 +120,12 @@ include = ["voiceagent", "tests"]
 # like a boundary violation but is only a configuration gap.
 venvPath = "."
 venv = ".venv"
+# Phase 2.42: tests/ops/test_offhost_backup.py imports scripts/offhost_backup.py
+# the same way scripts/validate_staging_listener_restart_recovery.py already
+# imports a sibling script -- via a `sys.path.insert(0, ...)` at runtime, not
+# a package. pyright cannot see a runtime sys.path edit, so it needs this
+# static equivalent to resolve the import instead of reporting it missing.
+extraPaths = ["scripts"]
 # Migrations are Alembic-generated scaffolding with its own conventions and
 # are type-checked by neither this project nor saas-os's own.
 exclude = ["migrations", "frontend", ".venv", "**/__pycache__"]
