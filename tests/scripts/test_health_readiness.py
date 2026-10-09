@@ -80,9 +80,7 @@ async def _await_event(event: asyncio.Event, *, timeout_seconds: float = 2.0) ->
 
 
 async def _probe(port: int, path: str) -> bytes:
-    reader, writer = await asyncio.wait_for(
-        asyncio.open_connection("127.0.0.1", port), timeout=2.0
-    )
+    reader, writer = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", port), timeout=2.0)
     try:
         writer.write(f"GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode("ascii"))
         await writer.drain()

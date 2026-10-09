@@ -55,6 +55,16 @@ from voiceagent.telephony.freeswitch.media import FreeSwitchMediaProvider
 #: never a free-form string.
 _RejectReason = Literal["malformed", "expired", "invalid_signature", "missing_path"]
 
+#: A deliberate, reviewed bound on a single inbound WebSocket message (raw
+#: PCM audio frame or a JSON control message), not `websockets`' own
+#: implicit 1 MiB default. This product's own largest real audio format
+#: (`voiceagent.telephony.freeswitch.media._SUPPORTED_FORMATS`, 16 kHz
+#: mono pcm_s16le = 32,000 bytes/second) and its JSON control messages are
+#: both orders of magnitude under this -- generous enough never to reject
+#: real traffic, but an explicit product decision that cannot silently
+#: change on a future `websockets` dependency bump.
+_MAX_MEDIA_MESSAGE_BYTES = 64 * 1024
+
 __all__ = [
     "FreeSwitchMediaListener",
     "TicketVerificationError",
@@ -326,7 +336,7 @@ async def serve_freeswitch_media(
             listener_closing=_is_listener_closing,
         )
 
-    server = await websockets.serve(_handler, host, port)
+    server = await websockets.serve(_handler, host, port, max_size=_MAX_MEDIA_MESSAGE_BYTES)
     original_close = server.close
 
     def _close(

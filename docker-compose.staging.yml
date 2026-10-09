@@ -55,6 +55,11 @@ services:
       MIGRATIONS_DATABASE_URL: ${MIGRATIONS_DATABASE_URL:?set MIGRATIONS_DATABASE_URL in .env.staging}
       APP_DB_USER: ${APP_DB_USER:?set APP_DB_USER in .env.staging}
     command: sh -c "saas-os-migrate upgrade && alembic upgrade head"
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "1.0"
 
   api:
     build: .
@@ -109,6 +114,11 @@ services:
       retries: 5
     ports:
       - "8000:8000"
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "1.0"
 
   call-runtime:
     build: .
@@ -171,6 +181,11 @@ services:
       timeout: 5s
       retries: 5
     stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "2.0"
 
   follow-up-worker:
     build: .
@@ -204,6 +219,11 @@ services:
       timeout: 5s
       retries: 5
     stop_grace_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "1.0"
 
   call-intelligence-worker:
     build: .
@@ -240,6 +260,11 @@ services:
       timeout: 5s
       retries: 5
     stop_grace_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "1.0"
 
   frontend:
     build: ./frontend
@@ -249,3 +274,8 @@ services:
       API_UPSTREAM: ${FRONTEND_API_UPSTREAM:-http://api:8000}
     ports:
       - "8080:8080"
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: "0.5"

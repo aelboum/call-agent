@@ -14,6 +14,7 @@ import pytest
 import websockets
 
 from voiceagent.telephony.contracts import TransportError
+from voiceagent.telephony.freeswitch import media_transport
 from voiceagent.telephony.freeswitch.media import FreeSwitchMediaProvider
 from voiceagent.telephony.freeswitch.media_transport import (
     FreeSwitchMediaListener,
@@ -350,3 +351,33 @@ def test_end_to_end_listener_close_during_active_media_raises_transport_error() 
                 await client.close()
 
     asyncio.run(scenario())
+
+
+def test_serve_freeswitch_media_wires_the_configured_max_size_into_websockets_serve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Proves `_MAX_MEDIA_MESSAGE_BYTES` is actually passed to
+    `websockets.serve()`, not just defined as an unused constant -- without
+    opening a real network listener, by substituting `websockets.serve`
+    itself and inspecting the call it receives."""
+    captured_kwargs: dict[str, object] = {}
+
+    class _FakeServer:
+        def close(self, *args: object, **kwargs: object) -> None:
+            pass
+
+    async def _fake_serve(handler: object, host: object, port: object, **kwargs: object) -> object:
+        captured_kwargs.update(kwargs)
+        return _FakeServer()
+
+    monkeypatch.setattr(media_transport.websockets, "serve", _fake_serve)
+
+    async def scenario() -> None:
+        provider = FreeSwitchMediaProvider()
+        listener = FreeSwitchMediaListener(provider, ticket_secret=_SECRET)
+        await serve_freeswitch_media(listener, host="127.0.0.1", port=0)
+
+    asyncio.run(scenario())
+
+    assert captured_kwargs.get("max_size") == media_transport._MAX_MEDIA_MESSAGE_BYTES  # noqa: SLF001
+    assert media_transport._MAX_MEDIA_MESSAGE_BYTES == 64 * 1024  # noqa: SLF001

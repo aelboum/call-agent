@@ -199,6 +199,155 @@ jobs:
           APP_DB_USER: saas_os_app
         run: pytest -m integration
 
+  recovery-drill:
+    name: automated recovery drill (Phase 2.43)
+    runs-on: ubuntu-latest
+    # Two independent disposable postgres:16-alpine service containers, both
+    # created fresh for this job and torn down with the runner -- never
+    # shared with any other job, never a database anything else depends on
+    # afterward (same "ephemeral, job-scoped, never a developer's own
+    # long-lived database" guarantee `migrations-integration` already
+    # relies on). `postgres-source` is migrated and backed up; `postgres-
+    # target` is left completely empty of this product's own schema -- that
+    # emptiness, confirmed again by `db_recovery_drill.py` itself right
+    # before it restores anything, is what makes it a safe destination.
+    # `scripts/db_recovery_drill.py` never accepts an arbitrary externally-
+    # supplied database URL and infers safety from it -- it only ever
+    # connects using the `DRILL_TARGET_*` configuration this job sets below,
+    # which always points at `postgres-target`.
+    services:
+      postgres-source:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: saas_os
+          POSTGRES_PASSWORD: drill-source-ci-placeholder # pragma: allowlist secret
+          POSTGRES_DB: voiceagent
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U saas_os -d voiceagent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      postgres-target:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: saas_os
+          POSTGRES_PASSWORD: drill-target-ci-placeholder # pragma: allowlist secret
+          POSTGRES_DB: voiceagent
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U saas_os -d voiceagent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Configure git for private saas-os access
+        run: git config --global url."https://x-access-token:${SAAS_OS_TOKEN}@github.com/".insteadOf "https://github.com/"
+        env:
+          SAAS_OS_TOKEN: ${{ secrets.SAAS_OS_TOKEN }}
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Install the PostgreSQL client (psql)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client
+      # Same restricted-role shape on both instances (NOSUPERUSER
+      # NOBYPASSRLS), via the identical statement
+      # `docker/postgres-init/01-create-app-role.sh` already runs for a real
+      # deployment -- `postgres-target`'s role is created here, before any
+      # migration or restore, precisely so the drill target already has the
+      # role structure `db_restore.sh`'s own docstring requires, while its
+      # `app` schema stays empty until the drill restores into it.
+      - name: Create the restricted application role on both instances
+        run: |
+          PGPASSWORD=drill-source-ci-placeholder psql -v ON_ERROR_STOP=1 \
+            -h 127.0.0.1 -p 5432 -U saas_os -d voiceagent -c "
+              CREATE ROLE saas_os_app LOGIN PASSWORD 'drill-source-app-ci-placeholder'
+                  NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
+              GRANT CONNECT ON DATABASE voiceagent TO saas_os_app;
+            "
+          PGPASSWORD=drill-target-ci-placeholder psql -v ON_ERROR_STOP=1 \
+            -h 127.0.0.1 -p 5433 -U saas_os -d voiceagent -c "
+              CREATE ROLE saas_os_app LOGIN PASSWORD 'drill-target-app-ci-placeholder'
+                  NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
+              GRANT CONNECT ON DATABASE voiceagent TO saas_os_app;
+            "
+      # Migrated ONLY on the source -- the target must stay empty of the
+      # product's own schema (`app`) until the drill itself restores into
+      # it; applying migrations here would defeat the whole point of the
+      # drill's own pre-restore emptiness check.
+      - name: Apply SaaS-OS's own migrations, then this product's, on the source only
+        env:
+          ENVIRONMENT: test
+          DATABASE_URL: postgresql+psycopg://saas_os_app:drill-source-app-ci-placeholder@127.0.0.1:5432/voiceagent # pragma: allowlist secret
+          MIGRATIONS_DATABASE_URL: postgresql+psycopg://saas_os:drill-source-ci-placeholder@127.0.0.1:5432/voiceagent # pragma: allowlist secret
+          APP_DB_USER: saas_os_app
+        run: |
+          saas-os-migrate upgrade
+          alembic upgrade head
+      # Real backup, real Phase 2.42 manifest/checksum format -- the local
+      # "command" transport (cp/sha256sum) with
+      # OFFHOST_BACKUP_ALLOW_LOCAL_DESTINATION_FOR_TESTING=true, exactly the
+      # test-only configuration `docs/PHASE-2.42-OFFHOST-BACKUP-RETENTION.md`
+      # §9 itself used, never a real network transport (out of this phase's
+      # scope, see docs/PHASE-2.43-AUTOMATED-RECOVERY-DRILLS.md).
+      - name: Produce and verify a real backup of the source
+        run: |
+          mkdir -p /tmp/drill-backup /tmp/drill-offhost /tmp/drill-state /tmp/drill-report
+          head_revision="$(python - <<'PY'
+          from alembic.config import Config
+          from alembic.script import ScriptDirectory
+          cfg = Config("alembic.ini")
+          print(ScriptDirectory.from_config(cfg).get_current_head())
+          PY
+          )"
+          python scripts/offhost_backup.py backup \
+            --host 127.0.0.1 --port 5432 --db voiceagent --user saas_os \
+            --output-dir /tmp/drill-backup --migration-revision "$head_revision"
+          echo "DUMP_PATH=$(ls /tmp/drill-backup/*.dump)" >> "$GITHUB_ENV"
+        env:
+          PGPASSWORD: drill-source-ci-placeholder # pragma: allowlist secret
+          OFFHOST_BACKUP_ENABLED: "true"
+          OFFHOST_BACKUP_DESTINATION_KIND: command
+          OFFHOST_BACKUP_DESTINATION_ROOT: /tmp/drill-offhost
+          OFFHOST_BACKUP_ALLOW_LOCAL_DESTINATION_FOR_TESTING: "true"
+          OFFHOST_BACKUP_TRANSFER_COMMAND: '["cp", "{LOCAL_PATH}", "{REMOTE_ROOT}/{REMOTE_NAME}"]'
+          OFFHOST_BACKUP_VERIFY_COMMAND: '["sha256sum", "{REMOTE_ROOT}/{REMOTE_NAME}"]'
+          OFFHOST_BACKUP_STATE_DIR: /tmp/drill-state
+      # The drill itself: artifact re-verification, target-safety
+      # precondition, restore, migration/schema/RLS validation -- never
+      # given DATABASE_URL/MIGRATIONS_DATABASE_URL/PGPASSWORD (not set
+      # anywhere in this step's own env block), and its target credentials
+      # are distinct from the source's.
+      - name: Run the recovery drill against the dedicated target
+        run: |
+          python scripts/db_recovery_drill.py drill \
+            --dump-path "$DUMP_PATH" --output-dir /tmp/drill-report
+        env:
+          DRILL_MODE: "true"
+          DRILL_TARGET_HOST: 127.0.0.1
+          DRILL_TARGET_PORT: "5433"
+          DRILL_TARGET_DB: voiceagent
+          DRILL_TARGET_OWNER_USER: saas_os
+          DRILL_TARGET_OWNER_PASSWORD: drill-target-ci-placeholder # pragma: allowlist secret
+          DRILL_TARGET_APP_USER: saas_os_app
+          DRILL_TARGET_APP_PASSWORD: drill-target-app-ci-placeholder # pragma: allowlist secret
+      - name: Upload the drill report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recovery-drill-report
+          path: /tmp/drill-report/*.json
+          retention-days: 14
+
   frontend:
     runs-on: ubuntu-latest
     steps:

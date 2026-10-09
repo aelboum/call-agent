@@ -1218,7 +1218,10 @@ workflow engine, calendar, knowledge, recordings, the UI.
 
 Phase 2 (after Phase 1 review): FreeSWITCH boundary + real media + one engine +
 the reaper. Phase 3: calendar + transfer + workflow subset. Phase 4: knowledge,
-privacy/retention implementation, external calendars, UI.
+privacy/retention implementation, external calendars, UI — the UI item is
+Phase 4.4, Product API + Frontend, broken out in §23, and it is built as one
+frontend application serving multiple authorized user contexts, never as
+separate frontends per role or tenant.
 
 ---
 
@@ -1457,3 +1460,106 @@ Two verification tasks are tracked and non-blocking: the Phase 2 spike must
 confirm that Pipecat's transport model does not demand ownership of the media
 socket (ADR-0006 point 9), and P1.3 must confirm 32-bit integer sufficiency
 before any column would need BIGINT (ADR-0007).
+
+---
+
+## 23. Phase 4.4 — Product API + Frontend (roadmap amendment)
+
+*Added 2026-09-21. Documentation only — no frontend, API, schema, or
+migration is built by this section. Resolves nothing that blocks Phase 1 or
+Phase 2; recorded now so the eventual UI phase (§18's Phase 4 line) cannot be
+designed around the wrong assumption. Full architectural decision: ADR-0010.*
+
+§21 already fixes "no UI" as a Phase 0 build non-goal. This section fixes the
+UI's *shape*, years before it is built, for the same reason ADR-0006 fixed
+`ConversationEngine`'s shape before an engine existed: stated once, up front,
+it cannot be re-decided by drift once a team is under delivery pressure.
+
+### 23.1 The requirement
+
+**The product ships one frontend application and codebase**, serving every
+authorized user context — platform/operator, agency, customer/tenant,
+sub-tenant where SaaS-OS's hierarchy supports it, and (future, not built
+here) delegated/support access — through one adaptive application, never
+through separate builds per role, per tenant, or per agency/customer. No
+product role list is fixed by this section; the examples are illustrative
+only. What is fixed is that whatever the roles turn out to be, they are
+**contexts within one application**.
+
+The frontend represents the authenticated user's **effective application
+context** — identity, available contexts, active context, effective
+capabilities, and (where a legitimate SaaS-OS workflow exists) a delegated
+context distinct from the authenticated identity. These five are never
+collapsed into a single frontend "role" field (ADR-0010 §6).
+
+SaaS-OS and the backend remain the sole authorization authority. The frontend
+consumes backend-provided context/capability information to drive what it
+shows; it never becomes a second authorization system, never trusts a
+frontend-supplied tenant ID/role name/capability flag as a security
+boundary, and treats UI visibility as a usability property, not a security
+control (ADR-0010 §9). It works with SaaS-OS's existing tenant hierarchy
+unmodified — no second tenant hierarchy, no product-specific rule that
+contradicts SaaS-OS's own.
+
+Context-scoped frontend state (cache, query results) is keyed or invalidated
+by the active context, so a context switch can never surface the previous
+context's cached data as though it belonged to the new one; a browser reload
+is never assumed sufficient for that isolation by itself (ADR-0010 §7, §11).
+A tenant/context ID encoded in a URL is a locator, never a grant — the
+backend verifies authorization independently of what the URL names
+(ADR-0010 §12). White-labeling is branding/feature configuration layered on
+the one application, not a reason to fork it, and the commercial product
+name stays undecided and configurable via `app_display_name`
+(`VOICEAGENT_APP_DISPLAY_NAME`), unchanged from ADR-0005 (ADR-0010 §13).
+
+### 23.2 Roadmap placement
+
+Phase 4's UI item (§18's Phase 4 line) is broken out as:
+
+```text
+Phase 4 -- Knowledge, Privacy/Retention, External Calendars, Product API + Frontend
+  4.1 -- Knowledge
+  4.2 -- Privacy/retention implementation
+  4.3 -- External calendars
+  4.4 -- Product API + Frontend
+        4.4.1 -- One Frontend, Multiple User Contexts   (ADR-0010; this section)
+        4.4.2 -- Context-aware Application Shell
+        4.4.3 -- Authorized Context Switching
+        4.4.4 -- Capability-driven Navigation/UI
+        4.4.5 -- Context Isolation, Cache & Security Tests
+```
+
+4.1–4.3 are unchanged from the original Phase 4 line and are not re-scoped by
+this section. 4.4's five sub-phases did not exist before this addendum; they
+give the previously unstructured "UI" item the same major.minor discipline
+already used for Phase 2 (2.0 architecture, 2.1/2.2/2.3 implementation
+slices), so a future phase has a checklist instead of one word.
+
+### 23.3 Dependencies
+
+SaaS-OS tenant hierarchy; SaaS-OS authorization; SaaS-OS delegated-
+administration/support access, where applicable; the product API's own
+authentication/session model (not yet designed); a product-owned frontend
+application shell (not yet built). None of these may be satisfied by
+inventing a second authorization model — see §9 above and ADR-0010 §9.
+
+### 23.4 Non-goals of this section
+
+This section is documentation only. It does not implement frontend context
+switching, a frontend authorization framework, a new authentication system, a
+new tenant hierarchy, a new RBAC system, support impersonation, new SaaS-OS
+functionality, new database tables or migrations, new product APIs, a
+production frontend, or white-labeling. It does not modify Phase 2.3's scope,
+which remains strictly the AI provider vertical slice (Call Runtime ->
+`ConversationEngine` -> `PipelinedEngine` -> STT/LLM/TTS providers).
+
+### 23.5 Full decision record
+
+ADR-0010 (`docs/ADR/0010-one-frontend-multiple-user-contexts.md`) carries the
+complete decision: the context model, context-switching requirements,
+delegated/support-context boundary, cache/state isolation requirements,
+URL/deep-link handling, white-label compatibility, and the security test
+list (cross-tenant leakage, context-switch leakage, stale-cache leakage,
+unauthorized/revoked context access, deep-link authorization, and concurrent
+requests or refresh during a context switch) that Phase 4.4.5 must satisfy
+before this phase is considered done.

@@ -125,10 +125,10 @@ default) and treats a `TimeoutError` as a logged, best-effort, non-fatal
 event. The old `detach()` body was:
 
 ```python
-stream = self._streams.pop(call_ref, None)   # (1) always runs
+stream = self._streams.pop(call_ref, None)  # (1) always runs
 ...
-await stream.close()                          # (2) can be slow/cancelled here
-self._sockets.pop(call_ref, None)             # (3) only reached if (2) finishes
+await stream.close()  # (2) can be slow/cancelled here
+self._sockets.pop(call_ref, None)  # (3) only reached if (2) finishes
 attached_at = self._attached_at.pop(call_ref, None)
 ```
 

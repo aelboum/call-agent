@@ -153,9 +153,7 @@ def test_run_call_intelligence_worker_activates_metrics_once_before_first_tick(
     recorder = _RecordingConfigureMetrics()
     handlers: dict[int, Callable[..., None]] = {}
 
-    monkeypatch.setenv(
-        "VOICEAGENT_CALL_INTELLIGENCE_WORKER_TENANT_IDS", str(uuid.uuid4())
-    )
+    monkeypatch.setenv("VOICEAGENT_CALL_INTELLIGENCE_WORKER_TENANT_IDS", str(uuid.uuid4()))
     monkeypatch.setattr(module, "configure_metrics", recorder)
     monkeypatch.setattr(module, "settings_from_env", _settings)
     monkeypatch.setattr(module, "validate_deployment_readiness", lambda settings: None)
@@ -219,6 +217,3 @@ def test_run_followup_worker_activates_metrics_once_before_first_tick(monkeypatc
         assert recorder.call_count == 1
 
     _run(scenario())
-
-
-

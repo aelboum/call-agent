@@ -62,6 +62,14 @@ services:
     # No host port published by default -- only services on this compose
     # network need to reach it. Uncomment to inspect it directly:
     # ports: ["15432:5432"]
+    # Host-enforced ceiling, independent of Phase 2.32's own app-level
+    # backpressure -- a runaway process in this container can never starve
+    # the rest of the compose network of host memory/CPU.
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "1.0"
 
   redis:
     image: redis:7-alpine
@@ -70,6 +78,11 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: "0.5"
 
   # One-shot migration step (Phase 2.18 Workstream F): runs both histories in
   # the required order (SaaS-OS's own, ADR-0016, then this product's) and
@@ -90,6 +103,11 @@ services:
       MIGRATIONS_DATABASE_URL: postgresql+psycopg://saas_os:devpassword@postgres:5432/voiceagent  # pragma: allowlist secret
       APP_DB_USER: saas_os_app
     command: sh -c "saas-os-migrate upgrade && alembic upgrade head"
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "1.0"
 
   api:
     build: .
@@ -124,6 +142,11 @@ services:
       retries: 5
     ports:
       - "8000:8000"
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "1.0"
 
   call-runtime:
     build: .
@@ -153,6 +176,11 @@ services:
       timeout: 5s
       retries: 5
     stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "2.0"
 
   follow-up-worker:
     build: .
@@ -183,6 +211,11 @@ services:
       timeout: 5s
       retries: 5
     stop_grace_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "1.0"
 
   call-intelligence-worker:
     build: .
@@ -213,6 +246,11 @@ services:
       timeout: 5s
       retries: 5
     stop_grace_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "1.0"
 
   frontend:
     build: ./frontend
@@ -222,6 +260,11 @@ services:
       API_UPSTREAM: http://api:8000
     ports:
       - "8080:8080"
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: "0.5"
 
 volumes:
   postgres_data:

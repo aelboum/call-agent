@@ -492,3 +492,77 @@ def test_ledger_round_trips_and_has_restrictive_permissions(tmp_path: Path) -> N
 def test_ledger_missing_file_is_empty_list(tmp_path: Path) -> None:
     config = m.load_config(_base_env(OFFHOST_BACKUP_STATE_DIR=str(tmp_path)))
     assert m.load_ledger(config) == []
+
+
+# --------------------------------------------------------------------- #
+# Phase 2.44: freshness -- pure logic over the existing ledger
+# --------------------------------------------------------------------- #
+
+
+def _verified_entry(backup_id: str, verified_at_utc: str) -> dict:
+    entry = _entry(backup_id, verified_at_utc)
+    entry["verified_at_utc"] = verified_at_utc
+    return entry
+
+
+def test_freshness_fails_on_empty_ledger() -> None:
+    report = m.check_freshness([], max_age_hours=24.0, now=_NOW)
+    assert report["verdict"] == "FAIL"
+    assert report["backups_in_ledger"] == 0
+
+
+def test_freshness_passes_when_newest_backup_within_threshold() -> None:
+    entries = [
+        _verified_entry("voiceagent-20261006T000000Z", "2026-10-06T00:00:00+00:00"),
+        _verified_entry("voiceagent-20261007T120000Z", "2026-10-07T12:00:00+00:00"),
+    ]
+    report = m.check_freshness(entries, max_age_hours=24.0, now=_NOW)
+    assert report["verdict"] == "PASS"
+    assert report["newest_backup_id"] == "voiceagent-20261007T120000Z"
+    assert report["age_hours"] == 12.0
+    assert report["reason"] is None
+
+
+def test_freshness_fails_when_newest_backup_exceeds_threshold() -> None:
+    entries = [_verified_entry("voiceagent-20261001T000000Z", "2026-10-01T00:00:00+00:00")]
+    report = m.check_freshness(entries, max_age_hours=24.0, now=_NOW)
+    assert report["verdict"] == "FAIL"
+    assert "exceeding" in report["reason"]
+    assert report["age_hours"] > 24.0
+
+
+def test_freshness_uses_the_newest_entry_not_ledger_order() -> None:
+    entries = [
+        _verified_entry("voiceagent-20261007T120000Z", "2026-10-07T12:00:00+00:00"),
+        _verified_entry("voiceagent-20261001T000000Z", "2026-10-01T00:00:00+00:00"),
+    ]
+    report = m.check_freshness(entries, max_age_hours=24.0, now=_NOW)
+    assert report["newest_backup_id"] == "voiceagent-20261007T120000Z"
+    assert report["verdict"] == "PASS"
+
+
+def test_cmd_freshness_requires_offhost_enabled(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(os, "environ", {})
+    args = m.argparse.Namespace(max_age_hours=24.0)
+    exit_code = m._cmd_freshness(args)
+    assert exit_code == 2
+    assert "not enabled" in capsys.readouterr().err
+
+
+def test_cmd_freshness_reports_json_and_exits_nonzero_on_stale(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env = _base_env(OFFHOST_BACKUP_STATE_DIR=str(tmp_path))
+    monkeypatch.setattr(os, "environ", env)
+    config = m.load_config(env)
+    m.save_ledger(config, [_verified_entry("voiceagent-old", "2020-01-01T00:00:00+00:00")])
+
+    args = m.argparse.Namespace(max_age_hours=24.0)
+    exit_code = m._cmd_freshness(args)
+
+    assert exit_code == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["verdict"] == "FAIL"
+    assert report["newest_backup_id"] == "voiceagent-old"

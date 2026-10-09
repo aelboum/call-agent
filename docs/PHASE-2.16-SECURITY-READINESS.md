@@ -467,5 +467,5 @@ missing security headers, telephony command-construction validation gap
 | Redis connection hygiene (`ops.py`) | Hardened |
 | Webhooks | Not applicable (none exist) |
 | Secrets in source/tests | Verified |
-| Container/deployment hardening | Environment-dependent (no container config exists) |
+| Container/deployment hardening | Hardened (resource limits added, Phase 2.45 -- container config did not exist at the time this row was first written) |
 | Integration-test execution | Environment-dependent (no PostgreSQL/Redis/FreeSWITCH here) |

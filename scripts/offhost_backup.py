@@ -898,6 +898,59 @@ def _cmd_retention(_args: argparse.Namespace) -> int:
     return 1 if result.failed else 0
 
 
+def check_freshness(ledger: list[dict], *, max_age_hours: float, now: datetime) -> dict:
+    """Phase 2.44: closes the gap this phase's own §13 named ("a failed
+    scheduled backup/retention run must currently be noticed from the
+    scheduler's own job-failure signal ... nothing in this phase pages
+    anyone"). Reads the existing verified-backup ledger -- no new state, no
+    new infrastructure, no scheduler -- and reports whether the newest
+    *verified* (off-host-confirmed, §2's own ledger contract) backup is
+    recent enough. An empty ledger is always a FAIL: it means no backup has
+    ever been off-host-verified, which is strictly worse than one merely
+    being stale."""
+    if not ledger:
+        return {
+            "verdict": "FAIL",
+            "reason": "ledger is empty -- no backup has ever been off-host verified",
+            "backups_in_ledger": 0,
+            "max_age_hours": max_age_hours,
+        }
+    newest = max(ledger, key=lambda entry: entry["verified_at_utc"])
+    verified_at = datetime.fromisoformat(newest["verified_at_utc"])
+    age_hours = (now - verified_at).total_seconds() / 3600.0
+    stale = age_hours > max_age_hours
+    return {
+        "verdict": "FAIL" if stale else "PASS",
+        "reason": (
+            f"newest verified backup is {age_hours:.1f}h old, "
+            f"exceeding the {max_age_hours}h threshold"
+            if stale
+            else None
+        ),
+        "backups_in_ledger": len(ledger),
+        "newest_backup_id": newest["backup_id"],
+        "newest_verified_at_utc": newest["verified_at_utc"],
+        "age_hours": round(age_hours, 2),
+        "max_age_hours": max_age_hours,
+    }
+
+
+def _cmd_freshness(args: argparse.Namespace) -> int:
+    try:
+        config = load_config(os.environ.copy())
+    except ConfigError as exc:
+        print(f"ERROR: configuration: {exc}", file=sys.stderr)
+        return 2
+    if not config.offhost_enabled:
+        print("ERROR: off-host is not enabled; there is no ledger to check", file=sys.stderr)
+        return 2
+
+    ledger = load_ledger(config)
+    report = check_freshness(ledger, max_age_hours=args.max_age_hours, now=datetime.now(UTC))
+    print(json.dumps(report, sort_keys=True))
+    return 0 if report["verdict"] == "PASS" else 1
+
+
 def _cmd_recover(args: argparse.Namespace) -> int:
     try:
         config = load_config(os.environ.copy())
@@ -981,6 +1034,19 @@ def main(argv: list[str] | None = None) -> int:
         "retention", help="run retention only, against the existing local ledger (idempotent)"
     )
     retention_parser.set_defaults(func=_cmd_retention)
+
+    freshness_parser = sub.add_parser(
+        "freshness",
+        help="check whether the newest off-host-verified backup is recent enough "
+        "(reads the existing ledger only; writes nothing, deletes nothing)",
+    )
+    freshness_parser.add_argument(
+        "--max-age-hours",
+        required=True,
+        type=float,
+        help="FAIL if the newest verified backup in the ledger is older than this",
+    )
+    freshness_parser.set_defaults(func=_cmd_freshness)
 
     recover_parser = sub.add_parser(
         "recover", help="fetch an off-host artifact back to a local path and verify its checksum"

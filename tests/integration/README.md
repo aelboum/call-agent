@@ -63,3 +63,8 @@ pytest -m integration
 role, is not optional** -- a superuser or `BYPASSRLS` role bypasses Row-Level
 Security entirely regardless of `FORCE ROW LEVEL SECURITY`, which would make
 every RLS assertion in this suite pass for the wrong reason.
+
+`test_recovery_drill_integration.py` additionally needs a *second*,
+disposable instance and `DRILL_TARGET_*` configuration -- see that file's
+own module docstring and `docs/PHASE-2.43-AUTOMATED-RECOVERY-DRILLS.md`. It
+skips (not fails) when that second instance isn't configured.

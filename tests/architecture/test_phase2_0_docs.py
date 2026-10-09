@@ -19,6 +19,18 @@ PYPROJECT = Path(__file__).resolve().parents[2] / "pyproject.toml"
 
 CANONICAL_SHA = "ff550010e5eafecace7311038aadc99fcecfbe3d"
 
+# Full-length SHAs of *this* repository's own HEAD, cited by a phase status
+# report as "what HEAD was when this phase landed" (e.g. PHASE-2.31's "HEAD /
+# origin/main: `cf11189...`"). These are not SaaS-OS pins and are legitimate
+# even though they are 40 hex characters -- verified once via `git rev-parse
+# <short-sha>` when added. CI checkouts are shallow, so this list can't be
+# verified against `git` at test time; append to it only when a new phase
+# report cites its own HEAD and the SHA has been checked against `git log`.
+_OWN_REPO_HEAD_SHAS = {
+    "cf11189a9fdafd80e58a1ab26b23b140f4e77904",  # PHASE-2.31's own HEAD
+    "0f7c9d5d59576d8d7d6f57120e8f63de594ef805",  # PHASE-2.32's own HEAD
+}
+
 # A bare 40-hex-character token. Deliberately not anchored to "saas-os" or a
 # URL, so it also catches a SHA pasted without its usual surrounding context.
 _SHA_LIKE = re.compile(r"\b[0-9a-f]{40}\b")
@@ -41,7 +53,7 @@ def test_every_sha_like_token_in_docs_is_the_canonical_pin() -> None:
     offenders: list[str] = []
     for path in _markdown_files():
         for match in _SHA_LIKE.findall(path.read_text(encoding="utf-8")):
-            if match != CANONICAL_SHA:
+            if match != CANONICAL_SHA and match not in _OWN_REPO_HEAD_SHAS:
                 offenders.append(f"{path.relative_to(DOCS_ROOT.parent)}: {match}")
     assert offenders == []
 
